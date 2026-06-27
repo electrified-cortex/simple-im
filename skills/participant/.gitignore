@@ -1,0 +1,5 @@
+# Generated at runtime by listen.sh / monitor.sh — never commit these.
+# service.token is a live listen credential (full send/dequeue/attachment access).
+service.token
+service.handle
+service.url

@@ -1,0 +1,36 @@
+.claude/
+
+# Task engine — task pipeline (untracked until committed)
+.tasks/
+tasks/
+.foreman-pod/
+.signal
+.trash/
+
+# Temporary build artifacts and test output
+.temp/
+
+# Worker artifact — never commit pod result files
+result.json
+
+# Local dev build config (toolchain paths) — not for distribution
+.cargo/config.toml
+
+# Added by cargo
+
+/target
+.hash-record/
+
+# Runtime state & secrets — NEVER commit. The token store holds plaintext governor/
+# agent/listen/DCP tokens, grants, and attachment blobs.
+sim-tokens.db
+*.db
+*.db-wal
+*.db-shm
+/data/
+
+# Participant skill: credentials generated at runtime by listen.sh/monitor.sh.
+# A live listen token grants full send/dequeue/attachment access — treat as a secret.
+skills/participant/service.token
+skills/participant/service.handle
+skills/participant/service.url

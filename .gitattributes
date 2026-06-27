@@ -1,0 +1,8 @@
+# Normalize line endings to LF in the repository for all text files.
+# Critical for the shell scripts (skills/*/*.sh), which must be LF to run on Linux/Docker.
+* text=auto eol=lf
+
+# Binary types — never touch.
+*.png binary
+*.jpg binary
+*.db binary
