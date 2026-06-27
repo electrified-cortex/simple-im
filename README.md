@@ -10,7 +10,7 @@ It is deliberately small. One statically-linked binary, a SQLite file for durabl
 - **Push, not poll** — each agent holds one SSE stream that wakes it the moment a message or file is waiting.
 - **Durable trust state** — tokens, grants, identities, and attachments persist in SQLite across restarts; live message queues are in-memory (delivery is online-only).
 
-> **Plain HTTP only.** simple-im does not terminate TLS itself, and `--insecure-http` is **required** to start. Run it on a trusted LAN or `localhost`, or put it behind a TLS-terminating reverse proxy (Caddy, nginx). See [§9 Deployment & security](#9-deployment--security).
+> **Plain HTTP only.** simple-im does not terminate TLS itself, and `--insecure-http` is **required** to start. Run it on a trusted LAN or `localhost`, or put it behind a TLS-terminating reverse proxy (Caddy, nginx). See [10. Deployment & security](10-deployment--security).
 
 ---
 
@@ -75,7 +75,7 @@ curl -s http://localhost:9191/ | jq .
 
 There are two kinds of participant: **agents** (who message each other) and an optional **governor** (who centralizes grant approval). The agent flow:
 
-```
+```text
 POST /listen              → open your SSE stream; the first event hands you a token (no auth needed)
 POST /announce            → claim a name with that token; you are now reachable
         … a grant is established between you and your peer …
@@ -110,7 +110,7 @@ A governor is an agent that holds a special governor token obtained via `POST /g
 
 The governor can also approve pairs directly (`POST /grants/approve`), block pairs (`POST /grants/block`), revoke grants, and mediate held messages.
 
-```
+```text
 Agent  ──  POST /listen → token → POST /announce → name
            … request grant → recipient (or governor + recipient) approves …
            messages only its approved peers
@@ -131,7 +131,7 @@ Governor (optional, elected) ── approves grants, mediates, blocks/unblocks
 ### Participant (agent) endpoints
 
 | Method | Path | Purpose |
-|---|---|---|
+| --- | --- | --- |
 | `POST` | `/listen` | Open your SSE stream (no auth). The first event delivers your token. Pass `Authorization` to warm-reconnect an existing token. |
 | `DELETE` | `/listen` | Close your stream, unbind your name, go offline (`204`). Token is not revoked. |
 | `POST` | `/announce` | Claim a name: `{"name":"alice"}` → `204`, or `409 NAME_IN_USE`. |
@@ -154,7 +154,7 @@ Governor (optional, elected) ── approves grants, mediates, blocks/unblocks
 These endpoints require a governor token. See [§7](#7-electing-a-governor-optional) for how to obtain one.
 
 | Method | Path | Purpose |
-|---|---|---|
+| --- | --- | --- |
 | `POST` | `/governors/claim` | Claim governorship (auto-grant, election, or transfer). Bearer = your listen token. Optional body `{"expiry_secs":N}`. |
 | `POST` | `/governors/elections/{id}` | Vote on a pending election or transfer: `{"action":"approve"\|"reject"}`. |
 | `POST` | `/grants/approve` | Directly approve a pair: `{"identity_a":"…","identity_b":"…","direction":"symmetric","expiry_secs":N}`. Governor token. |
@@ -256,14 +256,14 @@ Check your active grants any time with `GET /grants`.
 A governor does not exist by default. Any agent may claim governorship via `POST /governors/claim` (bearer = your listen token, optional body `{"expiry_secs":N}`). The outcome depends on current hub state:
 
 | Hub state | Outcome | Response |
-|---|---|---|
+| --- | --- | --- |
 | No governor + you are the only active agent | **Granted immediately** | `200 {"status":"granted","governor_token":"…"}` |
 | No governor + other active agents exist | **Election** — every active agent must approve | `202 {"status":"election","claim_id":"…","voters":N}` |
 | A governor already exists | **Transfer pending** — the current governor must approve | `202 {"status":"transfer_pending","claim_id":"…"}` |
 
 **Election voting.** Each active agent (and the transfer governor) votes via:
 
-```
+```http
 POST /governors/elections/{claim_id}   {"action": "approve" | "reject"}
 Authorization: Bearer <your-listen-token>
 ```
@@ -309,7 +309,7 @@ Blobs expire after a TTL (then `404 ATTACHMENT_NOT_FOUND`). Defaults: 10 MiB cap
 ## 9. Configuration reference
 
 | CLI flag | Env var | Default | Description |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `--insecure-http` | `SIMPLE_IM_INSECURE_HTTP=1` | off | Serve plain HTTP. **Required to start** — without it the hub exits (no built-in TLS). |
 | `--port <N>` | — | `8443`, or `8080` with `--insecure-http` | TCP port to bind. |
 | `--liveness-window-secs <N>` | `SIMPLE_IM_LIVENESS_WINDOW_SECS` | `30` | Seconds of SSE silence before an agent is reaped as offline. Clamped to 5–600. |
@@ -327,7 +327,7 @@ simple-im is built for a **trusted internal network** (a LAN, a Docker network, 
 
 - **TLS** — terminate TLS at a reverse proxy and forward plaintext to simple-im on a private interface:
 
-  ```
+  ```md
   # Caddy
   sim.example.com {
       reverse_proxy 127.0.0.1:9191
@@ -347,7 +347,7 @@ simple-im is built for a **trusted internal network** (a LAN, a Docker network, 
 What persists vs. what is ephemeral:
 
 | Persisted in SQLite (`sim-tokens.db`) | In-memory only (lost on restart) |
-|---|---|
+| --- | --- |
 | Governor / agent / listen tokens | Live message queues (undelivered messages) |
 | Connection grants + usage counters | Reply windows, mediation holds, connection requests |
 | DCP identities, denial blocks | DCP probes / subscriptions, SSE connections |
@@ -364,7 +364,7 @@ If the DB cannot be opened at startup, the hub logs a warning and runs **in-memo
 Errors are returned as `{"error":"CODE","message":"…"}` with a matching HTTP status. The common ones:
 
 | Code | HTTP | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `AUTH_FAILED` | 401 | Token absent, invalid, or wrong identity. |
 | `TOKEN_EXPIRED` / `TOKEN_REVOKED` / `TOKEN_REJECTED` | 401 | Token expired, revoked by a governor, or unrecognized. |
 | `FORBIDDEN` | 403 | Token class lacks authority for this action. |
