@@ -11,8 +11,7 @@ use tokio::time::timeout;
 
 use crate::error::Error;
 use crate::persistence::{
-    PersistedDenialBlock, PersistedGrant, PersistedIdentity, PersistedToken, StoredAttachment,
-    TokenStore,
+    PersistedDenialBlock, PersistedGrant, PersistedToken, StoredAttachment, TokenStore,
 };
 use crate::registry::{ParticipantIdentity, PresenceScope, Registry};
 use crate::trust::{ApproveGrantRequest, GrantMediation, TrustChain};
@@ -2089,8 +2088,8 @@ impl DeliveryHub {
                 .connection_requests
                 .retain(|_, r| r.from_name != name && r.to_name != name);
             // listen-token revoke
-            let sse_sender = if let Some(v2_tok) = inner.name_to_token.remove(name) {
-                if let Some(state) = inner.listen_tokens.get_mut(&v2_tok) {
+            let sse_sender = if let Some(listen_tok) = inner.name_to_token.remove(name) {
+                if let Some(state) = inner.listen_tokens.get_mut(&listen_tok) {
                     state.revoked = true;
                     state.sse_sender.take()
                 } else {
@@ -2194,12 +2193,12 @@ impl DeliveryHub {
                 // Fix 3: listen-flow agents track SSE by token, not by name — check sse_connections first.
                 // AC2 fix: also check registry liveness so roster shows online after announce+SSE-drop.
                 let is_online = if let Some(tok) = inner.name_to_token.get(name) {
-                    let v2_hidden = inner
+                    let listen_hidden = inner
                         .listen_tokens
                         .get(tok)
                         .map(|s| s.hidden)
                         .unwrap_or(false);
-                    !v2_hidden
+                    !listen_hidden
                         && (ListenTokenState::is_sse_alive_in_hub(tok, &inner.sse_connections)
                             || inner.registry.is_online(name))
                 } else {
@@ -2375,7 +2374,7 @@ impl DeliveryHub {
         request_id: &str,
         approve: bool,
     ) -> Result<RespondStatus, Error> {
-        let (status, notify_opt, persist_grant, identity_senders, v2_to_persist): (
+        let (status, notify_opt, persist_grant, identity_senders, listen_to_persist): (
             RespondStatus,
             Option<Arc<tokio::sync::Notify>>,
             Option<(String, String, String, String, String, String)>,
@@ -2541,10 +2540,10 @@ impl DeliveryHub {
 
                 // AC-T3: collect token strings for both agents (by name) so we can
                 // persist them to DB after the lock releases.
-                let mut v2_to_persist: Vec<String> = Vec::new();
+                let mut listen_to_persist: Vec<String> = Vec::new();
                 for name in [&from_name, &to_name] {
                     if let Some(tok) = inner.name_to_token.get(name.as_str()).cloned() {
-                        v2_to_persist.push(tok);
+                        listen_to_persist.push(tok);
                     }
                 }
 
@@ -2564,7 +2563,7 @@ impl DeliveryHub {
                         to_name_for_grant,
                     )),
                     identity_senders,
-                    v2_to_persist,
+                    listen_to_persist,
                 )
             }
         }; // lock released
@@ -2610,10 +2609,10 @@ impl DeliveryHub {
         }
 
         // AC-T3: persist listen tokens that gained their first grant.
-        if !v2_to_persist.is_empty()
+        if !listen_to_persist.is_empty()
             && let Some(store) = self.token_store.clone()
         {
-            for tok in v2_to_persist {
+            for tok in listen_to_persist {
                 let store2 = store.clone();
                 self.db_write(async move {
                     if let Err(e) = store2.upsert_token(&tok, &tok, "listen", None, None).await {
@@ -2841,7 +2840,7 @@ impl DeliveryHub {
         request_id: &str,
         expiry: Option<Duration>,
     ) -> Result<ApproveStatus, Error> {
-        let (status, notify_opt, v2_to_persist, identity_senders, persist_grant) = {
+        let (status, notify_opt, listen_to_persist, identity_senders, persist_grant) = {
             let mut inner = self.lock();
             let req = inner
                 .connection_requests
@@ -3007,7 +3006,7 @@ impl DeliveryHub {
 
                     // Mark ever_granted on listen tokens and collect SSE senders.
                     let mut identity_senders: Vec<mpsc::UnboundedSender<String>> = Vec::new();
-                    let mut v2_to_persist: Vec<String> = Vec::new();
+                    let mut listen_to_persist: Vec<String> = Vec::new();
                     for identity in [&from_identity, &to_identity] {
                         if let Some(st) = inner.listen_tokens.get_mut(identity.as_str()) {
                             st.ever_granted = true;
@@ -3018,7 +3017,7 @@ impl DeliveryHub {
                     }
                     for name in [&from_name, &to_name] {
                         if let Some(tok) = inner.name_to_token.get(name.as_str()).cloned() {
-                            v2_to_persist.push(tok);
+                            listen_to_persist.push(tok);
                         }
                     }
 
@@ -3035,7 +3034,7 @@ impl DeliveryHub {
                     (
                         ApproveStatus::Established,
                         notify,
-                        v2_to_persist,
+                        listen_to_persist,
                         all_notify_senders,
                         Some((
                             grant_id,
@@ -3084,10 +3083,10 @@ impl DeliveryHub {
                 }
             });
         }
-        if !v2_to_persist.is_empty()
+        if !listen_to_persist.is_empty()
             && let Some(store) = self.token_store.clone()
         {
-            for tok in v2_to_persist {
+            for tok in listen_to_persist {
                 let store2 = store.clone();
                 self.db_write(async move {
                     if let Err(e) = store2.upsert_token(&tok, &tok, "listen", None, None).await {
@@ -3627,7 +3626,10 @@ impl DeliveryHub {
             // Concurrent-use detection: if new IP differs from last IP within window.
             {
                 let alert_opt: Option<String> = {
-                    let state = inner.listen_tokens.get_mut(&token).unwrap();
+                    let state = inner
+                        .listen_tokens
+                        .get_mut(&token)
+                        .expect("listen_token entry must exist during open_listen");
                     if let Some(ip) = &peer_ip {
                         let concurrent_window = Duration::from_secs(60);
                         let alert = if let (Some(last_ip), Some(last_at)) =
@@ -3911,7 +3913,10 @@ impl DeliveryHub {
                 inner.agents.remove(&name);
             }
             // Clear name and SSE sender from token state.
-            let st = inner.listen_tokens.get_mut(token).unwrap();
+            let st = inner
+                .listen_tokens
+                .get_mut(token)
+                .expect("listen_token state must exist during close_listen");
             st.name = None;
             let sender_opt = st.sse_sender.take();
             (sender_opt, offline_senders, cancelled_name)
@@ -7260,17 +7265,17 @@ mod tests {
     async fn ac_t3_token_persists_after_first_grant_survives_restart() {
         let db = unique_test_db();
 
-        let v2_tok = {
+        let listen_tok = {
             let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
             let gov = hub.install_governor(None);
             let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
 
             // Issue token for bob and announce its name.
             let reg_bob = hub.register_participant();
-            let (v2_tok, _rx) = hub
+            let (listen_tok, _rx) = hub
                 .open_listen(Some(&reg_bob), None, None, None, false)
                 .unwrap();
-            hub.announce(&v2_tok, "bob", false).unwrap();
+            hub.announce(&listen_tok, "bob", false).unwrap();
 
             // Register alice so request_grant() can route by name.
             hub.register("alice", &tok_a, PresenceScope::GrantScoped)
@@ -7287,25 +7292,25 @@ mod tests {
                 .expect("governor approve must succeed");
 
             // Drain the grant_request event from bob's queue.
-            let _ = hub.dequeue(&v2_tok, None).unwrap();
+            let _ = hub.dequeue(&listen_tok, None).unwrap();
 
             // Bob approves (PendingRecipient → Established; grant created + token persisted).
             assert!(
                 matches!(
-                    hub.approve_grant_request(&v2_tok, &request_id, None),
+                    hub.approve_grant_request(&listen_tok, &request_id, None),
                     Ok(ApproveStatus::Established)
                 ),
                 "both-approved path must return Established"
             );
 
-            v2_tok
+            listen_tok
         }; // hub drops; DB write already completed (block_in_place in multi-thread runtime)
 
         // Simulate restart: rebuild hub from the same DB file.
         let hub2 = make_persisted_hub(&db, Duration::from_secs(30)).await;
 
         assert!(
-            hub2.validate_token(&v2_tok).is_ok(),
+            hub2.validate_token(&listen_tok).is_ok(),
             "AC-T3: token must be valid on a new hub rebuilt from the same DB after first grant"
         );
 
@@ -7320,14 +7325,14 @@ mod tests {
     async fn ac_persist_announce_send_by_name_not_unknown_after_restart() {
         let db = unique_test_db();
 
-        let v2_tok = {
+        let listen_tok = {
             let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
             let reg_bob = hub.register_participant();
-            let (v2_tok, _rx) = hub
+            let (listen_tok, _rx) = hub
                 .open_listen(Some(&reg_bob), None, None, None, false)
                 .unwrap();
-            hub.announce(&v2_tok, "bob", false).unwrap();
-            v2_tok
+            hub.announce(&listen_tok, "bob", false).unwrap();
+            listen_tok
         };
 
         // Restart: new hub from same DB.
@@ -7350,7 +7355,7 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&db);
-        drop(v2_tok);
+        drop(listen_tok);
     }
 
     /// AC2: announce token (no grant) → restart → validate_token returns Ok.
@@ -7359,21 +7364,21 @@ mod tests {
     async fn ac_persist_announce_token_valid_after_restart() {
         let db = unique_test_db();
 
-        let v2_tok = {
+        let listen_tok = {
             let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
             let reg_bob = hub.register_participant();
-            let (v2_tok, _rx) = hub
+            let (listen_tok, _rx) = hub
                 .open_listen(Some(&reg_bob), None, None, None, false)
                 .unwrap();
-            hub.announce(&v2_tok, "bob", false).unwrap();
-            v2_tok
+            hub.announce(&listen_tok, "bob", false).unwrap();
+            listen_tok
         };
 
         // Restart: new hub from same DB.
         let hub2 = make_persisted_hub(&db, Duration::from_secs(30)).await;
 
         assert!(
-            hub2.validate_token(&v2_tok).is_ok(),
+            hub2.validate_token(&listen_tok).is_ok(),
             "AC2: token announced (never granted) must be valid after announce-time persist + restart"
         );
 
@@ -7387,14 +7392,14 @@ mod tests {
         let db = unique_test_db();
         let name = "charlie";
 
-        let v2_tok = {
+        let listen_tok = {
             let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
             let reg_charlie = hub.register_participant();
-            let (v2_tok, _rx) = hub
+            let (listen_tok, _rx) = hub
                 .open_listen(Some(&reg_charlie), None, None, None, false)
                 .unwrap();
-            hub.announce(&v2_tok, name, false).unwrap();
-            v2_tok
+            hub.announce(&listen_tok, name, false).unwrap();
+            listen_tok
         };
 
         // Reload.
@@ -7403,12 +7408,12 @@ mod tests {
         let inner = hub2.inner.lock().unwrap();
         assert_eq!(
             inner.name_to_token.get(name).map(String::as_str),
-            Some(v2_tok.as_str()),
+            Some(listen_tok.as_str()),
             "AC3: name_to_token[name] must equal the announced token after reload"
         );
         let state = inner
             .listen_tokens
-            .get(&v2_tok)
+            .get(&listen_tok)
             .expect("AC3: token must exist in listen_tokens after reload");
         assert_eq!(
             state.name.as_deref(),
