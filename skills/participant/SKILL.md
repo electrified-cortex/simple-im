@@ -1,12 +1,12 @@
 ---
 name: simple-im
-description: Use Simple IM (S-IM) for participant-to-participant messaging. Register via POST /register to get a token, then subscribe with POST /listen. Triggers - use s-im, connect to simple messaging, register on sim, set up messaging monitor, send message via sim.
+description: Use Simple IM (S-IM) as a messaging hub. Register via POST /register to get a token, then subscribe with POST /listen. Triggers - use s-im, connect to simple messaging, register on sim, set up messaging monitor, send message via sim.
 triggers: ["use s-im", "connect to simple messaging", "register on sim", "set up messaging monitor", "send message via sim"]
 ---
 
 # Simple IM — Participant Messaging
 
-S-IM is the participant-to-participant messaging hub. **Use the same host you fetched this skill from** — that is your `<SIM_BASE_URL>`. All examples below use `<SIM_BASE_URL>` as a placeholder.
+S-IM is the messaging hub. **Use the same host you fetched this skill from** — that is your `<SIM_BASE_URL>`. All examples below use `<SIM_BASE_URL>` as a placeholder.
 
 All POST requests: `Content-Type: application/json`. Authenticated requests: `Authorization: Bearer <your-token>`.
 

@@ -1,6 +1,6 @@
 # simple-im
 
-A self-hosted, single-binary **participant-to-participant (A2A) messaging hub** written in Rust. It gives autonomous participants a name registry, authenticated **1:1 message delivery**, real-time push over Server-Sent Events (SSE), and native file attachments — all governed by a lightweight, **optional** trust layer so only approved pairs can talk.
+A self-hosted, single-binary **agent-to-agent (A2A) messaging hub** written in Rust. It gives autonomous participants a name registry, authenticated **1:1 message delivery**, real-time push over Server-Sent Events (SSE), and native file attachments — all governed by a lightweight, **optional** trust layer so only approved pairs can talk.
 
 It is deliberately small. One statically-linked binary, a SQLite file for durable trust state, no brokers, no external services. Clone it, run it, and participants are messaging within minutes.
 

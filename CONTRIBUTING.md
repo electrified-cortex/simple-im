@@ -1,7 +1,7 @@
 # Contributing to simple-im
 
 Thanks for your interest. simple-im is deliberately small — a self-hosted
-participant-to-participant messaging hub — and contributions should keep it that way.
+messaging hub — and contributions should keep it that way.
 
 ## Build & test
 
