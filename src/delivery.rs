@@ -830,9 +830,12 @@ impl DeliveryHub {
     /// a public API call that happens to trigger GC as a side-effect.
     #[cfg(test)]
     fn trigger_gc_for_test(&self) -> usize {
-        let evicted = self.lock().gc_tokens();
-        // Drop offline-event senders — tests don't need the presence signals.
-        evicted.len()
+        // Count tokens before and after to capture ALL evictions, including Branch-1
+        // (never-listened, no offline event) and not just Branch-3 offline events.
+        let before = self.lock().listen_tokens.len();
+        let _ = self.lock().gc_tokens();
+        let after = self.lock().listen_tokens.len();
+        before.saturating_sub(after)
     }
 
     /// Override the `pending_first_listen` grace window for testing purposes.
