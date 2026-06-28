@@ -19,6 +19,7 @@ result.json
 # Added by cargo
 
 /target
+/target-test
 .hash-record/
 
 # Runtime state & secrets — NEVER commit. The token store holds plaintext governor/

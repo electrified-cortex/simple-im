@@ -1,1 +1,0 @@
-{"rustc":13073507457223000659,"features":"","declared_features":"","target":0,"profile":0,"path":0,"deps":[[5157631553186200874,"build_script_build",false,122407888414100605]],"local":[{"RerunIfChanged":{"output":"debug\\build\\num-traits-5c8d2b39a2857b91\\output","paths":["build.rs"]}}],"rustflags":["-Cdlltool=C:/msys64/mingw64/bin/dlltool.exe"],"config":0,"compile_kind":0}
