@@ -556,10 +556,13 @@ impl HubInner {
             .iter()
             .filter(|(_, st)| !st.revoked)
             .filter(|(_, st)| {
-                if st.pending_first_listen && now.duration_since(st.issued_at) <= registration_grace
-                {
-                    // Freshly registered token within the grace window — GC immune.
-                    false
+                if st.pending_first_listen {
+                    // Registered but never used for open_listen().
+                    // Within the grace window: GC immune (client may still call open_listen).
+                    // After grace expires: evict immediately — the grace window IS the TTL
+                    // for tokens that were registered but never used, bounding accumulation
+                    // from unauthenticated /register calls. (sim-gc-registration-grace-cap)
+                    now.duration_since(st.issued_at) > registration_grace
                 } else if !st.ever_listened {
                     // Branches 1 (no grant) and 3 (ever_granted): both use unlisten_ttl.
                     now.duration_since(st.issued_at) > unlisten_ttl
