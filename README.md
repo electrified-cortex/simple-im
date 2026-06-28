@@ -321,6 +321,8 @@ Blobs expire after a TTL (then `404 ATTACHMENT_NOT_FOUND`). Defaults: 10 MiB cap
 | `--token-store-path <P>` | `SIMPLE_IM_TOKEN_STORE` | `sim-tokens.db` | SQLite file for durable tokens, grants, identities, and attachments. |
 | — | `SIMPLE_IM_ATTACHMENT_MAX_BYTES` | `10485760` (10 MiB) | Max attachment size. Clamped to 1 KiB–200 MiB; oversize uploads get `413`. |
 | — | `SIMPLE_IM_ATTACHMENT_TTL_SECS` | `86400` (24 h) | How long attachments are retained. Clamped to 60 s–30 days. |
+| — | `SIMPLE_IM_GC_UNLISTEN_SECS` | `300` (5 min) | Seconds before a token that has never opened an SSE stream is GC'd. Clamped to 60–3600. *(Renamed from `SIMPLE_IM_V2_GC_UNLISTEN_SECS` — update deployments using the old name.)* |
+| — | `SIMPLE_IM_GC_NO_GRANT_SECS` | `1800` (30 min) | Seconds before a connected token with no approved grant is GC'd. Clamped to 120–7200. *(Renamed from `SIMPLE_IM_V2_GC_NO_GRANT_SECS` — update deployments using the old name.)* |
 
 Run `simple-im --help` for the flag list.
 
