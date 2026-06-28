@@ -429,7 +429,7 @@ DCP is an advanced handle-based handshake for scenarios requiring persistent ide
 
 | Error | Meaning | Recovery |
 |---|---|---|
-| `AUTH_FAILED` | Token missing, invalid, or wrong type | Check you're using the correct token for this endpoint. V2: use listen-token everywhere. DCP: auth_token for /announce and /connect-probe-ack, sub_token for messaging. |
+| `AUTH_FAILED` | Token missing, invalid, or wrong type | Check you're using the correct token for this endpoint. V2: use listen-token everywhere. DCP: auth_token for all DCP calls. |
 | `TOKEN_REJECTED` | Token not recognized (never existed or purged) | V2: call `/register` for a new token. DCP: call `/introduce` for a new identity (old handle may be taken). |
 | `TOKEN_REVOKED` | Governor explicitly revoked your token | V2: call `/register`. DCP: contact governor — your identity was revoked. |
 | `NAME_IN_USE` | Someone else holds this name | Re-announce with `force: true` to reclaim your own name from a stale session. If another live participant holds it, the conflict goes to governor resolution. |
