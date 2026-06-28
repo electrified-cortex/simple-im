@@ -18,6 +18,13 @@ use crate::registry::{ParticipantIdentity, PresenceScope, Registry};
 use crate::trust::{ApproveGrantRequest, GrantMediation, TrustChain};
 use crate::types::{GovernorToken, ParticipantToken, Payload, QueuedMessage};
 
+/// Grace period after `register_participant()` during which a token with
+/// `pending_first_listen=true` is immune from Branch-1 GC.  After this window,
+/// the token is eligible for normal `unlisten_ttl` eviction — bounding worst-case
+/// accumulation from unauthenticated `/register` calls to `60s / registration_rate`.
+/// See: sim-gc-registration-grace-cap.
+const REGISTRATION_GRACE: Duration = Duration::from_secs(60);
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Generate a CSPRNG hex string of `n_bytes` bytes.
@@ -211,6 +218,11 @@ struct V2TokenState {
     /// Starts at 0; incremented on every push to message_queues for this token's name.
     /// Used by GET /messages/latest/id for non-consuming peek and long-poll gap detection.
     msg_id_watch: watch::Sender<u64>,
+    /// Set by `register_participant()` to protect the token from Branch-1 GC until the
+    /// first successful `open_listen()` call.  Cleared the moment the SSE stream opens.
+    /// This eliminates the TOCTOU window where GC evicts a freshly minted token before
+    /// the client can call `open_listen()`.  See: sim-gc-race-register-open-listen.
+    pending_first_listen: bool,
 }
 
 impl V2TokenState {
@@ -229,6 +241,7 @@ impl V2TokenState {
             last_ip_at: None,
             governor_id: None,
             msg_id_watch: msg_id_tx,
+            pending_first_listen: false,
         }
     }
 
@@ -326,6 +339,10 @@ struct HubInner {
     v2_gc_ttl_unlisten: Duration,
     /// TTL for listened-but-never-granted tokens.
     v2_gc_ttl_no_grant: Duration,
+    /// Grace window for `pending_first_listen` tokens; overridable in tests.
+    /// After this duration, even tokens with `pending_first_listen=true` become
+    /// eligible for `unlisten_ttl` eviction. (sim-gc-registration-grace-cap)
+    v2_gc_registration_grace: Duration,
     /// Persistent denial blocks keyed on (from_identity, to_name).
     denial_blocks: HashMap<(String, String), DenialBlock>,
     // DCP identity store: handle → DcpIdentity
@@ -518,6 +535,7 @@ impl HubInner {
         let now = Instant::now();
         let unlisten_ttl = self.v2_gc_ttl_unlisten;
         let no_grant_ttl = self.v2_gc_ttl_no_grant;
+        let registration_grace = self.v2_gc_registration_grace;
 
         // Branch 1: !ever_listened && !ever_granted — never subscribed and never granted; safe to
         //   collect after unlisten_ttl. No presence event: ever_granted=false → no grant-peers.
@@ -527,12 +545,25 @@ impl HubInner {
         //   then vanished (session dropped, no explicit revocation). Evict after unlisten_ttl and
         //   fire sim_offline to grant-peers out-of-lock (caller responsibility). (15-0002H)
         //   Branches 1 and 3 share the same TTL threshold; the filter is unified as !ever_listened.
+        //
+        // GC-race guard: if `pending_first_listen` is true AND the token is still within the
+        //   REGISTRATION_GRACE window, skip Branch-1 eviction — the client has not yet called
+        //   `open_listen()`.  After the grace window expires the token falls through to the
+        //   normal `unlisten_ttl` path so that abandoned `/register` calls cannot accumulate
+        //   indefinitely. (sim-gc-race-register-open-listen, sim-gc-registration-grace-cap)
         let to_remove: Vec<String> = self
             .listen_tokens
             .iter()
             .filter(|(_, st)| !st.revoked)
             .filter(|(_, st)| {
-                if !st.ever_listened {
+                if st.pending_first_listen {
+                    // Registered but never used for open_listen().
+                    // Within the grace window: GC immune (client may still call open_listen).
+                    // After grace expires: evict immediately — the grace window IS the TTL
+                    // for tokens that were registered but never used, bounding accumulation
+                    // from unauthenticated /register calls. (sim-gc-registration-grace-cap)
+                    now.duration_since(st.issued_at) > registration_grace
+                } else if !st.ever_listened {
                     // Branches 1 (no grant) and 3 (ever_granted): both use unlisten_ttl.
                     now.duration_since(st.issued_at) > unlisten_ttl
                 } else if !st.ever_granted {
@@ -669,6 +700,7 @@ impl DeliveryHub {
                 sse_connections: HashMap::new(),
                 v2_gc_ttl_unlisten,
                 v2_gc_ttl_no_grant,
+                v2_gc_registration_grace: REGISTRATION_GRACE,
                 denial_blocks: HashMap::new(),
                 dcp_identities: HashMap::new(),
                 dcp_auth_to_handle: HashMap::new(),
@@ -781,6 +813,38 @@ impl DeliveryHub {
         self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Override the Branch-1 GC TTL for testing purposes.
+    ///
+    /// Allows tests to use very short TTLs without waiting for the production minimums
+    /// enforced by `clamp_env_secs`.  Only compiled in `#[cfg(test)]`.
+    #[cfg(test)]
+    fn set_gc_unlisten_ttl_for_test(&self, ttl: Duration) {
+        self.lock().v2_gc_ttl_unlisten = ttl;
+    }
+
+    /// Trigger GC inline (test seam).  Returns the count of tokens evicted.
+    ///
+    /// Provides a deterministic way to flush expired tokens in tests without going through
+    /// a public API call that happens to trigger GC as a side-effect.
+    #[cfg(test)]
+    fn trigger_gc_for_test(&self) -> usize {
+        // Count tokens before and after to capture ALL evictions, including Branch-1
+        // (never-listened, no offline event) and not just Branch-3 offline events.
+        let before = self.lock().listen_tokens.len();
+        let _ = self.lock().gc_tokens();
+        let after = self.lock().listen_tokens.len();
+        before.saturating_sub(after)
+    }
+
+    /// Override the `pending_first_listen` grace window for testing purposes.
+    ///
+    /// Allows tests to exercise grace-cap expiry without sleeping 60 real seconds.
+    /// Only compiled in `#[cfg(test)]`.  (sim-gc-registration-grace-cap)
+    #[cfg(test)]
+    fn set_gc_registration_grace_for_test(&self, grace: Duration) {
+        self.lock().v2_gc_registration_grace = grace;
     }
 
     /// Subscribe to the governor event broadcast channel (governance notices, concurrent-use alerts).
@@ -3572,6 +3636,9 @@ impl DeliveryHub {
     ///
     /// Use this token with `open_listen()` to start listening.
     /// This replaces the old anonymous /listen flow — now agents must register first.
+    ///
+    /// The returned token is marked `pending_first_listen = true`, which prevents Branch-1
+    /// GC from evicting it before `open_listen()` is called.  See: sim-gc-race-register-open-listen.
     pub fn register_participant(&self) -> String {
         let mut inner = self.lock();
         let mut rng = rand::thread_rng();
@@ -3579,7 +3646,9 @@ impl DeliveryHub {
             let digits: u64 = rng.gen_range(10_000_000..=999_999_999_999);
             let tok = digits.to_string();
             if !inner.listen_tokens.contains_key(&tok) {
-                inner.listen_tokens.insert(tok.clone(), V2TokenState::new());
+                let mut state = V2TokenState::new();
+                state.pending_first_listen = true;
+                inner.listen_tokens.insert(tok.clone(), state);
                 return tok;
             }
         }
@@ -3740,8 +3809,11 @@ impl DeliveryHub {
             }
 
             // Mark as ever-listened and increment SSE connection count.
+            // Also clear pending_first_listen: the GC-race guard is no longer needed once
+            // the stream is open.  (sim-gc-race-register-open-listen)
             if let Some(state) = inner.listen_tokens.get_mut(&token) {
                 state.ever_listened = true;
+                state.pending_first_listen = false;
             }
             *inner.sse_connections.entry(token.clone()).or_insert(0) += 1;
 
@@ -8300,6 +8372,96 @@ mod tests {
         assert!(
             matches!(result, Ok(true)),
             "Minted agent with grant should see target's real status"
+        );
+    }
+
+    // ── GC race: register_participant() → GC → open_listen() ─────────────────
+
+    /// AC1+AC2 (sim-gc-race-register-open-listen): a freshly minted listen token must survive
+    /// concurrent GC and succeed on the first `open_listen()` call even when the configured
+    /// `unlisten_ttl` is shorter than the window between registration and first use,
+    /// provided the token is still within the REGISTRATION_GRACE window.
+    ///
+    /// Procedure:
+    ///   1. Create a hub with a very short Branch-1 GC TTL (1 ms) and a 200 ms grace window.
+    ///   2. Register a participant token — `pending_first_listen` is set to true.
+    ///   3. Sleep 5 ms (past TTL, still within 200 ms grace).
+    ///   4. Trigger GC explicitly — the token must NOT be evicted (still in grace).
+    ///   5. Call `open_listen()` with the token — must succeed (not AuthFailed/401).
+    ///   6. AC3 regression: a second token registered and then used normally still works.
+    #[test]
+    fn gc_race_registered_token_survives_gc_before_open_listen() {
+        let hub = make_hub(Duration::from_secs(30));
+
+        // AC1: set a 1 ms Branch-1 TTL — far shorter than any real deployment, but
+        // enough to make a freshly minted token appear "stale" to GC immediately.
+        hub.set_gc_unlisten_ttl_for_test(Duration::from_millis(1));
+        // Set a 200 ms grace window so the 5 ms sleep below stays inside the grace.
+        hub.set_gc_registration_grace_for_test(Duration::from_millis(200));
+
+        // Register the token (sets pending_first_listen = true).
+        let token = hub.register_participant();
+
+        // Sleep past the TTL (1 ms) but well within the grace window (200 ms).
+        std::thread::sleep(Duration::from_millis(5));
+
+        // AC2: trigger GC — the pending token must survive because it is within grace.
+        let evicted = hub.trigger_gc_for_test();
+        assert_eq!(
+            evicted, 0,
+            "GC must not evict a token with pending_first_listen=true that is still within the grace window"
+        );
+
+        // Token must still exist: open_listen() must succeed (not AuthFailed).
+        let result = hub.open_listen(Some(&token), None, None, None, false);
+        assert!(
+            result.is_ok(),
+            "open_listen() must succeed for a registered token that survived GC: {result:?}"
+        );
+
+        // AC3 regression: confirm normal lifecycle still works — a second token registered,
+        // then immediately listened, must also succeed.
+        let token2 = hub.register_participant();
+        let result2 = hub.open_listen(Some(&token2), None, None, None, false);
+        assert!(
+            result2.is_ok(),
+            "Normal register → open_listen flow must still succeed: {result2:?}"
+        );
+    }
+
+    /// AC: a token with `pending_first_listen=true` whose registration grace window has
+    /// expired must be evicted by GC (prevents unbounded accumulation from `/register` DoS).
+    ///
+    /// Procedure:
+    ///   1. Hub with 1 ms unlisten_ttl and 50 ms grace.
+    ///   2. Register a token — `pending_first_listen=true`.
+    ///   3. Sleep 60 ms (past both TTL and grace).
+    ///   4. Trigger GC — token MUST be evicted (grace expired, never listened).
+    ///   5. `open_listen()` must fail with AuthFailed (token gone).
+    #[test]
+    fn gc_evicts_registered_token_after_grace_expires() {
+        let hub = make_hub(Duration::from_secs(30));
+
+        hub.set_gc_unlisten_ttl_for_test(Duration::from_millis(1));
+        hub.set_gc_registration_grace_for_test(Duration::from_millis(50));
+
+        let token = hub.register_participant();
+
+        // Sleep past both the TTL (1 ms) and the grace window (50 ms).
+        std::thread::sleep(Duration::from_millis(60));
+
+        // GC must evict the stale, never-listened token.
+        let evicted = hub.trigger_gc_for_test();
+        assert_eq!(
+            evicted, 1,
+            "GC must evict a pending_first_listen token whose grace window has expired"
+        );
+
+        // open_listen() must now fail — the token no longer exists.
+        let result = hub.open_listen(Some(&token), None, None, None, false);
+        assert!(
+            matches!(result, Err(Error::AuthFailed)),
+            "open_listen() must return AuthFailed for an evicted token, got: {result:?}"
         );
     }
 }
