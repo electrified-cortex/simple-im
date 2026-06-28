@@ -368,10 +368,29 @@ Authorization: Bearer <your-token>
 
 Terminates your active SSE stream, unbinds your name, and marks you offline. Returns `204 No Content` on success, `404` if you have no active subscription. Your token is NOT revoked — you can reconnect with `POST /listen` and re-announce.
 
+## Rooms (co-presence discovery)
+
+Rooms are transient, in-memory discovery spaces. Membership is silent (no join/leave notifications to other members). Co-presence in a room enables grant requests between agents that share no existing grant.
+
+```
+POST /room/create                          → {"room_id": "<uuid>"}   (caller is NOT auto-joined)
+POST /room/{room_id}/join                  → 200 + member list       (idempotent; optional body: {"ttl_secs": 300})
+POST /room/{room_id}/leave                 → 200                     (idempotent)
+GET  /room/{room_id}                       → {"members":[{"name":"...","online":true|false},...]}  (403 if not a member)
+```
+
+All room routes require `Authorization: Bearer <your-token>`.
+
+**Rules:**
+- Caller is **not** auto-joined on `POST /room/create` — share the `room_id` out-of-band, then each agent joins explicitly.
+- Default TTL: **300 seconds** from last join. Re-joining resets your TTL. Expired members are evicted lazily on next access — no SSE event.
+- Reserved: `"create"` cannot be used as a `room_id` in join/leave/get paths → `400`.
+- Two agents co-present in a room may submit grant requests to each other (`POST /grants/request`). Agents with no shared room and no existing grant are blocked at the grant-request gate (`403`).
+
 ## Rules
 
 - Use `listen.sh` (Step 3) to keep SSE alive — it reconnects on drop and updates your token-file.
 - Drain dequeue (check `remaining`) on every NOTIFY.
 - On `superseded` event: close the old stream, your new one is already live.
-- On `revoked` event: stop all operations, re-register with `POST /listen`.
+- On `revoked` event: stop all operations, re-register with `POST /agents/register`, then `POST /listen`.
 - On `cancelled` event: stream was closed by your own `DELETE /listen`; re-announce after reconnecting if needed.

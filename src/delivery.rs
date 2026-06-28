@@ -4581,6 +4581,77 @@ impl DeliveryHub {
         Ok(state.name.clone())
     }
 
+    /// Resolve a bearer token to the agent's announced name.
+    ///
+    /// Works for both V2 listen tokens and minted agent tokens.
+    /// Returns `None` if the token is unknown, revoked, or has no announced name.
+    pub fn name_for_bearer_token(&self, token: &str) -> Option<String> {
+        let inner = self.lock();
+        // V2 listen token path — check revocation explicitly.
+        if let Some(state) = inner.listen_tokens.get(token) {
+            return if state.revoked {
+                None
+            } else {
+                state.name.clone()
+            };
+        }
+        // Minted agent token path — presence in token_to_name implies validity.
+        inner.token_to_name.get(token).cloned()
+    }
+
+    /// Return `true` if any active grant exists (in either direction) between
+    /// the agent identified by `from_token` and the agent named `to_name`.
+    pub fn has_any_grant_with(&self, from_token: &str, to_name: &str) -> bool {
+        let inner = self.lock();
+
+        // Resolve caller identity + announced name.
+        let (from_id, from_name): (String, Option<String>) =
+            if let Some(state) = inner.listen_tokens.get(from_token) {
+                if state.revoked {
+                    return false;
+                }
+                (from_token.to_string(), state.name.clone())
+            } else {
+                let tok = AgentToken(from_token.to_string());
+                match inner.trust.agent_identity(&tok) {
+                    Some(id) => (id.to_string(), inner.token_to_name.get(from_token).cloned()),
+                    None => return false,
+                }
+            };
+
+        // Resolve target: prefer the listen-token identity (which == token) if
+        // the agent is a V2 listen-flow agent; fall back to the minted identity.
+        let (to_id, to_tok): (String, Option<String>) =
+            if let Some(t_tok) = inner.name_to_token.get(to_name).cloned() {
+                (t_tok.clone(), Some(t_tok))
+            } else if let Some(agent) = inner.agents.get(to_name) {
+                (agent.identity.clone(), None)
+            } else {
+                return false;
+            };
+
+        let to_id_str: &str = to_tok.as_deref().unwrap_or(&to_id);
+
+        inner
+            .trust
+            .check_grant_directed_with_names(
+                &from_id,
+                to_id_str,
+                from_name.as_deref(),
+                Some(to_name),
+            )
+            .is_ok()
+            || inner
+                .trust
+                .check_grant_directed_with_names(
+                    to_id_str,
+                    &from_id,
+                    Some(to_name),
+                    from_name.as_deref(),
+                )
+                .is_ok()
+    }
+
     /// Send a message addressed by token (AC-S3). Looks up the announced name for `to_token`,
     /// then delegates to `send()` with the normal grant-check pipeline.
     /// Returns RECIPIENT_UNKNOWN if the token is revoked, GC'd, or not yet announced.

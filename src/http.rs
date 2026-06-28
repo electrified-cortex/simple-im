@@ -25,6 +25,7 @@ use crate::delivery::{
     MediationDecision, MediationResult,
 };
 use crate::error::Error;
+use crate::rooms::RoomStore;
 use crate::trust::{ApproveGrantRequest, GrantDirection, GrantMediation};
 use crate::types::{AgentToken, GovernorToken, Payload};
 
@@ -39,6 +40,8 @@ const GOVERNOR_SKILL_MD: &str = include_str!("../skills/governor/SKILL.md");
 /// Shared Axum application state holding the delivery hub and attachment configuration.
 pub struct AppState {
     pub hub: DeliveryHub,
+    /// In-memory room store — does not persist across server restarts.
+    pub rooms: RoomStore,
     pub attachment_ttl: Duration,
     pub attachment_max_bytes: usize,
 }
@@ -49,6 +52,7 @@ impl AppState {
         let (attachment_ttl, attachment_max_bytes) = attachment_config();
         Self {
             hub: DeliveryHub::new(liveness_window),
+            rooms: RoomStore::new(),
             attachment_ttl,
             attachment_max_bytes,
         }
@@ -59,6 +63,7 @@ impl AppState {
         let (attachment_ttl, attachment_max_bytes) = attachment_config();
         Self {
             hub,
+            rooms: RoomStore::new(),
             attachment_ttl,
             attachment_max_bytes,
         }
@@ -162,6 +167,18 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(handle_attach_upload).layer(DefaultBodyLimit::max(max_attach)),
         )
         .route("/attachments/{id}", get(handle_attach_download))
+        // ── Rooms discovery ────────────────────────────────────────────────────
+        // Static route for POST /room/create (mint a new room).
+        // An explicit GET on this path returns 400 so that "create" stays reserved
+        // as a room_id: `GET /room/create` would otherwise be shadowed by the
+        // static registration and never reach `GET /room/{room_id}`.
+        .route(
+            "/room/create",
+            post(handle_room_create).get(handle_room_create_get_reserved),
+        )
+        .route("/room/{room_id}/join", post(handle_room_join))
+        .route("/room/{room_id}", get(handle_room_get))
+        .route("/room/{room_id}/leave", post(handle_room_leave))
         .with_state(state)
         .layer(axum::middleware::from_fn(log_requests))
 }
@@ -847,6 +864,10 @@ async fn handle_latest_message(State(state): State<Arc<AppState>>, headers: Head
 }
 
 // POST /grants/request  — agent requests a grant to talk to another agent
+//
+// Gate (AC8/AC9): the caller must either already hold a grant with the target
+// OR be co-present in a room with the target.  This prevents cold-contact spam:
+// room discovery is the bootstrap path for first-contact grant requests.
 async fn handle_grant_request(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -856,6 +877,37 @@ async fn handle_grant_request(
         Some(t) => t,
         None => return auth_failed(),
     };
+
+    // Resolve caller name for room check.  If the caller has no announced name
+    // they cannot possibly be in a room or hold a named grant → reject.
+    let caller_name = match state.hub.name_for_bearer_token(&tok_str) {
+        Some(n) => n,
+        None => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": "FORBIDDEN",
+                    "message": "must announce a name before requesting a grant"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // AC9: no existing grant AND no shared room → reject.
+    if !state.hub.has_any_grant_with(&tok_str, &body.to)
+        && !state.rooms.shares_room(&caller_name, &body.to)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "FORBIDDEN",
+                "message": "must share a room or hold an existing grant to submit a grant request"
+            })),
+        )
+            .into_response();
+    }
+
     match state
         .hub
         .request_grant(&tok_str, &body.to, body.reason, body.request_id.as_deref())
@@ -1623,4 +1675,156 @@ async fn handle_skill_governor() -> impl IntoResponse {
         [("content-type", "text/plain; charset=utf-8")],
         GOVERNOR_SKILL_MD,
     )
+}
+
+// ── Rooms discovery ───────────────────────────────────────────────────────────
+//
+// All room routes require `Authorization: Bearer <token>`.  The token must
+// resolve to an announced agent name; otherwise 401 is returned.
+//
+// Room IDs are server-generated UUIDs.  The string "create" is reserved and
+// may not appear as a room_id in join / get / leave paths (→ 400).
+
+/// Helper: extract bearer token AND resolve it to an announced name.
+/// Returns `None` if the header is missing, the token is unknown/revoked, or
+/// the agent has not yet announced a name.
+fn room_auth(headers: &HeaderMap, state: &AppState) -> Option<String> {
+    let tok = bearer_token(headers)?;
+    state.hub.name_for_bearer_token(&tok)
+}
+
+/// Returns 401 AUTH_FAILED — used when the room bearer-token check fails.
+fn room_auth_failed() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({"error": "AUTH_FAILED", "message": "valid bearer token with announced name required"})),
+    )
+        .into_response()
+}
+
+/// Returns 400 BAD_REQUEST — reserved name "create" used as room_id.
+fn room_id_reserved() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error": "BAD_REQUEST", "message": "\"create\" is a reserved name and cannot be used as a room_id"})),
+    )
+        .into_response()
+}
+
+// ── POST /room/create ─────────────────────────────────────────────────────────
+
+/// POST /room/create — mint a new room and return its UUID.
+/// The caller is NOT automatically joined.
+async fn handle_room_create(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if room_auth(&headers, &state).is_none() {
+        return room_auth_failed();
+    }
+    let room_id = state.rooms.create();
+    (StatusCode::OK, Json(json!({"room_id": room_id}))).into_response()
+}
+
+/// GET /room/create — "create" is reserved; return 400.
+///
+/// Without this explicit handler, Axum would return 405 (Method Not Allowed)
+/// because the static `/room/create` path is registered only for POST, and it
+/// shadows the dynamic `GET /room/{room_id}` route at that position.
+async fn handle_room_create_get_reserved() -> Response {
+    room_id_reserved()
+}
+
+// ── POST /room/{room_id}/join ─────────────────────────────────────────────────
+
+#[derive(Deserialize, Default)]
+struct RoomJoinBody {
+    ttl: Option<u64>,
+}
+
+/// POST /room/{room_id}/join — add the caller to the room.
+/// Idempotent (re-join resets TTL).  Returns the current member list.
+async fn handle_room_join(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(room_id): Path<String>,
+    body: Option<Json<RoomJoinBody>>,
+) -> Response {
+    if room_id == "create" {
+        return room_id_reserved();
+    }
+    let caller = match room_auth(&headers, &state) {
+        Some(n) => n,
+        None => return room_auth_failed(),
+    };
+    let ttl = body.as_ref().and_then(|b| b.0.ttl);
+    match state.rooms.join(&room_id, &caller, ttl) {
+        Ok(names) => {
+            let members: Vec<_> = names
+                .iter()
+                .map(|n| json!({"name": n, "online": state.hub.presence(n)}))
+                .collect();
+            (StatusCode::OK, Json(json!({"members": members}))).into_response()
+        }
+        Err(crate::rooms::RoomError::RoomNotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "NOT_FOUND", "message": "room not found"})),
+        )
+            .into_response(),
+        Err(crate::rooms::RoomError::NotMember) => unreachable!("join never returns NotMember"),
+    }
+}
+
+// ── GET /room/{room_id} ───────────────────────────────────────────────────────
+
+/// GET /room/{room_id} — return the live member list.
+/// 403 if the caller is not a member.
+async fn handle_room_get(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(room_id): Path<String>,
+) -> Response {
+    if room_id == "create" {
+        return room_id_reserved();
+    }
+    let caller = match room_auth(&headers, &state) {
+        Some(n) => n,
+        None => return room_auth_failed(),
+    };
+    match state.rooms.members(&room_id, &caller) {
+        Ok(names) => {
+            let members: Vec<_> = names
+                .iter()
+                .map(|n| json!({"name": n, "online": state.hub.presence(n)}))
+                .collect();
+            (StatusCode::OK, Json(json!({"members": members}))).into_response()
+        }
+        Err(crate::rooms::RoomError::RoomNotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "NOT_FOUND", "message": "room not found"})),
+        )
+            .into_response(),
+        Err(crate::rooms::RoomError::NotMember) => (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "FORBIDDEN", "message": "caller is not a member of this room"})),
+        )
+            .into_response(),
+    }
+}
+
+// ── POST /room/{room_id}/leave ────────────────────────────────────────────────
+
+/// POST /room/{room_id}/leave — remove the caller from the room.
+/// Idempotent: 200 even if the caller was not a member or the room doesn't exist.
+async fn handle_room_leave(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(room_id): Path<String>,
+) -> Response {
+    if room_id == "create" {
+        return room_id_reserved();
+    }
+    let caller = match room_auth(&headers, &state) {
+        Some(n) => n,
+        None => return room_auth_failed(),
+    };
+    state.rooms.leave(&room_id, &caller);
+    (StatusCode::OK, Json(json!({"status": "ok"}))).into_response()
 }
