@@ -123,9 +123,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/listen", post(handle_listen))
         .route("/listen", delete(handle_cancel_listen))
         .route("/announce", post(handle_announce))
-        .route("/introduce", post(handle_introduce))
-        .route("/connect-probe-ack", post(handle_probe_ack))
-        .route("/leave", post(handle_leave))
         .route("/skills/participant", get(handle_skill_participant))
         .route(
             "/skills/participant/listen.sh",
@@ -1090,41 +1087,11 @@ async fn handle_gov_events(State(state): State<Arc<AppState>>, headers: HeaderMa
         .into_response()
 }
 
-// \u2500\u2500 V2 request body types \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+// \u2500\u2500 request body types \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 
-// ── DCP request body types ────────────────────────────────────────────────────
+// ── request body types ─────────────────────────────────────────────────────
 
-#[derive(Deserialize)]
-struct IntroduceBody {
-    handle: String,
-    sub_id: String,
-}
-
-#[derive(Deserialize)]
-struct ProbeAckBody {
-    nonce: String,
-    sub_id: String,
-}
-
-#[derive(Deserialize)]
-struct LeaveBody {
-    sub_id: String,
-}
-
-// DCP announce body — deserialized inline via serde_json::Value in handle_announce
-// These structs are kept as documentation of the wire format:
-#[allow(dead_code)]
-#[derive(Deserialize, Default)]
-struct DcpAnnounceBody {
-    handle: String,
-    #[serde(default)]
-    force: bool,
-    sub_id: String,
-}
-
-// ── V2 request body types ─────────────────────────────────────────────────────
-
-// V2 announce body — deserialized inline via serde_json::Value in handle_announce
+// announce body — deserialized inline via serde_json::Value in handle_announce
 #[allow(dead_code)]
 #[derive(Deserialize)]
 struct AnnounceBody {
@@ -1172,7 +1139,6 @@ async fn handle_discovery() -> Response {
                     "POST /listen": {"auth": "participant", "body": "{name?}", "hint": "Open SSE stream; optional name to auto-announce"},
                     "DELETE /listen": {"auth": "participant", "body": null, "hint": "Close SSE stream, unbind name"},
                     "POST /announce": {"auth": "participant", "body": "{name, force?}", "hint": "Claim a name for this token"},
-                    "POST /leave": {"auth": "participant", "body": "{sub_id}", "hint": "Disconnect preserving identity (DCP)"},
                     "GET /participants": {"auth": "governor", "body": null, "hint": "List all announced participants"},
                     "DELETE /participants/{name}": {"auth": "governor", "body": null, "hint": "Force-revoke participant by name"},
                     "GET /participants/{name}/presence": {"auth": "participant", "body": null, "hint": "Check if participant is online"},
@@ -1205,10 +1171,6 @@ async fn handle_discovery() -> Response {
                     "POST /governors/mediate": {"auth": "governor", "body": "{mediation_id, decision, payload?}", "hint": "Resolve a mediation hold"},
                     "GET /governors/events": {"auth": "governor", "body": null, "hint": "SSE stream of governor events"},
                     "GET /governors/grants": {"auth": "governor", "body": null, "hint": "List all grants in the system (supports ?participant=)"}
-                },
-                "dcp": {
-                    "POST /introduce": {"auth": "none", "body": "{handle, sub_id}", "hint": "Mint a new DCP identity (TOFU)"},
-                    "POST /connect-probe-ack": {"auth": "dcp_auth_token", "body": "{nonce, sub_id}", "hint": "Acknowledge DCP nonce probe"}
                 },
                 "attachment": {
                     "POST /attachments": {"auth": "participant", "body": "raw bytes (query: ?to=&filename=&note=)", "hint": "Upload file attachment"},
@@ -1412,29 +1374,12 @@ async fn handle_listen(
 }
 
 // ── DELETE /listen ────────────────────────────────────────────────────────────
-// DCP: sub_token in Authorization header → dcp_cancel_sub_by_token
-// V2 fallback: listen token in Authorization header → cancel_listen
 
 async fn handle_cancel_listen(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let token = match bearer_token(&headers) {
         Some(t) => t,
         None => return auth_failed(),
     };
-    // Try DCP sub_token cancel first
-    match state.hub.dcp_cancel_sub_by_token(&token) {
-        Ok(()) => return StatusCode::NO_CONTENT.into_response(),
-        Err(Error::TokenRejected) => {
-            // Not a DCP sub_token — fall through to V2
-        }
-        Err(_) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "NOT_FOUND", "message": "no active subscription"})),
-            )
-                .into_response();
-        }
-    }
-    // V2 fallback
     match state.hub.cancel_listen(&token) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(_) => (
@@ -1446,8 +1391,6 @@ async fn handle_cancel_listen(State(state): State<Arc<AppState>>, headers: Heade
 }
 
 // ── POST /announce ─────────────────────────────────────────────────────────────
-// DCP: takes Authorization: Bearer <auth-token> + {handle, force, sub_id}
-// Falls back to V2 if no sub_id is provided (backward compat).
 
 async fn handle_announce(
     State(state): State<Arc<AppState>>,
@@ -1459,29 +1402,6 @@ async fn handle_announce(
         None => return auth_failed(),
     };
 
-    // DCP path: if sub_id is present in body, use DCP announce
-    if let Some(sub_id) = body.get("sub_id").and_then(|v| v.as_str()) {
-        let handle = match body.get("handle").and_then(|v| v.as_str()) {
-            Some(h) => h,
-            None => return err_response(Error::BadRequest),
-        };
-        let force = body.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
-        return match state.hub.dcp_announce(&token, handle, force, sub_id) {
-            Ok(()) => StatusCode::NO_CONTENT.into_response(),
-            Err(Error::NameInUse) => (
-                StatusCode::CONFLICT,
-                Json(json!({
-                    "error": "NAME_IN_USE",
-                    "message": "name is currently in use",
-                    "resolution": "re-announce with force:true to supersede the live holder"
-                })),
-            )
-                .into_response(),
-            Err(e) => err_response(e),
-        };
-    }
-
-    // V2 fallback: {name, force}
     let name = match body.get("name").and_then(|v| v.as_str()) {
         Some(n) => n.to_string(),
         None => return err_response(Error::BadRequest),
@@ -1536,68 +1456,6 @@ async fn handle_dequeue_all(
                 .collect();
             (StatusCode::OK, Json(json!({"messages": msgs_json}))).into_response()
         }
-        Err(e) => err_response(e),
-    }
-}
-
-// ── DCP handlers ─────────────────────────────────────────────────────────────
-
-// POST /introduce  — mint a new identity (TOFU for dogfood phase)
-async fn handle_introduce(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<IntroduceBody>,
-) -> Response {
-    match state.hub.dcp_introduce(&body.handle, &body.sub_id) {
-        Ok(auth_token) => (
-            StatusCode::OK,
-            Json(json!({
-                "auth_token": auth_token,
-                "hint": "Save this auth_token — it is your permanent identity credential. Present it on future /listen calls."
-            })),
-        ).into_response(),
-        Err(Error::HandleExists) => (
-            StatusCode::CONFLICT,
-            Json(json!({
-                "error": "HANDLE_EXISTS",
-                "message": "handle already exists",
-                "hint": "This handle already exists. If this is your account, reclaim it via POST /announce with your auth-token. Do not re-introduce."
-            })),
-        ).into_response(),
-        Err(e) => err_response(e),
-    }
-}
-
-// POST /connect-probe-ack  — agent acknowledges the nonce probe
-async fn handle_probe_ack(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(body): Json<ProbeAckBody>,
-) -> Response {
-    let auth_token = match bearer_token(&headers) {
-        Some(t) => t,
-        None => return auth_failed(),
-    };
-    match state
-        .hub
-        .dcp_probe_ack(&auth_token, &body.nonce, &body.sub_id)
-    {
-        Ok(()) => (StatusCode::OK, Json(json!({"status": "connected"}))).into_response(),
-        Err(e) => err_response(e),
-    }
-}
-
-// POST /leave  — agent disconnects while preserving identity
-async fn handle_leave(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(body): Json<LeaveBody>,
-) -> Response {
-    let auth_token = match bearer_token(&headers) {
-        Some(t) => t,
-        None => return auth_failed(),
-    };
-    match state.hub.dcp_leave(&auth_token, &body.sub_id) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => err_response(e),
     }
 }
@@ -1706,10 +1564,7 @@ async fn handle_skill_governor() -> impl IntoResponse {
 
 /// GET /openapi.yaml — returns the OpenAPI 3.x specification.
 async fn handle_openapi() -> impl IntoResponse {
-    (
-        [("content-type", "text/yaml; charset=utf-8")],
-        OPENAPI_YAML,
-    )
+    ([("content-type", "text/yaml; charset=utf-8")], OPENAPI_YAML)
 }
 
 // ── Rooms discovery ───────────────────────────────────────────────────────────
@@ -1879,9 +1734,6 @@ fn router_routes() -> Vec<String> {
         "POST /listen".to_string(),
         "DELETE /listen".to_string(),
         "POST /announce".to_string(),
-        "POST /introduce".to_string(),
-        "POST /connect-probe-ack".to_string(),
-        "POST /leave".to_string(),
         "GET /skills/participant".to_string(),
         "GET /skills/participant/listen.sh".to_string(),
         "GET /skills/governor".to_string(),
@@ -1935,7 +1787,9 @@ fn discovery_routes() -> Vec<String> {
     // Extract the JSON body from the response
     let body = rt.block_on(async {
         let (_, body) = response.into_parts();
-        axum::body::to_bytes(body, usize::MAX).await.expect("Failed to read body")
+        axum::body::to_bytes(body, usize::MAX)
+            .await
+            .expect("Failed to read body")
     });
 
     let discovery: serde_json::Value =

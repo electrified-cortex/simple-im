@@ -186,7 +186,7 @@ paths:
     post:
       tags: [participant]
       summary: Claim a name
-      description: Bind a name to this token. Supports both V2 and DCP flows.
+      description: Bind a name to this token. Supports the listen-flow.
       operationId: announce
       security:
         - bearerAuth: []
@@ -195,9 +195,7 @@ paths:
         content:
           application/json:
             schema:
-              oneOf:
-                - $ref: "#/components/schemas/V2AnnounceBody"
-                - $ref: "#/components/schemas/DcpAnnounceBody"
+              $ref: "#/components/schemas/AnnounceBody"
       responses:
         "204":
           description: Name bound
@@ -1402,7 +1400,7 @@ components:
       type: object
       description: Machine-readable API discovery document
 
-    V2AnnounceBody:
+    AnnounceBody:
       type: object
       required: [name]
       properties:

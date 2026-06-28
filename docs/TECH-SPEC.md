@@ -28,7 +28,7 @@ This spec defines the **design, behavior, and testable acceptance criteria** for
 
 - **Language: Rust** (decided early in the project). Rationale on file; not re-litigated here.
 - **Single statically-linked binary.** No interpreter, no GC runtime, no external service dependency at runtime. Target: `x86_64-unknown-linux-musl` (fully static) as the canonical artifact; native host targets acceptable for dev. **AC-ARCH-1** asserts the no-dynamic-dependency property.
-- **Durable trust state, ephemeral delivery.** As of v1.0 the hub persists tokens, grants (with usage counters), DCP identities, denial blocks, and attachment blobs to a SQLite/WAL store (`--token-store-path`, default `sim-tokens.db`), reloaded on boot; if the store cannot be opened it degrades gracefully to fully in-memory. **Message delivery stays in-memory and online-only** — registry presence and in-flight message queues are not persisted and reset on restart (PRD R5). See README §11.
+- **Durable trust state, ephemeral delivery.** As of 1.0 the hub persists tokens, grants (with usage counters), DCP identities, denial blocks, and attachment blobs to a SQLite/WAL store (`--token-store-path`, default `sim-tokens.db`), reloaded on boot; if the store cannot be opened it degrades gracefully to fully in-memory. **Message delivery stays in-memory and online-only** — registry presence and in-flight message queues are not persisted and reset on restart (PRD R5). See README §11.
 - **Single process, async core.** One Tokio (or equivalent async) reactor; no worker-process fan-out. Concurrency is task-based within the one process.
 
 ### 2.2 Transport
@@ -196,7 +196,7 @@ All failures are explicit and enumerable — never a silent drop or an opaque ha
 Explicitly OUT of scope (deferring is a deliberate simplification, not an oversight):
 
 - **No offline / durable delivery.** Messages to an offline/unknown recipient fail explicitly; nothing is buffered, queued, retried, or stored. (out of scope.)
-- **No durable *delivery*.** Registry presence and in-flight messages are in-memory only and reset on restart; agents re-announce to recover (PRD R5). *(Trust state — tokens, grants, identities, attachments — IS persisted to SQLite as of v1.0; see §2.1 and README §11.)*
+- **No durable *delivery*.** Registry presence and in-flight messages are in-memory only and reset on restart; agents re-announce to recover (PRD R5). *(Trust state — tokens, grants, identities, attachments — IS persisted to SQLite as of 1.0; see §2.1 and README §11.)*
 - **No broadcast / group / multicast.** 1:1 by name only. (out of scope.)
 - **No message history / read receipts / editing / threading.** Deliver-and-forget to a live channel.
 - **No WebSocket transport.** SSE (implemented) and long-poll are the live-channel primitives; WebSocket is out of scope.

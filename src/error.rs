@@ -20,16 +20,6 @@ pub enum Error {
     AnnounceRequired,
     /// Grant request blocked by a persistent denial; carries the denial reason.
     GrantBlocked(String),
-    /// DCP: handle already exists at introduce time; instructive breadcrumb in message
-    HandleExists,
-    /// DCP: handle unknown at announce time
-    IdentityNotFound,
-    /// DCP: connect_probe nonce expired or not found
-    ProbeExpired,
-    /// DCP: connect_probe nonce mismatch / auth-token mismatch
-    ProbeInvalid,
-    /// DCP: agent tried to send before reaching CONNECTED
-    NotConnected,
     /// File attachment unknown or expired.
     AttachmentNotFound,
     /// Server-side failure (e.g. attachment store unavailable or I/O error).
@@ -59,11 +49,6 @@ impl Error {
             Error::RequestPending => "REQUEST_PENDING",
             Error::AnnounceRequired => "ANNOUNCE_REQUIRED",
             Error::GrantBlocked(_) => "GRANT_BLOCKED",
-            Error::HandleExists => "HANDLE_EXISTS",
-            Error::IdentityNotFound => "IDENTITY_NOT_FOUND",
-            Error::ProbeExpired => "PROBE_EXPIRED",
-            Error::ProbeInvalid => "PROBE_INVALID",
-            Error::NotConnected => "NOT_CONNECTED",
             Error::AttachmentNotFound => "ATTACHMENT_NOT_FOUND",
             Error::Internal => "INTERNAL",
             Error::ActiveSubscription => "ACTIVE_SUBSCRIPTION",
@@ -90,11 +75,6 @@ impl Error {
             Error::RequestPending => "a grant request is already pending for this target",
             Error::AnnounceRequired => "announce your name before sending",
             Error::GrantBlocked(_) => "sender-recipient pair is blocked",
-            Error::HandleExists => "handle already exists",
-            Error::IdentityNotFound => "identity not found",
-            Error::ProbeExpired => "connect probe has expired",
-            Error::ProbeInvalid => "connect probe is invalid",
-            Error::NotConnected => "not connected — complete probe handshake first",
             Error::AttachmentNotFound => "attachment not found or expired",
             Error::Internal => "internal server error",
             Error::ActiveSubscription => "token already has an active subscription",

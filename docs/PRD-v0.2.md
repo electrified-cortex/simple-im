@@ -17,7 +17,7 @@ v0.2 makes the grant the **expressive control surface for governed conversation*
 ## 2. Out of scope (v0.2 keeps these out)
 
 - **No durable delivery.** In-memory queue only — messages do not survive server restart. Durable queue is a future enhancement. Inspect-mode holds are transient with a bounded TTL; no store-and-forward beyond process lifetime.
-- **Ephemeral session state.** Reply windows, mediation holds, presence scopes, and in-flight messages are in-memory and reset on restart. *(Grants and their usage counters are persisted to SQLite as of v1.0 — see README §10.)*
+- **Ephemeral session state.** Reply windows, mediation holds, presence scopes, and in-flight messages are in-memory and reset on restart. *(Grants and their usage counters are persisted to SQLite as of 1.0 — see README §10.)*
 - **No broadcast / group messaging.** 1:1 by name only.
 - **No message history, read receipts, editing, or threading.**
 - **No federation / multi-hub clustering.**
