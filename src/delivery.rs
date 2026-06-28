@@ -3799,9 +3799,8 @@ impl DeliveryHub {
                 let welcome = serde_json::json!({
                     "type": "service",
                     "event": "welcome",
-                    "token": &token,
                     "name": name_opt,
-                    "instructions": "Call POST /announce to register your name. You will receive notify events when messages arrive — call POST /messages/queue/pop to retrieve them.",
+                    "instructions": "Call POST /announce to register your name. You will receive notify events when messages arrive — call POST /messages/dequeue to retrieve them.",
                 })
                 .to_string();
                 let _ = tx.send(welcome);

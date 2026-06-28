@@ -70,42 +70,16 @@ connect() {
 
             case "$type/$event" in
                 service/welcome)
-                    # Extract and save token
-                    new_token=$(echo "$data" | grep -o '"token":"[^"]*"' | sed 's/"token":"//;s/"//')
-                    if [[ -n "$new_token" ]]; then
-                        echo "$new_token" > "$TOKEN_FILE"
-                    fi
-                    # Announce handle — try /introduce first (first boot), fall back to /announce (warm reconnect)
-                    sub_id=$(echo "$data" | grep -o '"sub_id":"[^"]*"' | sed 's/"sub_id":"//;s/"//')
-                    if [[ -n "$sub_id" ]]; then
-                        introduce_result=$(curl -s -w "\n%{http_code}" -X POST "$SIM_URL/introduce" \
-                            -H "Content-Type: application/json" \
-                            -H "Authorization: Bearer $new_token" \
-                            -d "{\"handle\":\"$HANDLE\",\"sub_id\":\"$sub_id\"}" 2>/dev/null)
-                        introduce_code="${introduce_result##*$'\n'}"
-                        echo >&2 "sim: introduce HTTP $introduce_code"
-                        # If handle already exists, fall back to /announce
-                        if echo "$introduce_result" | grep -q "HANDLE_EXISTS"; then
-                            announce_result=$(curl -s -w "\n%{http_code}" -X POST "$SIM_URL/announce" \
-                                -H "Content-Type: application/json" \
-                                -H "Authorization: Bearer $new_token" \
-                                -d "{\"name\":\"$HANDLE\"}" 2>/dev/null)
-                            announce_code="${announce_result##*$'\n'}"
-                            echo >&2 "sim: announce HTTP $announce_code"
-                            if [[ "$announce_code" != "204" ]]; then
-                                echo >&2 "sim: announce failed — body: ${announce_result%$'\n'*}"
-                            fi
-                        fi
-                    else
-                        announce_result=$(curl -s -w "\n%{http_code}" -X POST "$SIM_URL/announce" \
-                            -H "Content-Type: application/json" \
-                            -H "Authorization: Bearer $new_token" \
-                            -d "{\"name\":\"$HANDLE\"}" 2>/dev/null)
-                        announce_code="${announce_result##*$'\n'}"
-                        echo >&2 "sim: announce HTTP $announce_code"
-                        if [[ "$announce_code" != "204" ]]; then
-                            echo >&2 "sim: announce failed — body: ${announce_result%$'\n'*}"
-                        fi
+                    # Welcome no longer echoes the token — use $token (set at top of connect()).
+                    # Announce handle to go live.
+                    announce_result=$(curl -s -w "\n%{http_code}" -X POST "$SIM_URL/announce" \
+                        -H "Content-Type: application/json" \
+                        -H "Authorization: Bearer $token" \
+                        -d "{\"name\":\"$HANDLE\"}" 2>/dev/null)
+                    announce_code="${announce_result##*$'\n'}"
+                    echo >&2 "sim: announce HTTP $announce_code"
+                    if [[ "$announce_code" != "204" ]]; then
+                        echo >&2 "sim: announce failed — body: ${announce_result%$'\n'*}"
                     fi
                     ;;
                 service/superseded|service/cancelled)
@@ -120,6 +94,9 @@ connect() {
                     # we can't set FAIL_COUNT here directly — use a flag file instead.
                     echo "REVOKED" > "$SCRIPT_DIR/.sim_revoke_flag"
                     break
+                    ;;
+                sub/*)
+                    echo >&2 "sim: subscription event (sub_id embedded)"
                     ;;
                 notify/*)
                     pending=$(echo "$data" | grep -o '"pending":[0-9]*' | grep -o '[0-9]*')

@@ -37,7 +37,7 @@ Authorization: Bearer <your-token>
 Returns an SSE stream. The **first event** is the welcome:
 
 ```
-data: {"type":"service","event":"welcome","token":"12345678","name":null,"instructions":"Call POST /announce to register your name. You will receive notify events when messages arrive — call POST /messages/queue/pop to retrieve them."}
+data: {"type":"service","event":"welcome","name":null,"instructions":"Call POST /announce to register your name. You will receive notify events when messages arrive — call POST /messages/dequeue to retrieve them."}
 ```
 
 Keep this stream open — it is your wake-on-message signal.
@@ -85,7 +85,8 @@ Events arrive on your persistent `/listen` stream:
 
 | Event | Meaning |
 |---|---|
-| `{"type":"service","event":"welcome","token":"..."}` | Your token on connect. |
+| `{"type":"service","event":"welcome","name":null}` | Stream open — call `POST /announce` to go live. |
+| `{"type":"sub","sub_id":"...","sub_token":"...","last_message_id":N}` | Subscription binding info after welcome — note for reference, not required for basic use. |
 | `{"type":"service","event":"sim_online"}` | Emitted exactly once, on the first SSE subscription after SIM starts up. Signals that SIM just came online fresh. Subsequent connections do not receive this event. |
 | `{"type":"service","event":"superseded"}` | New listen created — close this stream. |
 | `{"type":"service","event":"revoked"}` | Token revoked by governor — stop and re-register. |
