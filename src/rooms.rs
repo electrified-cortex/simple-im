@@ -83,7 +83,10 @@ impl RoomStore {
     /// The caller is NOT automatically added.
     pub fn create(&self) -> String {
         let id = gen_room_id();
-        self.inner.lock().unwrap().insert(id.clone(), Room::new());
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.clone(), Room::new());
         id
     }
 
@@ -98,7 +101,7 @@ impl RoomStore {
         name: &str,
         ttl_secs: Option<u64>,
     ) -> Result<Vec<String>, RoomError> {
-        let mut rooms = self.inner.lock().unwrap();
+        let mut rooms = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let room = rooms.get_mut(room_id).ok_or(RoomError::RoomNotFound)?;
         room.prune();
         let ttl = Duration::from_secs(ttl_secs.unwrap_or(DEFAULT_TTL_SECS));
@@ -116,7 +119,7 @@ impl RoomStore {
     /// Returns `RoomError::RoomNotFound` if the room does not exist.
     /// Returns `RoomError::NotMember` if `caller_name` is not (or is no longer) a member.
     pub fn members(&self, room_id: &str, caller_name: &str) -> Result<Vec<String>, RoomError> {
-        let mut rooms = self.inner.lock().unwrap();
+        let mut rooms = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let room = rooms.get_mut(room_id).ok_or(RoomError::RoomNotFound)?;
         room.prune();
         if !room.members.contains_key(caller_name) {
@@ -129,24 +132,48 @@ impl RoomStore {
     ///
     /// Idempotent: returns `Ok(())` even if the participant was not a member or the room
     /// does not exist.
+    ///
+    /// After removing the member (and pruning any TTL-expired members), the outer HashMap
+    /// entry is removed if the room is now empty, preventing unbounded HashMap growth on
+    /// long-running servers.
     pub fn leave(&self, room_id: &str, name: &str) {
-        let mut rooms = self.inner.lock().unwrap();
-        if let Some(room) = rooms.get_mut(room_id) {
+        let mut rooms = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let should_remove = if let Some(room) = rooms.get_mut(room_id) {
             room.prune();
             room.members.remove(name);
+            room.members.is_empty()
+        } else {
+            false
+        };
+        if should_remove {
+            rooms.remove(room_id);
         }
     }
 
     /// Return `true` if `name_a` and `name_b` are currently co-present in any room.
     ///
-    /// Performs lazy TTL pruning on every room it visits.
+    /// Performs lazy TTL pruning on every room it visits.  As a side-effect, rooms
+    /// that are left empty after pruning are removed from the outer HashMap, keeping
+    /// memory bounded on long-running servers.
     pub fn shares_room(&self, name_a: &str, name_b: &str) -> bool {
-        let mut rooms = self.inner.lock().unwrap();
+        let mut rooms = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
-        rooms.values_mut().any(|room| {
+        let mut co_present = false;
+        rooms.retain(|_, room| {
             room.members.retain(|_, m| m.expires_at > now);
-            room.members.contains_key(name_a) && room.members.contains_key(name_b)
-        })
+            if room.members.contains_key(name_a) && room.members.contains_key(name_b) {
+                co_present = true;
+            }
+            !room.members.is_empty()
+        });
+        co_present
+    }
+
+    /// Returns the number of rooms currently in the store.
+    /// Intended for tests only — not exposed in production paths.
+    #[cfg(test)]
+    pub fn room_count(&self) -> usize {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 }
 
@@ -270,6 +297,72 @@ mod tests {
             Err(RoomError::NotMember)
         ));
         assert!(!store.shares_room("alice", "bob"));
+        // shares_room prunes + removes the now-empty room
+        assert_eq!(store.room_count(), 0, "empty room must be removed by shares_room cleanup");
+    }
+
+    // ── Room eviction tests (sim-rooms-empty-room-eviction) ─────────────────────
+
+    #[test]
+    fn leave_removes_room_when_last_member_leaves() {
+        let store = RoomStore::new();
+        let id = store.create();
+        assert_eq!(store.room_count(), 1);
+        store.join(&id, "alice", None).unwrap();
+        store.leave(&id, "alice");
+        assert_eq!(
+            store.room_count(),
+            0,
+            "room must be removed from outer HashMap when last member leaves"
+        );
+    }
+
+    #[test]
+    fn leave_does_not_remove_room_with_remaining_members() {
+        let store = RoomStore::new();
+        let id = store.create();
+        store.join(&id, "alice", None).unwrap();
+        store.join(&id, "bob", None).unwrap();
+        store.leave(&id, "alice");
+        assert_eq!(
+            store.room_count(),
+            1,
+            "room must remain when members still present after leave"
+        );
+        let names = store.members(&id, "bob").unwrap();
+        assert!(names.contains(&"bob".to_string()));
+        assert!(!names.contains(&"alice".to_string()));
+    }
+
+    #[test]
+    fn leave_after_ttl_expiry_removes_room() {
+        let store = RoomStore::new();
+        let id = store.create();
+        // alice joins with 0-second TTL (immediately expired)
+        store.join(&id, "alice", Some(0)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        // leave() prunes alice (expired), sees room empty, removes the room
+        store.leave(&id, "alice");
+        assert_eq!(
+            store.room_count(),
+            0,
+            "room must be removed after TTL-expired last member calls leave"
+        );
+    }
+
+    #[test]
+    fn shares_room_removes_empty_rooms_after_ttl() {
+        let store = RoomStore::new();
+        let id = store.create();
+        store.join(&id, "alice", Some(0)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        // shares_room prunes all rooms and removes empty ones
+        assert!(!store.shares_room("alice", "bob"));
+        assert_eq!(
+            store.room_count(),
+            0,
+            "empty room must be removed by shares_room after TTL pruning"
+        );
     }
 
     #[test]

@@ -4014,3 +4014,372 @@ async fn ac_room_10_reserved_name_create_returns_400() {
         "leave with room_id='create' must return 400"
     );
 }
+
+// ── Room eviction tests (sim-rooms-empty-room-eviction) ───────────────────────
+
+// AC2: create → join → leave (last member) → room entry gone (GET returns 404).
+#[tokio::test]
+async fn ac_room_eviction_last_member_leaves_room_gone() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    let alice = setup_agent(&server, &client, "EvAlice").await;
+
+    let room_id = create_room(&server, &client, &alice).await;
+    join_room(&server, &client, &alice, &room_id, None).await;
+
+    // Alice is the last (and only) member — leave should remove the room.
+    let leave_r = client
+        .post(server.url(&format!("/room/{room_id}/leave")))
+        .header("Authorization", format!("Bearer {alice}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(leave_r.status(), StatusCode::OK, "leave must return 200");
+
+    // GET must now return 404 (room gone, not just 403 not-a-member).
+    let get_r = client
+        .get(server.url(&format!("/room/{room_id}")))
+        .header("Authorization", format!("Bearer {alice}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        get_r.status(),
+        StatusCode::NOT_FOUND,
+        "room entry must be gone (404) after last member leaves — not merely 403 not-a-member"
+    );
+}
+
+// AC3: TTL expiry of last member + explicit leave → room entry gone.
+// The lazy cleanup is triggered when leave() is called (which calls prune() internally).
+#[tokio::test]
+async fn ac_room_eviction_ttl_expired_last_member_cleanup() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    let alice = setup_agent(&server, &client, "TtlEvAlice").await;
+
+    let room_id = create_room(&server, &client, &alice).await;
+    // Alice joins with a 1-second TTL.
+    join_room(&server, &client, &alice, &room_id, Some(1)).await;
+
+    // Wait for alice's TTL to expire.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+
+    // Alice calls leave (idempotent — she already expired, but leave() prunes the room
+    // and removes it when it becomes empty).
+    let leave_r = client
+        .post(server.url(&format!("/room/{room_id}/leave")))
+        .header("Authorization", format!("Bearer {alice}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(leave_r.status(), StatusCode::OK, "leave must return 200");
+
+    // GET must now return 404 — the room was pruned and removed during leave().
+    let get_r = client
+        .get(server.url(&format!("/room/{room_id}")))
+        .header("Authorization", format!("Bearer {alice}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        get_r.status(),
+        StatusCode::NOT_FOUND,
+        "room must be gone (404) after TTL-expired last member triggers cleanup via leave()"
+    );
+}
+
+// AC4 (regression): room with remaining members is NOT removed on partial leave.
+#[tokio::test]
+async fn ac_room_eviction_no_regression_partial_leave() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    let alice = setup_agent(&server, &client, "EvAlice4").await;
+    let bob = setup_agent(&server, &client, "EvBob4").await;
+
+    let room_id = create_room(&server, &client, &alice).await;
+    join_room(&server, &client, &alice, &room_id, None).await;
+    join_room(&server, &client, &bob, &room_id, None).await;
+
+    // Alice leaves — bob is still in the room; room must remain.
+    client
+        .post(server.url(&format!("/room/{room_id}/leave")))
+        .header("Authorization", format!("Bearer {alice}"))
+        .send()
+        .await
+        .unwrap();
+
+    // Bob can still GET the room.
+    let get_r = client
+        .get(server.url(&format!("/room/{room_id}")))
+        .header("Authorization", format!("Bearer {bob}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        get_r.status(),
+        StatusCode::OK,
+        "room must still exist (200) when bob is still a member after alice leaves"
+    );
+}
+
+// ── Dequeue alias acceptance tests (sim-dequeue-alias-acceptance-test) ─────────
+
+// AC1: POST /messages/dequeue with valid token + empty queue → 200, null message.
+#[tokio::test]
+async fn ac_dequeue_alias_empty_queue_returns_null() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+
+    let (token, _) = listen_and_get_welcome(&server, &client, None).await;
+    client
+        .post(server.url("/announce"))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&json!({"name": "AliasEmpty"}))
+        .send()
+        .await
+        .unwrap();
+
+    let start = std::time::Instant::now();
+    let r = client
+        .post(server.url("/messages/dequeue"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    let elapsed = start.elapsed();
+    assert_eq!(
+        r.status(),
+        StatusCode::OK,
+        "POST /messages/dequeue must return 200"
+    );
+    // Non-blocking: well under 500 ms.
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "dequeue alias must be non-blocking; took {:?}",
+        elapsed
+    );
+    let body: Value = r.json().await.unwrap();
+    assert!(
+        body["message"].is_null(),
+        "empty queue must return null message"
+    );
+    assert_eq!(body["remaining"], 0, "remaining must be 0 on empty queue");
+}
+
+// AC2: POST /messages/dequeue with a queued message → 200, message returned and removed.
+#[tokio::test]
+async fn ac_dequeue_alias_returns_queued_message() {
+    let (server, gov) = TestServer::spawn_with_governor().await;
+    let client = server.client();
+
+    // Receiver.
+    let (recv_tok, _recv_stream) = listen_get_token(&server, &client, None).await;
+    client
+        .post(server.url("/announce"))
+        .header("Authorization", format!("Bearer {recv_tok}"))
+        .json(&json!({"name": "AliasRecv"}))
+        .send()
+        .await
+        .unwrap();
+
+    // Sender.
+    let (sender_tok, _) = listen_and_get_welcome(&server, &client, None).await;
+    client
+        .post(server.url("/announce"))
+        .header("Authorization", format!("Bearer {sender_tok}"))
+        .json(&json!({"name": "AliasSender"}))
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(server.url("/grants/approve"))
+        .header("Authorization", format!("Bearer {gov}"))
+        .json(&json!({"identity_a": sender_tok, "identity_b": recv_tok}))
+        .send()
+        .await
+        .unwrap();
+
+    // Sender sends a message.
+    client
+        .post(server.url("/messages/send"))
+        .header("Authorization", format!("Bearer {sender_tok}"))
+        .json(&json!({"to": "AliasRecv", "payload": "hello-via-alias"}))
+        .send()
+        .await
+        .unwrap();
+
+    // Receiver dequeues via the alias endpoint.
+    let r = client
+        .post(server.url("/messages/dequeue"))
+        .header("Authorization", format!("Bearer {recv_tok}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        StatusCode::OK,
+        "POST /messages/dequeue must return 200 when a message is queued"
+    );
+    let body: Value = r.json().await.unwrap();
+    let msg = &body["message"];
+    assert!(
+        !msg.is_null(),
+        "dequeue alias must return the queued message"
+    );
+    assert_eq!(
+        msg["payload"], "hello-via-alias",
+        "message payload must match what was sent"
+    );
+    assert_eq!(
+        msg["from"], "AliasSender",
+        "message from field must identify the sender"
+    );
+
+    // AC4: response shape identical to /messages/queue/pop — check remaining field.
+    assert!(
+        body["remaining"].is_number(),
+        "remaining field must be present"
+    );
+
+    // Message consumed — second dequeue via canonical path returns null.
+    let r2 = client
+        .post(server.url("/messages/queue/pop"))
+        .header("Authorization", format!("Bearer {recv_tok}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::OK);
+    let body2: Value = r2.json().await.unwrap();
+    assert!(
+        body2["message"].is_null(),
+        "message must be consumed after alias dequeue; canonical pop must return null"
+    );
+}
+
+// ── SSE direct probe for room events (sim-rooms-ac7-sse-direct-probe) ──────────
+
+// AC1: Open an SSE stream, trigger room join/leave events, assert no room_* events
+// appear on the stream within a short window (direct assertion, not via dequeue).
+#[tokio::test]
+async fn ac_room_6_7_sse_direct_no_room_events() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+
+    // Alice opens a live SSE stream to capture events.
+    let _rtok = register_participant_tok(&server, &client).await;
+    let r = client
+        .post(server.url("/listen"))
+        .header("Authorization", format!("Bearer {_rtok}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let mut stream = r.bytes_stream();
+
+    // Drain the welcome event.
+    let mut buf = String::new();
+    loop {
+        let chunk = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+        if buf.lines().any(|l| l.starts_with("data:")) {
+            break;
+        }
+    }
+    let alice_tok = _rtok.clone();
+    client
+        .post(server.url("/announce"))
+        .header("Authorization", format!("Bearer {alice_tok}"))
+        .json(&json!({"name": "SseDAlice"}))
+        .send()
+        .await
+        .unwrap();
+
+    let bob = setup_agent(&server, &client, "SseDAliceBob").await;
+
+    // Create a room and have both agents join then leave with a 1-second TTL.
+    let room_id = create_room(&server, &client, &alice_tok).await;
+    join_room(&server, &client, &alice_tok, &room_id, Some(1)).await;
+    join_room(&server, &client, &bob, &room_id, Some(1)).await;
+
+    // Wait for TTL expiry (room join/leave/expire events would arrive within this window
+    // if they were being emitted — they must NOT appear on the SSE stream).
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    // Alice leaves explicitly too.
+    client
+        .post(server.url(&format!("/room/{room_id}/leave")))
+        .header("Authorization", format!("Bearer {alice_tok}"))
+        .send()
+        .await
+        .unwrap();
+
+    // Drain any SSE events that arrived during the window and assert none are room events.
+    let mut room_events_seen = Vec::new();
+    loop {
+        match tokio::time::timeout(Duration::from_millis(100), stream.next()).await {
+            Ok(Some(Ok(chunk))) => {
+                let data = String::from_utf8_lossy(&chunk);
+                for line in data.lines() {
+                    if line.starts_with("data:") {
+                        let payload = line.trim_start_matches("data:").trim();
+                        if payload.contains("room_join")
+                            || payload.contains("room_leave")
+                            || payload.contains("room_expire")
+                        {
+                            room_events_seen.push(payload.to_string());
+                        }
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    assert!(
+        room_events_seen.is_empty(),
+        "no room_* SSE events must be pushed to members; got: {:?}",
+        room_events_seen
+    );
+}
+
+// ── Grant with existing grant, no shared room (sim-rooms-grant-with-existing-grant) ─
+
+// AC1: Two agents with an existing active grant but NOT in any shared room →
+// POST /grants/request returns 200 (has_any_grant_with path).
+#[tokio::test]
+async fn ac_room_grant_existing_no_room() {
+    let (server, gov) = TestServer::spawn_with_governor().await;
+    let client = server.client();
+
+    let alice = setup_agent(&server, &client, "GrantAlice").await;
+    let _bob = setup_agent(&server, &client, "GrantBob").await;
+
+    // Governor approves a grant between alice and bob — no shared room involved.
+    client
+        .post(server.url("/grants/approve"))
+        .header("Authorization", format!("Bearer {gov}"))
+        .json(&json!({"identity_a": alice, "identity_b": _bob}))
+        .send()
+        .await
+        .unwrap();
+
+    // Confirm they are NOT in any shared room (no room created).
+    // Alice requests a grant from Bob — must succeed because has_any_grant_with is true.
+    let rg = client
+        .post(server.url("/grants/request"))
+        .header("Authorization", format!("Bearer {alice}"))
+        .json(&json!({"to": "GrantBob", "reason": "we already have a grant"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        rg.status(),
+        StatusCode::OK,
+        "grant request must return 200 when requester already holds an active grant with target (no shared room required): got {}",
+        rg.json::<Value>().await.unwrap_or_default()
+    );
+}
