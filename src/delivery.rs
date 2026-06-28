@@ -3562,12 +3562,30 @@ impl DeliveryHub {
         tok
     }
 
-    /// Open (or supersede) the listen SSE stream for `token`.
+    /// Register a new agent and obtain a listen token without opening an SSE stream.
     ///
-    /// Returns `(token, rx)` where `rx` is the mpsc receiver for the new SSE stream.
-    /// The first event on the stream will be a SERVICE welcome event with the token.
-    /// If `token_opt` is Some and refers to a known token: supersede the old SSE.
-    /// If None (or unknown token): issue a fresh token.
+    /// Use this token with `open_listen()` to start listening.
+    /// This replaces the old anonymous /listen flow — now agents must register first.
+    pub fn register_agent(&self) -> String {
+        let mut inner = self.lock();
+        let mut rng = rand::thread_rng();
+        loop {
+            let digits: u64 = rng.gen_range(10_000_000..=999_999_999_999);
+            let tok = digits.to_string();
+            if !inner.listen_tokens.contains_key(&tok) {
+                inner.listen_tokens.insert(tok.clone(), V2TokenState::new());
+                return tok;
+            }
+        }
+    }
+
+    /// Opens an SSE listen stream for a token.
+    ///
+    /// Token is REQUIRED. If no token or unknown token, returns `AuthFailed`.
+    /// Use `register_agent()` to obtain a token before calling this.
+    ///
+    /// `force`: if true and an active SSE exists for this token, supersede it.
+    ///          if false and an active SSE exists, return `ActiveSubscription` error.
     ///
     /// `name_to_bind`: if Some, attempt to bind that name at listen time (combined listen+announce).
     /// Welcome event always includes `name_in_use`, `holder_identity`, `resolution_token` fields.
@@ -3577,43 +3595,54 @@ impl DeliveryHub {
         peer_ip: Option<String>,
         name_to_bind: Option<&str>,
         observed_host: Option<String>,
+        force: bool,
     ) -> Result<(String, mpsc::UnboundedReceiver<String>), Error> {
+        // Token is required.
+        let provided_token = token_opt.ok_or(Error::AuthFailed)?;
+
         // Capture auth-token hint BEFORE locking for DCP breadcrumb generation.
         // In DCP flow, the agent presents their auth-token as Bearer on /listen.
-        let dcp_auth_hint: Option<String> = token_opt.map(|t| t.to_string());
+        let dcp_auth_hint: Option<String> = Some(provided_token.to_string());
         let observed_host_str = observed_host.unwrap_or_default();
         let (token, rx, bound_name_for_persist, gc_offline_events) = {
             let mut inner = self.lock();
             let gc_offline_events = inner.gc_tokens();
 
-            let token = match token_opt {
-                Some(t) if inner.listen_tokens.contains_key(t) => {
-                    if inner
-                        .listen_tokens
-                        .get(t)
-                        .map(|s| s.revoked)
-                        .unwrap_or(false)
-                    {
-                        drop(inner);
-                        // Fire any Branch-3 GC offline events before returning. (15-0002H)
-                        for (senders, name) in gc_offline_events {
-                            push_presence_event(senders, &name, "offline");
-                        }
-                        return Err(Error::TokenRevoked);
+            // Token must exist in listen_tokens (pre-registered via register_agent).
+            let token = if inner.listen_tokens.contains_key(provided_token) {
+                if inner
+                    .listen_tokens
+                    .get(provided_token)
+                    .map(|s| s.revoked)
+                    .unwrap_or(false)
+                {
+                    drop(inner);
+                    // Fire any Branch-3 GC offline events before returning. (15-0002H)
+                    for (senders, name) in gc_offline_events {
+                        push_presence_event(senders, &name, "offline");
                     }
-                    t.to_string()
+                    return Err(Error::TokenRevoked);
                 }
-                _ => {
-                    let mut rng = rand::thread_rng();
-                    loop {
-                        let digits: u64 = rng.gen_range(10_000_000..=999_999_999_999);
-                        let tok = digits.to_string();
-                        if !inner.listen_tokens.contains_key(&tok) {
-                            inner.listen_tokens.insert(tok.clone(), V2TokenState::new());
-                            break tok;
-                        }
+
+                // Single-subscription enforcement: check if already has active SSE.
+                let has_active_sse =
+                    V2TokenState::is_sse_alive_in_hub(provided_token, &inner.sse_connections);
+                if has_active_sse && !force {
+                    drop(inner);
+                    for (senders, name) in gc_offline_events {
+                        push_presence_event(senders, &name, "offline");
                     }
+                    return Err(Error::ActiveSubscription);
                 }
+
+                provided_token.to_string()
+            } else {
+                // Unknown token — auth failed (no anonymous minting).
+                drop(inner);
+                for (senders, name) in gc_offline_events {
+                    push_presence_event(senders, &name, "offline");
+                }
+                return Err(Error::AuthFailed);
             };
 
             let (tx, rx) = mpsc::unbounded_channel::<String>();
@@ -4553,23 +4582,83 @@ impl DeliveryHub {
     }
 
     /// Presence for a listen token: online if active SSE and not hidden.
+    /// Grant-gated: querier must have an active grant with target to see their presence.
     pub fn presence_for_token(&self, token: &str, target_name: &str) -> Result<bool, Error> {
         let inner = self.lock();
         // Validate querier token.
-        inner
+        let querier_state = inner
             .listen_tokens
             .get(token)
-            .ok_or(Error::TokenRejected)
-            .and_then(|st| {
-                if st.revoked {
-                    Err(Error::TokenRevoked)
+            .ok_or(Error::TokenRejected)?;
+        if querier_state.revoked {
+            return Err(Error::TokenRevoked);
+        }
+
+        // Resolve querier name for grant check.
+        let querier_name = querier_state.name.clone();
+
+        // Resolve target identity (listen token string if they're a listen-flow agent).
+        let target_tok = inner.name_to_token.get(target_name).cloned();
+
+        // Grant check: querier must have a grant with target.
+        // Check both directions (A→B or B→A) since grants can be symmetric.
+        let has_grant = match &target_tok {
+            Some(t_tok) => {
+                // Target is a listen-flow agent.
+                inner
+                    .trust
+                    .check_grant_directed_with_names(
+                        token,
+                        t_tok.as_str(),
+                        querier_name.as_deref(),
+                        Some(target_name),
+                    )
+                    .is_ok()
+                    || inner
+                        .trust
+                        .check_grant_directed_with_names(
+                            t_tok.as_str(),
+                            token,
+                            Some(target_name),
+                            querier_name.as_deref(),
+                        )
+                        .is_ok()
+            }
+            None => {
+                // Target might be a minted agent — check by identity.
+                // For minted agents, identity is usually their name in the agents map.
+                if let Some(agent_state) = inner.agents.get(target_name) {
+                    inner
+                        .trust
+                        .check_grant_directed_with_names(
+                            token,
+                            &agent_state.identity,
+                            querier_name.as_deref(),
+                            Some(target_name),
+                        )
+                        .is_ok()
+                        || inner
+                            .trust
+                            .check_grant_directed_with_names(
+                                &agent_state.identity,
+                                token,
+                                Some(target_name),
+                                querier_name.as_deref(),
+                            )
+                            .is_ok()
                 } else {
-                    Ok(())
+                    false
                 }
-            })?;
+            }
+        };
+
+        if !has_grant {
+            // No grant → target not visible (return false, not an error).
+            return Ok(false);
+        }
 
         // Check if target is a listen-flow agent.
-        if let Some(target_tok) = inner.name_to_token.get(target_name).cloned()
+        if let Some(target_tok) = target_tok
             && let Some(target_state) = inner.listen_tokens.get(&target_tok)
         {
             if target_state.hidden {
@@ -4585,16 +4674,77 @@ impl DeliveryHub {
     }
 
     /// Check presence using any valid token.
+    /// Grant-gated: querier must have an active grant with target to see their presence.
     pub fn presence_any_token(&self, token_str: &str, target_name: &str) -> Result<bool, Error> {
         let inner = self.lock();
+
+        // Resolve target identity (listen token string if they're a listen-flow agent).
+        let target_tok = inner.name_to_token.get(target_name).cloned();
 
         // Try listen token first.
         if let Some(state) = inner.listen_tokens.get(token_str) {
             if state.revoked {
                 return Err(Error::TokenRevoked);
             }
+
+            // Resolve querier name for grant check.
+            let querier_name = state.name.clone();
+
+            // Grant check: querier must have a grant with target.
+            let has_grant = match &target_tok {
+                Some(t_tok) => {
+                    inner
+                        .trust
+                        .check_grant_directed_with_names(
+                            token_str,
+                            t_tok.as_str(),
+                            querier_name.as_deref(),
+                            Some(target_name),
+                        )
+                        .is_ok()
+                        || inner
+                            .trust
+                            .check_grant_directed_with_names(
+                                t_tok.as_str(),
+                                token_str,
+                                Some(target_name),
+                                querier_name.as_deref(),
+                            )
+                            .is_ok()
+                }
+                None => {
+                    // Target might be a minted agent.
+                    if let Some(agent_state) = inner.agents.get(target_name) {
+                        inner
+                            .trust
+                            .check_grant_directed_with_names(
+                                token_str,
+                                &agent_state.identity,
+                                querier_name.as_deref(),
+                                Some(target_name),
+                            )
+                            .is_ok()
+                            || inner
+                                .trust
+                                .check_grant_directed_with_names(
+                                    &agent_state.identity,
+                                    token_str,
+                                    Some(target_name),
+                                    querier_name.as_deref(),
+                                )
+                                .is_ok()
+                    } else {
+                        false
+                    }
+                }
+            };
+
+            if !has_grant {
+                return Ok(false);
+            }
+
             // Check target.
-            if let Some(target_tok) = inner.name_to_token.get(target_name).cloned()
+            if let Some(target_tok) = target_tok
                 && let Some(tgt) = inner.listen_tokens.get(&target_tok)
             {
                 if tgt.hidden {
@@ -4612,8 +4762,45 @@ impl DeliveryHub {
         // Try minted agent token.
         let agent_token = crate::types::AgentToken(token_str.to_string());
         if inner.trust.validate_agent_token(&agent_token).is_ok() {
+            // Get agent's identity for grant check.
+            let querier_identity = inner.trust.agent_identity(&agent_token).map(|s| s.to_string());
+
+            // Grant check for minted agent querier.
+            let has_grant = match (&target_tok, &querier_identity) {
+                (Some(t_tok), Some(q_id)) => {
+                    inner
+                        .trust
+                        .check_grant_directed_with_names(q_id, t_tok.as_str(), None, Some(target_name))
+                        .is_ok()
+                        || inner
+                            .trust
+                            .check_grant_directed_with_names(t_tok.as_str(), q_id, Some(target_name), None)
+                            .is_ok()
+                }
+                (None, Some(q_id)) => {
+                    // Both are minted agents.
+                    if let Some(agent_state) = inner.agents.get(target_name) {
+                        inner
+                            .trust
+                            .check_grant_directed_with_names(q_id, &agent_state.identity, None, Some(target_name))
+                            .is_ok()
+                            || inner
+                                .trust
+                                .check_grant_directed_with_names(&agent_state.identity, q_id, Some(target_name), None)
+                                .is_ok()
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            };
+
+            if !has_grant {
+                return Ok(false);
+            }
+
             // Check listen-flow target.
-            if let Some(target_tok) = inner.name_to_token.get(target_name).cloned()
+            if let Some(target_tok) = target_tok
                 && let Some(tgt) = inner.listen_tokens.get(&target_tok)
             {
                 if tgt.hidden {
@@ -6080,8 +6267,9 @@ mod tests {
         let gov = hub.install_governor(None);
         let tok_a = hub.mint_agent_token(&gov, "id-alice", None).unwrap();
 
-        // Bob is a listen-flow client.
-        let (bob_token, rx1) = hub.open_listen(None, None, Some("bob"), None).unwrap();
+        // Bob is a listen-flow client — register first, then open_listen.
+        let bob_token = hub.register_agent();
+        let (bob_token, rx1) = hub.open_listen(Some(&bob_token), None, Some("bob"), None, false).unwrap();
         // Alice is a regular agent with a Notify grant to Bob.
         hub.register("alice", &tok_a, PresenceScope::Public)
             .unwrap();
@@ -6106,10 +6294,10 @@ mod tests {
         // (simulates the client disconnecting before it could call /dequeue).
         drop(rx1); // simulate disconnect — notify_suppressed remains true
 
-        // Simulate reconnect: open_listen with the same token.
+        // Simulate reconnect: open_listen with the same token (force=true to supersede).
         // SIM-1 fix: open_listen must reset notify_suppressed and emit a catch-up NOTIFY.
         let (returned_token, mut rx2) =
-            hub.open_listen(Some(&bob_token), None, None, None).unwrap();
+            hub.open_listen(Some(&bob_token), None, None, None, true).unwrap();
         assert_eq!(
             returned_token, bob_token,
             "reconnect must return same token"
@@ -7234,7 +7422,8 @@ mod tests {
     fn ac_t2_token_not_persisted_before_first_grant() {
         let hub = make_hub(Duration::from_secs(30));
 
-        let (token, _rx) = hub.open_listen(None, None, None, None).unwrap();
+        let reg_token = hub.register_agent();
+        let (token, _rx) = hub.open_listen(Some(&reg_token), None, None, None, false).unwrap();
 
         // ever_granted = false means the token would NOT be persisted to DB yet.
         let inner = hub.inner.lock().unwrap();
@@ -7329,7 +7518,8 @@ mod tests {
     fn ac_t5_gc_no_grant_ttl_removes_listened_never_granted_token() {
         let hub = make_hub(Duration::from_secs(30));
 
-        let (stale, _rx) = hub.open_listen(None, None, None, None).unwrap();
+        let reg_token = hub.register_agent();
+        let (stale, _rx) = hub.open_listen(Some(&reg_token), None, None, None, false).unwrap();
 
         {
             let inner = hub.inner.lock().unwrap();
@@ -7365,7 +7555,8 @@ mod tests {
         let gov = hub.install_governor(None);
 
         // Agent A: full listen-flow session (the observer — will receive presence events).
-        let (tok_a, mut rx_a) = hub.open_listen(None, None, None, None).unwrap();
+        let reg_a = hub.register_agent();
+        let (tok_a, mut rx_a) = hub.open_listen(Some(&reg_a), None, None, None, false).unwrap();
         hub.announce(&tok_a, "GcA6", false).unwrap();
 
         // Agent B: issue token + announce, but NO open_listen (ever_listened stays false).
@@ -7427,7 +7618,8 @@ mod tests {
             let tok_a = hub.mint_agent_token(&gov, "id-alice", None).unwrap();
 
             // Issue token for bob and announce its name.
-            let (v2_tok, _rx) = hub.open_listen(None, None, None, None).unwrap();
+            let reg_bob = hub.register_agent();
+            let (v2_tok, _rx) = hub.open_listen(Some(&reg_bob), None, None, None, false).unwrap();
             hub.announce(&v2_tok, "bob", false).unwrap();
 
             // Register alice so request_grant() can route by name.
@@ -7480,7 +7672,8 @@ mod tests {
 
         let v2_tok = {
             let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
-            let (v2_tok, _rx) = hub.open_listen(None, None, None, None).unwrap();
+            let reg_bob = hub.register_agent();
+            let (v2_tok, _rx) = hub.open_listen(Some(&reg_bob), None, None, None, false).unwrap();
             hub.announce(&v2_tok, "bob", false).unwrap();
             v2_tok
         };
@@ -7514,7 +7707,8 @@ mod tests {
 
         let v2_tok = {
             let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
-            let (v2_tok, _rx) = hub.open_listen(None, None, None, None).unwrap();
+            let reg_bob = hub.register_agent();
+            let (v2_tok, _rx) = hub.open_listen(Some(&reg_bob), None, None, None, false).unwrap();
             hub.announce(&v2_tok, "bob", false).unwrap();
             v2_tok
         };
@@ -7539,7 +7733,8 @@ mod tests {
 
         let v2_tok = {
             let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
-            let (v2_tok, _rx) = hub.open_listen(None, None, None, None).unwrap();
+            let reg_charlie = hub.register_agent();
+            let (v2_tok, _rx) = hub.open_listen(Some(&reg_charlie), None, None, None, false).unwrap();
             hub.announce(&v2_tok, name, false).unwrap();
             v2_tok
         };
@@ -7761,6 +7956,141 @@ mod tests {
                 Err(Error::Forbidden)
             ),
             "AC8: agent token in governor slot must yield Forbidden"
+        );
+    }
+
+    // ── Grant-gated presence tests ────────────────────────────────────────────
+
+    /// AC1: Agent A with no grant to Agent B → presence_for_token returns false (not visible).
+    #[test]
+    fn test_presence_no_grant_returns_offline() {
+        let hub = make_hub(Duration::from_secs(30));
+        let _gov = hub.install_governor(None);
+
+        // Register listen tokens for A and B (no grant between them).
+        let reg_a = hub.register_agent();
+        let reg_b = hub.register_agent();
+
+        // Open listen for both.
+        let (listen_a, _rx_a) = hub.open_listen(Some(&reg_a), None, None, None, false).unwrap();
+        let (listen_b, _rx_b) = hub.open_listen(Some(&reg_b), None, None, None, false).unwrap();
+
+        // Announce both.
+        hub.announce(&listen_a, "alice", false).unwrap();
+        hub.announce(&listen_b, "bob", false).unwrap();
+
+        // A has no grant with B → presence_for_token should return false.
+        let result = hub.presence_for_token(&listen_a, "bob");
+        assert!(
+            matches!(result, Ok(false)),
+            "Agent without grant should see target as not visible (false)"
+        );
+    }
+
+    /// AC2: Agent A with active grant to Agent B → returns real status.
+    #[test]
+    fn test_presence_with_grant_returns_online() {
+        let hub = make_hub(Duration::from_secs(30));
+        let gov = hub.install_governor(None);
+
+        // Register listen tokens.
+        let reg_a = hub.register_agent();
+        let reg_b = hub.register_agent();
+
+        // Open listen for both.
+        let (listen_a, _rx_a) = hub.open_listen(Some(&reg_a), None, None, None, false).unwrap();
+        let (listen_b, _rx_b) = hub.open_listen(Some(&reg_b), None, None, None, false).unwrap();
+
+        // Announce both (this updates name_to_token mappings).
+        hub.announce(&listen_a, "alice", false).unwrap();
+        hub.announce(&listen_b, "bob", false).unwrap();
+
+        // Create grant between alice and bob (using their listen tokens as identities).
+        hub.approve_grant(&gov, &listen_a, &listen_b, None).unwrap();
+
+        // Now A should see B as online (active SSE).
+        let result = hub.presence_for_token(&listen_a, "bob");
+        assert!(
+            matches!(result, Ok(true)),
+            "Agent with grant should see target's real status (online)"
+        );
+    }
+
+    /// AC3: Grant exists but expired → presence_for_token returns false.
+    #[test]
+    fn test_presence_grant_expired_returns_offline() {
+        let hub = make_hub(Duration::from_secs(30));
+        let gov = hub.install_governor(None);
+
+        // Register listen tokens.
+        let reg_a = hub.register_agent();
+        let reg_b = hub.register_agent();
+
+        // Open listen for both.
+        let (listen_a, _rx_a) = hub.open_listen(Some(&reg_a), None, None, None, false).unwrap();
+        let (listen_b, _rx_b) = hub.open_listen(Some(&reg_b), None, None, None, false).unwrap();
+
+        // Announce both.
+        hub.announce(&listen_a, "alice", false).unwrap();
+        hub.announce(&listen_b, "bob", false).unwrap();
+
+        // Create grant with immediate expiry (1ms).
+        hub.approve_grant(&gov, &listen_a, &listen_b, Some(Duration::from_millis(1)))
+            .unwrap();
+
+        // Wait for expiry.
+        std::thread::sleep(Duration::from_millis(10));
+
+        // Grant expired → should return false.
+        let result = hub.presence_for_token(&listen_a, "bob");
+        assert!(
+            matches!(result, Ok(false)),
+            "Agent with expired grant should see target as not visible"
+        );
+    }
+
+    /// presence_any_token: same grant-gating applies to minted agent tokens.
+    #[test]
+    fn test_presence_any_token_no_grant_returns_offline() {
+        let hub = make_hub(Duration::from_secs(30));
+        let gov = hub.install_governor(None);
+
+        // Mint tokens (no grant).
+        let tok_a = hub.mint_agent_token(&gov, "id-alice", None).unwrap();
+        let tok_b = hub.mint_agent_token(&gov, "id-bob", None).unwrap();
+
+        // Register both.
+        hub.register("alice", &tok_a, PresenceScope::GrantScoped).unwrap();
+        hub.register("bob", &tok_b, PresenceScope::GrantScoped).unwrap();
+
+        // A uses presence_any_token with minted agent token → no grant → false.
+        let result = hub.presence_any_token(&tok_a.0, "bob");
+        assert!(
+            matches!(result, Ok(false)),
+            "Minted agent without grant should see target as not visible"
+        );
+    }
+
+    /// presence_any_token: with grant, returns real status.
+    #[test]
+    fn test_presence_any_token_with_grant_returns_online() {
+        let hub = make_hub(Duration::from_secs(30));
+        let gov = hub.install_governor(None);
+
+        // Mint tokens and create grant.
+        let tok_a = hub.mint_agent_token(&gov, "id-alice", None).unwrap();
+        let tok_b = hub.mint_agent_token(&gov, "id-bob", None).unwrap();
+        hub.approve_grant(&gov, "id-alice", "id-bob", None).unwrap();
+
+        // Register both.
+        hub.register("alice", &tok_a, PresenceScope::GrantScoped).unwrap();
+        hub.register("bob", &tok_b, PresenceScope::GrantScoped).unwrap();
+
+        // A with grant → sees bob's real status.
+        let result = hub.presence_any_token(&tok_a.0, "bob");
+        assert!(
+            matches!(result, Ok(true)),
+            "Minted agent with grant should see target's real status"
         );
     }
 }

@@ -113,6 +113,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let max_attach = state.attachment_max_bytes;
     Router::new()
         .route("/", get(handle_discovery))
+        .route("/agents/register", post(handle_agents_register))
         .route("/listen", post(handle_listen))
         .route("/listen", delete(handle_cancel_listen))
         .route("/announce", post(handle_announce))
@@ -134,6 +135,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/messages/send", post(handle_send))
         .route("/messages/queue/pop", post(handle_dequeue))
+        .route("/messages/dequeue", post(handle_dequeue))
         .route("/messages/queue", delete(handle_dequeue_all))
         .route("/messages/pending", get(handle_pending))
         .route("/messages/latest/id", get(handle_latest_message_id))
@@ -212,7 +214,8 @@ fn error_status(e: &Error) -> StatusCode {
         Error::NameInUse
         | Error::RecipientOffline
         | Error::MediationUnavailable
-        | Error::RequestPending => StatusCode::CONFLICT,
+        | Error::RequestPending
+        | Error::ActiveSubscription => StatusCode::CONFLICT,
         Error::RecipientUnknown | Error::IdentityNotFound | Error::AttachmentNotFound => {
             StatusCode::NOT_FOUND
         }
@@ -1093,17 +1096,20 @@ async fn handle_discovery() -> Response {
         Json(json!({
             "service": "simple-im",
             "version": "2",
-            "entry": "POST /listen",
-            "description": "Open your SSE stream with POST /listen (no auth) to receive a listen token, then POST /announce to claim a name. See the participant skill for the full flow.",
+            "entry": "POST /agents/register",
+            "description": "Register with POST /agents/register to receive a token, then POST /listen with that token to open your SSE stream. POST /announce to claim a name. See the participant skill for the full flow.",
             "skill": "/skills/participant",
             "auth": "Bearer <listen-token> in the Authorization header. Gate on HTTP status code; errors are {\"error\":CODE,\"message\":...}.",
+            "agents_register": "POST /agents/register",
             "participant": {
+                "register": "POST /agents/register",
                 "listen": "POST /listen",
                 "cancel_listen": "DELETE /listen",
                 "announce": "POST /announce",
                 "leave": "POST /leave",
                 "send": "POST /messages/send",
                 "dequeue": "POST /messages/queue/pop",
+                "dequeue_alias": "POST /messages/dequeue",
                 "dequeue_all": "DELETE /messages/queue",
                 "pending": "GET /messages/pending",
                 "latest": "GET /messages/latest",
@@ -1247,6 +1253,15 @@ fn sanitize_filename(name: &str) -> String {
     }
 }
 
+// ── POST /agents/register ─────────────────────────────────────────────────────
+// Mint a new agent token for future /listen use.
+// No authentication required (anyone can register, same as anonymous /listen before).
+
+async fn handle_agents_register(State(state): State<Arc<AppState>>) -> Response {
+    let token = state.hub.register_agent();
+    (StatusCode::OK, Json(json!({"token": token}))).into_response()
+}
+
 // ── POST /listen ──────────────────────────────────────────────────────────────
 
 #[derive(Deserialize, Default)]
@@ -1254,12 +1269,24 @@ struct ListenBody {
     name: Option<String>,
 }
 
+#[derive(Deserialize, Default)]
+struct ListenQueryParams {
+    force: Option<bool>,
+}
+
 async fn handle_listen(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    Query(params): Query<ListenQueryParams>,
     body: Option<Json<ListenBody>>,
 ) -> Response {
-    let existing_token = bearer_token(&headers);
+    // Token is required — no anonymous /listen.
+    let token = match bearer_token(&headers) {
+        Some(t) => t,
+        None => return auth_failed(),
+    };
+    let force = params.force.unwrap_or(false);
+
     let peer_ip = headers
         .get("X-Forwarded-For")
         .or_else(|| headers.get("X-Real-IP"))
@@ -1275,10 +1302,11 @@ async fn handle_listen(
     let name_to_bind = body.as_ref().and_then(|b| b.0.name.as_deref());
 
     let (token, rx) = match state.hub.open_listen(
-        existing_token.as_deref(),
+        Some(&token),
         peer_ip,
         name_to_bind,
         observed_host,
+        force,
     ) {
         Ok(pair) => pair,
         Err(e) => return err_response(e),

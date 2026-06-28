@@ -34,6 +34,8 @@ pub enum Error {
     AttachmentNotFound,
     /// Server-side failure (e.g. attachment store unavailable or I/O error).
     Internal,
+    /// Token already has an active SSE subscription.
+    ActiveSubscription,
 }
 
 impl Error {
@@ -64,6 +66,7 @@ impl Error {
             Error::NotConnected => "NOT_CONNECTED",
             Error::AttachmentNotFound => "ATTACHMENT_NOT_FOUND",
             Error::Internal => "INTERNAL",
+            Error::ActiveSubscription => "ACTIVE_SUBSCRIPTION",
         }
     }
 
@@ -94,6 +97,7 @@ impl Error {
             Error::NotConnected => "not connected — complete probe handshake first",
             Error::AttachmentNotFound => "attachment not found or expired",
             Error::Internal => "internal server error",
+            Error::ActiveSubscription => "token already has an active subscription",
         }
     }
 }
