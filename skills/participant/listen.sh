@@ -115,6 +115,10 @@ connect() {
                 service/revoked)
                     echo >&2 "sim: token revoked — re-registering"
                     > "$TOKEN_FILE"
+                    # Signal outer loop: revoke is intentional governance, not a server failure.
+                    # FAIL_COUNT must not be incremented. Bash runs the pipe-RHS in a subshell so
+                    # we can't set FAIL_COUNT here directly — use a flag file instead.
+                    echo "REVOKED" > "$SCRIPT_DIR/.sim_revoke_flag"
                     break
                     ;;
                 notify/*)
@@ -134,6 +138,14 @@ while true; do
     connect
     connect_end=$(date +%s)
     elapsed=$((connect_end - connect_start))
+
+    # Revoke flag: governor intentionally cycled the token — not a server failure.
+    # Reset backoff and skip FAIL_COUNT increment so a revoke storm can't trigger SIM-DOWN.
+    if [[ -f "$SCRIPT_DIR/.sim_revoke_flag" ]]; then
+        rm -f "$SCRIPT_DIR/.sim_revoke_flag"
+        BACKOFF=2
+        continue
+    fi
 
     if (( elapsed >= STABLE_THRESHOLD )); then
         # connection held → healthy; reset failure tracking
