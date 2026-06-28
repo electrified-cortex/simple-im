@@ -4320,23 +4320,20 @@ async fn ac_room_6_7_sse_direct_no_room_events() {
 
     // Drain any SSE events that arrived during the window and assert none are room events.
     let mut room_events_seen = Vec::new();
-    loop {
-        match tokio::time::timeout(Duration::from_millis(100), stream.next()).await {
-            Ok(Some(Ok(chunk))) => {
-                let data = String::from_utf8_lossy(&chunk);
-                for line in data.lines() {
-                    if line.starts_with("data:") {
-                        let payload = line.trim_start_matches("data:").trim();
-                        if payload.contains("room_join")
-                            || payload.contains("room_leave")
-                            || payload.contains("room_expire")
-                        {
-                            room_events_seen.push(payload.to_string());
-                        }
-                    }
+    while let Ok(Some(Ok(chunk))) =
+        tokio::time::timeout(Duration::from_millis(100), stream.next()).await
+    {
+        let data = String::from_utf8_lossy(&chunk);
+        for line in data.lines() {
+            if line.starts_with("data:") {
+                let payload = line.trim_start_matches("data:").trim();
+                if payload.contains("room_join")
+                    || payload.contains("room_leave")
+                    || payload.contains("room_expire")
+                {
+                    room_events_seen.push(payload.to_string());
                 }
             }
-            _ => break,
         }
     }
     assert!(
