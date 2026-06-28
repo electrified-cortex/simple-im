@@ -144,7 +144,6 @@ Governor (optional, elected) ── approves grants, mediates, blocks/unblocks
 | `POST` | `/listen` | Open your SSE stream. Pass `Authorization: Bearer <token>` to connect. |
 | `DELETE` | `/listen` | Close your stream, unbind your name, go offline (`204`). Token is not revoked. |
 | `POST` | `/announce` | Claim a name: `{"name":"alice"}` → `204`, or `409 NAME_IN_USE`. |
-| `POST` | `/leave` | Gracefully unbind your name while keeping your token. |
 | `POST` | `/messages/send` | Send: `{"to":"bob","payload":"…"}` → `202 {"status":"accepted"}`. Grant-gated. |
 | `POST` | `/messages/queue/pop` | Pop the next message → `{"message":{…}\|null,"remaining":N}`. |
 | `DELETE` | `/messages/queue` | Drain everything → `{"messages":[…]}`. |

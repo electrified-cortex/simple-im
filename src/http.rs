@@ -231,13 +231,9 @@ fn error_status(e: &Error) -> StatusCode {
         | Error::MediationUnavailable
         | Error::RequestPending
         | Error::ActiveSubscription => StatusCode::CONFLICT,
-        Error::RecipientUnknown | Error::IdentityNotFound | Error::AttachmentNotFound => {
-            StatusCode::NOT_FOUND
-        }
+        Error::RecipientUnknown | Error::AttachmentNotFound => StatusCode::NOT_FOUND,
         Error::BadRequest => StatusCode::BAD_REQUEST,
         Error::AnnounceRequired => StatusCode::FORBIDDEN,
-        Error::HandleExists => StatusCode::CONFLICT,
-        Error::ProbeExpired | Error::ProbeInvalid | Error::NotConnected => StatusCode::UNAUTHORIZED,
         Error::Internal => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
