@@ -172,7 +172,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         // An explicit GET on this path returns 400 so that "create" stays reserved
         // as a room_id: `GET /room/create` would otherwise be shadowed by the
         // static registration and never reach `GET /room/{room_id}`.
-        .route("/room/create", post(handle_room_create).get(handle_room_create_get_reserved))
+        .route(
+            "/room/create",
+            post(handle_room_create).get(handle_room_create_get_reserved),
+        )
         .route("/room/{room_id}/join", post(handle_room_join))
         .route("/room/{room_id}", get(handle_room_get))
         .route("/room/{room_id}/leave", post(handle_room_leave))
@@ -1712,10 +1715,7 @@ fn room_id_reserved() -> Response {
 
 /// POST /room/create — mint a new room and return its UUID.
 /// The caller is NOT automatically joined.
-async fn handle_room_create(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Response {
+async fn handle_room_create(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if room_auth(&headers, &state).is_none() {
         return room_auth_failed();
     }

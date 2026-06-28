@@ -1839,7 +1839,11 @@ async fn ac_s2_send_without_grant_request_pending_gov_event() {
         .send()
         .await
         .unwrap();
-    assert_eq!(room_resp.status(), StatusCode::OK, "POST /room/create failed");
+    assert_eq!(
+        room_resp.status(),
+        StatusCode::OK,
+        "POST /room/create failed"
+    );
     let room_id = room_resp.json::<Value>().await.unwrap()["room_id"]
         .as_str()
         .unwrap()
@@ -1953,7 +1957,11 @@ async fn ac_governorless_recipient_consent_grant() {
         .send()
         .await
         .unwrap();
-    assert_eq!(room_resp.status(), StatusCode::OK, "POST /room/create failed");
+    assert_eq!(
+        room_resp.status(),
+        StatusCode::OK,
+        "POST /room/create failed"
+    );
     let room_id = room_resp.json::<Value>().await.unwrap()["room_id"]
         .as_str()
         .unwrap()
@@ -3544,7 +3552,11 @@ async fn setup_agent(server: &TestServer, client: &reqwest::Client, name: &str) 
         .send()
         .await
         .unwrap();
-    assert!(r.status().is_success(), "announce {name} failed: {}", r.status());
+    assert!(
+        r.status().is_success(),
+        "announce {name} failed: {}",
+        r.status()
+    );
     tok
 }
 
@@ -3582,7 +3594,11 @@ async fn join_room(
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), StatusCode::OK, "POST /room/{room_id}/join failed");
+    assert_eq!(
+        r.status(),
+        StatusCode::OK,
+        "POST /room/{room_id}/join failed"
+    );
     r.json::<Value>().await.unwrap()
 }
 
@@ -3599,7 +3615,11 @@ async fn ac_room_1_create_returns_room_id_caller_not_joined() {
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), StatusCode::OK, "POST /room/create must return 200");
+    assert_eq!(
+        r.status(),
+        StatusCode::OK,
+        "POST /room/create must return 200"
+    );
     let body: Value = r.json().await.unwrap();
     let room_id = body["room_id"].as_str().unwrap();
     assert!(!room_id.is_empty(), "room_id must be non-empty");
@@ -3636,7 +3656,10 @@ async fn ac_room_2_join_adds_caller_idempotent() {
         .iter()
         .map(|m| m["name"].as_str().unwrap())
         .collect();
-    assert!(names.contains(&"RoomAlice2"), "alice must be in member list");
+    assert!(
+        names.contains(&"RoomAlice2"),
+        "alice must be in member list"
+    );
 
     // Bob joins.
     let j2 = join_room(&server, &client, &bob, &room_id, None).await;
@@ -3646,7 +3669,10 @@ async fn ac_room_2_join_adds_caller_idempotent() {
         .iter()
         .map(|m| m["name"].as_str().unwrap())
         .collect();
-    assert!(names2.contains(&"RoomAlice2"), "alice in list after bob joins");
+    assert!(
+        names2.contains(&"RoomAlice2"),
+        "alice in list after bob joins"
+    );
     assert!(names2.contains(&"RoomBob2"), "bob in list after bob joins");
 
     // Re-join alice — must return 200 (idempotent).
@@ -3677,7 +3703,10 @@ async fn ac_room_3_ttl_default_and_explicit() {
         .iter()
         .map(|m| m["name"].as_str().unwrap())
         .collect();
-    assert!(names.contains(&"RoomAlice3"), "alice must be present with ttl=1");
+    assert!(
+        names.contains(&"RoomAlice3"),
+        "alice must be present with ttl=1"
+    );
 
     // After TTL expires, alice should be silently removed.
     tokio::time::sleep(Duration::from_millis(1100)).await;
@@ -3703,7 +3732,11 @@ async fn ac_room_3_ttl_default_and_explicit() {
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), StatusCode::OK, "join with default TTL must succeed");
+    assert_eq!(
+        r.status(),
+        StatusCode::OK,
+        "join with default TTL must succeed"
+    );
 }
 
 // AC4: GET /room/{room_id} returns member list with online status; 403 if not member.
@@ -3723,7 +3756,11 @@ async fn ac_room_4_get_member_list_and_access_control() {
         .send()
         .await
         .unwrap();
-    assert_eq!(r403.status(), StatusCode::FORBIDDEN, "non-member GET must return 403");
+    assert_eq!(
+        r403.status(),
+        StatusCode::FORBIDDEN,
+        "non-member GET must return 403"
+    );
 
     // Alice joins; GET as Alice must return member list with online field.
     join_room(&server, &client, &alice, &room_id, None).await;
@@ -3773,7 +3810,11 @@ async fn ac_room_5_leave_removes_caller_idempotent() {
         .send()
         .await
         .unwrap();
-    assert_eq!(get_r.status(), StatusCode::FORBIDDEN, "alice must not see room after leaving");
+    assert_eq!(
+        get_r.status(),
+        StatusCode::FORBIDDEN,
+        "alice must not see room after leaving"
+    );
 
     // Bob still in room.
     let bob_get = client
@@ -3790,7 +3831,10 @@ async fn ac_room_5_leave_removes_caller_idempotent() {
         .iter()
         .map(|m| m["name"].as_str().unwrap())
         .collect();
-    assert!(!members.contains(&"RoomAlice5"), "alice must not appear after leave");
+    assert!(
+        !members.contains(&"RoomAlice5"),
+        "alice must not appear after leave"
+    );
 
     // Idempotent: alice leaving again must return 200.
     let leave2 = client
@@ -3799,7 +3843,11 @@ async fn ac_room_5_leave_removes_caller_idempotent() {
         .send()
         .await
         .unwrap();
-    assert_eq!(leave2.status(), StatusCode::OK, "second leave must be idempotent 200");
+    assert_eq!(
+        leave2.status(),
+        StatusCode::OK,
+        "second leave must be idempotent 200"
+    );
 
     // Leaving a non-existent room must also return 200.
     let leave3 = client
@@ -3808,7 +3856,11 @@ async fn ac_room_5_leave_removes_caller_idempotent() {
         .send()
         .await
         .unwrap();
-    assert_eq!(leave3.status(), StatusCode::OK, "leave non-existent room must return 200");
+    assert_eq!(
+        leave3.status(),
+        StatusCode::OK,
+        "leave non-existent room must return 200"
+    );
 }
 
 // AC6: TTL expiry removes agent silently; no notification emitted.

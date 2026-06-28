@@ -181,7 +181,11 @@ mod tests {
         let store = RoomStore::new();
         let id = store.create();
         let parts: Vec<&str> = id.split('-').collect();
-        assert_eq!(parts.len(), 5, "UUID must have 5 hyphen-separated groups: {id}");
+        assert_eq!(
+            parts.len(),
+            5,
+            "UUID must have 5 hyphen-separated groups: {id}"
+        );
         assert_eq!(parts[0].len(), 8);
         assert_eq!(parts[1].len(), 4);
         assert_eq!(parts[2].len(), 4);
@@ -194,7 +198,10 @@ mod tests {
     #[test]
     fn join_unknown_room_returns_not_found() {
         let store = RoomStore::new();
-        assert!(matches!(store.join("no-such-room", "alice", None), Err(RoomError::RoomNotFound)));
+        assert!(matches!(
+            store.join("no-such-room", "alice", None),
+            Err(RoomError::RoomNotFound)
+        ));
     }
 
     #[test]
@@ -212,7 +219,10 @@ mod tests {
         let store = RoomStore::new();
         let id = store.create();
         store.join(&id, "alice", None).unwrap();
-        assert!(matches!(store.members(&id, "bob"), Err(RoomError::NotMember)));
+        assert!(matches!(
+            store.members(&id, "bob"),
+            Err(RoomError::NotMember)
+        ));
         assert!(store.members(&id, "alice").is_ok());
     }
 
@@ -255,7 +265,10 @@ mod tests {
         // A tiny sleep to ensure Instant::now() > expires_at
         std::thread::sleep(std::time::Duration::from_millis(1));
         // members() should prune alice
-        assert!(matches!(store.members(&id, "alice"), Err(RoomError::NotMember)));
+        assert!(matches!(
+            store.members(&id, "alice"),
+            Err(RoomError::NotMember)
+        ));
         assert!(!store.shares_room("alice", "bob"));
     }
 
@@ -268,7 +281,10 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1));
         // Re-join with normal TTL — should reset
         let names = store.join(&id, "alice", Some(300)).unwrap();
-        assert!(names.contains(&"alice".to_string()), "alice should be back after rejoin");
+        assert!(
+            names.contains(&"alice".to_string()),
+            "alice should be back after rejoin"
+        );
         assert!(store.members(&id, "alice").is_ok());
     }
 }

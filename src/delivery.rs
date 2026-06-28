@@ -4589,7 +4589,11 @@ impl DeliveryHub {
         let inner = self.lock();
         // V2 listen token path — check revocation explicitly.
         if let Some(state) = inner.listen_tokens.get(token) {
-            return if state.revoked { None } else { state.name.clone() };
+            return if state.revoked {
+                None
+            } else {
+                state.name.clone()
+            };
         }
         // Minted agent token path — presence in token_to_name implies validity.
         inner.token_to_name.get(token).cloned()
@@ -4610,10 +4614,7 @@ impl DeliveryHub {
             } else {
                 let tok = AgentToken(from_token.to_string());
                 match inner.trust.agent_identity(&tok) {
-                    Some(id) => (
-                        id.to_string(),
-                        inner.token_to_name.get(from_token).cloned(),
-                    ),
+                    Some(id) => (id.to_string(), inner.token_to_name.get(from_token).cloned()),
                     None => return false,
                 }
             };
