@@ -6,7 +6,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::error::Error;
 use crate::persistence::{PersistedGrant, PersistedToken};
-use crate::types::{ParticipantToken, GovernorToken};
+use crate::types::{GovernorToken, ParticipantToken};
 
 // ── Public enums ──────────────────────────────────────────────────────────────
 

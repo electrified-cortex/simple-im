@@ -16,7 +16,7 @@ use crate::persistence::{
 };
 use crate::registry::{ParticipantIdentity, PresenceScope, Registry};
 use crate::trust::{ApproveGrantRequest, GrantMediation, TrustChain};
-use crate::types::{ParticipantToken, GovernorToken, Payload, QueuedMessage};
+use crate::types::{GovernorToken, ParticipantToken, Payload, QueuedMessage};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -2288,7 +2288,10 @@ impl DeliveryHub {
 
     /// Rotate the caller's agent token atomically. Old token is immediately invalidated.
     /// Identity and all grants remain unchanged (grants are keyed on identity, not token).
-    pub fn refresh_participant_token(&self, old_token: &ParticipantToken) -> Result<ParticipantToken, Error> {
+    pub fn refresh_participant_token(
+        &self,
+        old_token: &ParticipantToken,
+    ) -> Result<ParticipantToken, Error> {
         let (new_token, identity, expiry_instant) = {
             let mut inner = self.lock();
             let new_token = inner.trust.rotate_participant_token(old_token)?;
@@ -3473,7 +3476,10 @@ impl DeliveryHub {
 
     /// Non-blocking dequeue: pops one message from the agent's queue, or returns None.
     /// Clears kick_pending when the queue becomes empty.
-    pub fn pop_queued_message(&self, token: &ParticipantToken) -> Result<Option<QueuedMessage>, Error> {
+    pub fn pop_queued_message(
+        &self,
+        token: &ParticipantToken,
+    ) -> Result<Option<QueuedMessage>, Error> {
         let mut inner = self.lock();
         inner.trust.validate_participant_token(token)?;
         let agent_name = inner
@@ -5736,7 +5742,12 @@ mod tests {
 
     // ── Reply window tests ────────────────────────────────────────────────────
 
-    fn setup_hub_ab_window() -> (DeliveryHub, GovernorToken, ParticipantToken, ParticipantToken) {
+    fn setup_hub_ab_window() -> (
+        DeliveryHub,
+        GovernorToken,
+        ParticipantToken,
+        ParticipantToken,
+    ) {
         use crate::trust::GrantDirection;
         let hub = make_hub(Duration::from_secs(30));
         let gov = hub.install_governor(None);
@@ -5989,7 +6000,12 @@ mod tests {
 
     // ── Brief authorization tests ─────────────────────────────────────────────
 
-    fn setup_hub_brief() -> (DeliveryHub, GovernorToken, ParticipantToken, ParticipantToken) {
+    fn setup_hub_brief() -> (
+        DeliveryHub,
+        GovernorToken,
+        ParticipantToken,
+        ParticipantToken,
+    ) {
         let hub = make_hub(Duration::from_secs(30));
         let gov = hub.install_governor(None);
         let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
@@ -6013,7 +6029,11 @@ mod tests {
             .lock()
             .unwrap()
             .registry
-            .register("bob", ParticipantIdentity::valid("id-bob"), PresenceScope::Public)
+            .register(
+                "bob",
+                ParticipantIdentity::valid("id-bob"),
+                PresenceScope::Public,
+            )
             .unwrap();
 
         let result = hub.send(&tok_a, "bob", Payload(b"hello".to_vec()), None, None);
@@ -6200,7 +6220,12 @@ mod tests {
 
     // ── Inspect / Notify / Bypass mediation tests ─────────────────────────────
 
-    fn setup_hub_inspect() -> (DeliveryHub, GovernorToken, ParticipantToken, ParticipantToken) {
+    fn setup_hub_inspect() -> (
+        DeliveryHub,
+        GovernorToken,
+        ParticipantToken,
+        ParticipantToken,
+    ) {
         use crate::trust::{GrantDirection, GrantMediation};
         let hub = make_hub(Duration::from_secs(30));
         let gov = hub.install_governor(None);
@@ -6918,7 +6943,12 @@ mod tests {
 
     // ── Bilateral consent tests (AC1–AC8 for task 20-9008) ───────────────────
 
-    fn setup_hub_no_grant() -> (DeliveryHub, GovernorToken, ParticipantToken, ParticipantToken) {
+    fn setup_hub_no_grant() -> (
+        DeliveryHub,
+        GovernorToken,
+        ParticipantToken,
+        ParticipantToken,
+    ) {
         let hub = make_hub(Duration::from_secs(30));
         let gov = hub.install_governor(None);
         let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
@@ -7189,7 +7219,14 @@ mod tests {
     // ── Attachments (native file/attachment send) ────────────────────────────────
 
     /// Persistence-backed hub with alice↔bob registered + granted (attachments need a store).
-    async fn setup_persisted_ab(db: &str) -> (DeliveryHub, ParticipantToken, ParticipantToken, GovernorToken) {
+    async fn setup_persisted_ab(
+        db: &str,
+    ) -> (
+        DeliveryHub,
+        ParticipantToken,
+        ParticipantToken,
+        GovernorToken,
+    ) {
         let hub = make_persisted_hub(db, Duration::from_secs(30)).await;
         let gov = hub.install_governor(None);
         let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();

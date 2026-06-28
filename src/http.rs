@@ -27,7 +27,7 @@ use crate::delivery::{
 use crate::error::Error;
 use crate::rooms::RoomStore;
 use crate::trust::{ApproveGrantRequest, GrantDirection, GrantMediation};
-use crate::types::{ParticipantToken, GovernorToken, Payload};
+use crate::types::{GovernorToken, ParticipantToken, Payload};
 
 // ── Bundled skill files ───────────────────────────────────────────────────────
 
