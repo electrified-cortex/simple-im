@@ -211,6 +211,11 @@ struct V2TokenState {
     /// Starts at 0; incremented on every push to message_queues for this token's name.
     /// Used by GET /messages/latest/id for non-consuming peek and long-poll gap detection.
     msg_id_watch: watch::Sender<u64>,
+    /// Set by `register_participant()` to protect the token from Branch-1 GC until the
+    /// first successful `open_listen()` call.  Cleared the moment the SSE stream opens.
+    /// This eliminates the TOCTOU window where GC evicts a freshly minted token before
+    /// the client can call `open_listen()`.  See: sim-gc-race-register-open-listen.
+    pending_first_listen: bool,
 }
 
 impl V2TokenState {
@@ -229,6 +234,7 @@ impl V2TokenState {
             last_ip_at: None,
             governor_id: None,
             msg_id_watch: msg_id_tx,
+            pending_first_listen: false,
         }
     }
 
@@ -527,12 +533,19 @@ impl HubInner {
         //   then vanished (session dropped, no explicit revocation). Evict after unlisten_ttl and
         //   fire sim_offline to grant-peers out-of-lock (caller responsibility). (15-0002H)
         //   Branches 1 and 3 share the same TTL threshold; the filter is unified as !ever_listened.
+        //
+        // GC-race guard: if `pending_first_listen` is true, the token was registered via
+        //   `register_participant()` but `open_listen()` has not yet been called.  Skip Branch-1
+        //   eviction entirely until the stream opens — cleared there. (sim-gc-race-register-open-listen)
         let to_remove: Vec<String> = self
             .listen_tokens
             .iter()
             .filter(|(_, st)| !st.revoked)
             .filter(|(_, st)| {
-                if !st.ever_listened {
+                if st.pending_first_listen {
+                    // Freshly registered token awaiting first open_listen() — GC immune.
+                    false
+                } else if !st.ever_listened {
                     // Branches 1 (no grant) and 3 (ever_granted): both use unlisten_ttl.
                     now.duration_since(st.issued_at) > unlisten_ttl
                 } else if !st.ever_granted {
@@ -781,6 +794,26 @@ impl DeliveryHub {
         self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Override the Branch-1 GC TTL for testing purposes.
+    ///
+    /// Allows tests to use very short TTLs without waiting for the production minimums
+    /// enforced by `clamp_env_secs`.  Only compiled in `#[cfg(test)]`.
+    #[cfg(test)]
+    fn set_gc_unlisten_ttl_for_test(&self, ttl: Duration) {
+        self.lock().v2_gc_ttl_unlisten = ttl;
+    }
+
+    /// Trigger GC inline (test seam).  Returns the count of tokens evicted.
+    ///
+    /// Provides a deterministic way to flush expired tokens in tests without going through
+    /// a public API call that happens to trigger GC as a side-effect.
+    #[cfg(test)]
+    fn trigger_gc_for_test(&self) -> usize {
+        let evicted = self.lock().gc_tokens();
+        // Drop offline-event senders — tests don't need the presence signals.
+        evicted.len()
     }
 
     /// Subscribe to the governor event broadcast channel (governance notices, concurrent-use alerts).
@@ -3572,6 +3605,9 @@ impl DeliveryHub {
     ///
     /// Use this token with `open_listen()` to start listening.
     /// This replaces the old anonymous /listen flow — now agents must register first.
+    ///
+    /// The returned token is marked `pending_first_listen = true`, which prevents Branch-1
+    /// GC from evicting it before `open_listen()` is called.  See: sim-gc-race-register-open-listen.
     pub fn register_participant(&self) -> String {
         let mut inner = self.lock();
         let mut rng = rand::thread_rng();
@@ -3579,7 +3615,9 @@ impl DeliveryHub {
             let digits: u64 = rng.gen_range(10_000_000..=999_999_999_999);
             let tok = digits.to_string();
             if !inner.listen_tokens.contains_key(&tok) {
-                inner.listen_tokens.insert(tok.clone(), V2TokenState::new());
+                let mut state = V2TokenState::new();
+                state.pending_first_listen = true;
+                inner.listen_tokens.insert(tok.clone(), state);
                 return tok;
             }
         }
@@ -3740,8 +3778,11 @@ impl DeliveryHub {
             }
 
             // Mark as ever-listened and increment SSE connection count.
+            // Also clear pending_first_listen: the GC-race guard is no longer needed once
+            // the stream is open.  (sim-gc-race-register-open-listen)
             if let Some(state) = inner.listen_tokens.get_mut(&token) {
                 state.ever_listened = true;
+                state.pending_first_listen = false;
             }
             *inner.sse_connections.entry(token.clone()).or_insert(0) += 1;
 
@@ -8300,6 +8341,57 @@ mod tests {
         assert!(
             matches!(result, Ok(true)),
             "Minted agent with grant should see target's real status"
+        );
+    }
+
+    // ── GC race: register_participant() → GC → open_listen() ─────────────────
+
+    /// AC1+AC2 (sim-gc-race-register-open-listen): a freshly minted listen token must survive
+    /// concurrent GC and succeed on the first `open_listen()` call even when the configured
+    /// `unlisten_ttl` is shorter than the window between registration and first use.
+    ///
+    /// Procedure:
+    ///   1. Create a hub with a very short Branch-1 GC TTL (1 ms) via the test seam.
+    ///   2. Register a participant token — `pending_first_listen` is set to true.
+    ///   3. Sleep past the TTL so the token *would* be eligible for GC.
+    ///   4. Trigger GC explicitly — the token must NOT be evicted (pending guard).
+    ///   5. Call `open_listen()` with the token — must succeed (not AuthFailed/401).
+    ///   6. AC3 regression: a second token registered and then used normally still works.
+    #[test]
+    fn gc_race_registered_token_survives_gc_before_open_listen() {
+        let hub = make_hub(Duration::from_secs(30));
+
+        // AC1: set a 1 ms Branch-1 TTL — far shorter than any real deployment, but
+        // enough to make a freshly minted token appear "stale" to GC immediately.
+        hub.set_gc_unlisten_ttl_for_test(Duration::from_millis(1));
+
+        // Register the token (sets pending_first_listen = true).
+        let token = hub.register_participant();
+
+        // Sleep past the TTL so the token's age exceeds it.
+        std::thread::sleep(Duration::from_millis(5));
+
+        // AC2: trigger GC — the pending token must survive.
+        let evicted = hub.trigger_gc_for_test();
+        assert_eq!(
+            evicted, 0,
+            "GC must not evict a token that has pending_first_listen=true"
+        );
+
+        // Token must still exist: open_listen() must succeed (not AuthFailed).
+        let result = hub.open_listen(Some(&token), None, None, None, false);
+        assert!(
+            result.is_ok(),
+            "open_listen() must succeed for a registered token that survived GC: {result:?}"
+        );
+
+        // AC3 regression: confirm normal lifecycle still works — a second token registered,
+        // then immediately listened, must also succeed.
+        let token2 = hub.register_participant();
+        let result2 = hub.open_listen(Some(&token2), None, None, None, false);
+        assert!(
+            result2.is_ok(),
+            "Normal register → open_listen flow must still succeed: {result2:?}"
         );
     }
 }
