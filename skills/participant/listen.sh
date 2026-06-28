@@ -31,6 +31,22 @@ connect() {
     local token
     token="$(cat "$TOKEN_FILE" 2>/dev/null | tr -d '[:space:]')"
 
+    # If no token, register first
+    if [[ -z "$token" ]]; then
+        echo >&2 "sim: no token — registering via /register"
+        local reg_result
+        reg_result=$(curl -s -X POST "$SIM_URL/register" \
+            -H "Content-Type: application/json" 2>/dev/null)
+        token=$(echo "$reg_result" | grep -o '"token":"[^"]*"' | sed 's/"token":"//;s/"//')
+        if [[ -n "$token" ]]; then
+            echo "$token" > "$TOKEN_FILE"
+            echo >&2 "sim: registered — token saved"
+        else
+            echo >&2 "sim: registration failed — ${reg_result}"
+            return 1
+        fi
+    fi
+
     local auth_header=""
     if [[ -n "$token" ]]; then
         auth_header="Authorization: Bearer $token"
@@ -47,6 +63,17 @@ connect() {
         [[ -z "$line" ]] && continue
         [[ "$line" == :* ]] && continue
 
+        # Detect non-SSE error response (e.g. 401 AUTH_FAILED on stale/invalid token).
+        # S-IM restart clears all tokens — an agent with a pre-restart token in TOKEN_FILE
+        # will get AUTH_FAILED on the first POST /listen. Without this guard, FAIL_COUNT
+        # would increment 10 times and trigger a false SIM-DOWN. Instead: clear the file
+        # and break; the outer loop's next iteration will call /register for a fresh token.
+        if [[ "$line" == *'"AUTH_FAILED"'* || "$line" == *'"TOKEN_REJECTED"'* ]]; then
+            echo >&2 "sim: token rejected — clearing for re-registration"
+            > "$TOKEN_FILE"
+            break
+        fi
+
         if [[ "$line" == data:* ]]; then
             data="${line#data: }"
             type=$(echo "$data" | grep -o '"type":"[^"]*"' | head -1 | sed 's/"type":"//;s/"//')
@@ -54,42 +81,16 @@ connect() {
 
             case "$type/$event" in
                 service/welcome)
-                    # Extract and save token
-                    new_token=$(echo "$data" | grep -o '"token":"[^"]*"' | sed 's/"token":"//;s/"//')
-                    if [[ -n "$new_token" ]]; then
-                        echo "$new_token" > "$TOKEN_FILE"
-                    fi
-                    # Announce handle — try /introduce first (first boot), fall back to /announce (warm reconnect)
-                    sub_id=$(echo "$data" | grep -o '"sub_id":"[^"]*"' | sed 's/"sub_id":"//;s/"//')
-                    if [[ -n "$sub_id" ]]; then
-                        introduce_result=$(curl -s -w "\n%{http_code}" -X POST "$SIM_URL/introduce" \
-                            -H "Content-Type: application/json" \
-                            -H "Authorization: Bearer $new_token" \
-                            -d "{\"handle\":\"$HANDLE\",\"sub_id\":\"$sub_id\"}" 2>/dev/null)
-                        introduce_code="${introduce_result##*$'\n'}"
-                        echo >&2 "sim: introduce HTTP $introduce_code"
-                        # If handle already exists, fall back to /announce
-                        if echo "$introduce_result" | grep -q "HANDLE_EXISTS"; then
-                            announce_result=$(curl -s -w "\n%{http_code}" -X POST "$SIM_URL/announce" \
-                                -H "Content-Type: application/json" \
-                                -H "Authorization: Bearer $new_token" \
-                                -d "{\"name\":\"$HANDLE\"}" 2>/dev/null)
-                            announce_code="${announce_result##*$'\n'}"
-                            echo >&2 "sim: announce HTTP $announce_code"
-                            if [[ "$announce_code" != "204" ]]; then
-                                echo >&2 "sim: announce failed — body: ${announce_result%$'\n'*}"
-                            fi
-                        fi
-                    else
-                        announce_result=$(curl -s -w "\n%{http_code}" -X POST "$SIM_URL/announce" \
-                            -H "Content-Type: application/json" \
-                            -H "Authorization: Bearer $new_token" \
-                            -d "{\"name\":\"$HANDLE\"}" 2>/dev/null)
-                        announce_code="${announce_result##*$'\n'}"
-                        echo >&2 "sim: announce HTTP $announce_code"
-                        if [[ "$announce_code" != "204" ]]; then
-                            echo >&2 "sim: announce failed — body: ${announce_result%$'\n'*}"
-                        fi
+                    # Welcome no longer echoes the token — use $token (set at top of connect()).
+                    # Announce handle to go live.
+                    announce_result=$(curl -s -w "\n%{http_code}" -X POST "$SIM_URL/announce" \
+                        -H "Content-Type: application/json" \
+                        -H "Authorization: Bearer $token" \
+                        -d "{\"name\":\"$HANDLE\"}" 2>/dev/null)
+                    announce_code="${announce_result##*$'\n'}"
+                    echo >&2 "sim: announce HTTP $announce_code"
+                    if [[ "$announce_code" != "204" ]]; then
+                        echo >&2 "sim: announce failed — body: ${announce_result%$'\n'*}"
                     fi
                     ;;
                 service/superseded|service/cancelled)
@@ -99,7 +100,14 @@ connect() {
                 service/revoked)
                     echo >&2 "sim: token revoked — re-registering"
                     > "$TOKEN_FILE"
+                    # Signal outer loop: revoke is intentional governance, not a server failure.
+                    # FAIL_COUNT must not be incremented. Bash runs the pipe-RHS in a subshell so
+                    # we can't set FAIL_COUNT here directly — use a flag file instead.
+                    echo "REVOKED" > "$SCRIPT_DIR/.sim_revoke_flag"
                     break
+                    ;;
+                sub/*)
+                    echo >&2 "sim: subscription event (sub_id embedded)"
                     ;;
                 notify/*)
                     pending=$(echo "$data" | grep -o '"pending":[0-9]*' | grep -o '[0-9]*')
@@ -118,6 +126,16 @@ while true; do
     connect
     connect_end=$(date +%s)
     elapsed=$((connect_end - connect_start))
+
+    # Re-registration triggers — two cases, both are intentional, not server failures:
+    #   1. Revoke flag: governor explicitly cycled the token (service/revoked handler).
+    #   2. Empty/missing TOKEN_FILE: AUTH_FAILED on stale token cleared the file (redeploy recovery).
+    # In both cases: reset backoff, skip FAIL_COUNT increment, continue to re-register.
+    if [[ -f "$SCRIPT_DIR/.sim_revoke_flag" ]] || [[ ! -s "$TOKEN_FILE" ]]; then
+        rm -f "$SCRIPT_DIR/.sim_revoke_flag"
+        BACKOFF=2
+        continue
+    fi
 
     if (( elapsed >= STABLE_THRESHOLD )); then
         # connection held → healthy; reset failure tracking
