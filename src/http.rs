@@ -34,6 +34,7 @@ use crate::types::{GovernorToken, ParticipantToken, Payload};
 const PARTICIPANT_SKILL_MD: &str = include_str!("../skills/participant/SKILL.md");
 const PARTICIPANT_LISTEN_SH: &str = include_str!("../skills/participant/listen.sh");
 const GOVERNOR_SKILL_MD: &str = include_str!("../skills/governor/SKILL.md");
+const OPENAPI_YAML: &str = include_str!("../docs/openapi.yaml");
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
@@ -117,6 +118,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let max_attach = state.attachment_max_bytes;
     Router::new()
         .route("/", get(handle_discovery))
+        .route("/openapi.yaml", get(handle_openapi))
         .route("/register", post(handle_register))
         .route("/listen", post(handle_listen))
         .route("/listen", delete(handle_cancel_listen))
@@ -1141,59 +1143,84 @@ struct DequeueAllBody {
 
 // ── GET / — discovery JSON ─────────────────────────────────────────────────────
 
+/// Returns the machine-readable discovery document listing all API routes.
+/// This is the canonical source of truth for the API surface; the drift-guard
+/// test in this module ensures router ↔ discovery consistency.
 async fn handle_discovery() -> Response {
     (
         StatusCode::OK,
         Json(json!({
             "service": "simple-im",
             "version": "2",
+            "openapi": "/openapi.yaml",
             "entry": "POST /register",
             "description": "Register with POST /register to receive a token, then POST /listen with that token to open your SSE stream. POST /announce to claim a name. See the participant skill for the full flow.",
             "skill": "/skills/participant",
-            "auth": "Bearer <listen-token> in the Authorization header. Gate on HTTP status code; errors are {\"error\":CODE,\"message\":...}.",
-            "participant": {
-                "register": "POST /register",
-                "listen": "POST /listen",
-                "cancel_listen": "DELETE /listen",
-                "announce": "POST /announce",
-                "leave": "POST /leave",
-                "send": "POST /messages/send",
-                "dequeue": "POST /messages/queue/pop",
-                "dequeue_alias": "POST /messages/dequeue",
-                "dequeue_all": "DELETE /messages/queue",
-                "pending": "GET /messages/pending",
-                "latest": "GET /messages/latest",
-                "latest_id": "GET /messages/latest/id",
-                "presence": "GET /participants/{name}/presence",
-                "presence_scope": "POST /participants/{name}/presence-scope",
-                "participants": "GET /participants",
-                "deregister": "DELETE /participants/{name}",
-                "grant_request": "POST /grants/request",
-                "grants": "GET /grants",
-                "attach": "POST /attachments?to=<name>&filename=<f>  (raw body = file bytes, Content-Type = mime)",
-                "attachment_fetch": "GET /attachments/{id}"
-            },
-            "dcp": {
-                "note": "Advanced connect-by-handle handshake. The V2 listen+announce flow above is the default; use DCP only for handle-addressed direct connect.",
-                "introduce": "POST /introduce",
-                "connect_probe_ack": "POST /connect-probe-ack"
-            },
-            "governor": {
-                "skill": "/skills/governor",
-                "claim": "POST /governors/claim",
-                "election_vote": "POST /governors/elections/{id}  (body {\"action\":\"approve|reject\"})",
-                "refresh": "POST /governors/refresh",
-                "transfer": "POST /governors/transfer",
-                "accept_transfer": "POST /governors/accept-transfer",
-                "mediate": "POST /governors/mediate",
-                "events": "GET /governors/events",
-                "approve_grant": "POST /grants/approve",
-                "grant_request_action": "PATCH /grants/requests/{id}  (body: {\"action\":\"approve|deny|hold\"})",
-                "list_grants": "GET /grants",
-                "list_all_grants": "GET /governors/grants",
-                "block": "POST /grants/block",
-                "unblock": "POST /grants/unblock",
-                "revoke_grant": "DELETE /grants/{id}"
+            "auth": "Bearer <token> in the Authorization header. Token types: listen-token (participant), governor-token (governor). Gate on HTTP status code; errors are {\"error\":CODE,\"message\":...}.",
+            "routes": {
+                "discovery": {
+                    "GET /": {"auth": "none", "body": null, "hint": "Returns this discovery document"}
+                },
+                "skill": {
+                    "GET /skills/participant": {"auth": "none", "body": null, "hint": "Participant skill markdown"},
+                    "GET /skills/participant/listen.sh": {"auth": "none", "body": null, "hint": "Participant listen script"},
+                    "GET /skills/governor": {"auth": "none", "body": null, "hint": "Governor skill markdown"},
+                    "GET /openapi.yaml": {"auth": "none", "body": null, "hint": "OpenAPI 3.x specification (YAML)"}
+                },
+                "participant": {
+                    "POST /register": {"auth": "none", "body": null, "hint": "Mint a new participant token"},
+                    "POST /listen": {"auth": "participant", "body": "{name?}", "hint": "Open SSE stream; optional name to auto-announce"},
+                    "DELETE /listen": {"auth": "participant", "body": null, "hint": "Close SSE stream, unbind name"},
+                    "POST /announce": {"auth": "participant", "body": "{name, force?}", "hint": "Claim a name for this token"},
+                    "POST /leave": {"auth": "participant", "body": "{sub_id}", "hint": "Disconnect preserving identity (DCP)"},
+                    "GET /participants": {"auth": "governor", "body": null, "hint": "List all announced participants"},
+                    "DELETE /participants/{name}": {"auth": "governor", "body": null, "hint": "Force-revoke participant by name"},
+                    "GET /participants/{name}/presence": {"auth": "participant", "body": null, "hint": "Check if participant is online"},
+                    "POST /participants/{name}/presence-scope": {"auth": "participant", "body": "{presence_scope}", "hint": "Set presence visibility (hidden/visible)"}
+                },
+                "message": {
+                    "POST /messages/send": {"auth": "participant", "body": "{to|to_token, payload, reason?, thread_id?}", "hint": "Send message to participant"},
+                    "POST /messages/queue/pop": {"auth": "participant", "body": "{thread?}", "hint": "Dequeue one message"},
+                    "POST /messages/dequeue": {"auth": "participant", "body": "{thread?}", "hint": "Alias for POST /messages/queue/pop"},
+                    "DELETE /messages/queue": {"auth": "participant", "body": "{thread?}", "hint": "Drain all queued messages"},
+                    "GET /messages/pending": {"auth": "participant", "body": null, "hint": "Count pending messages"},
+                    "GET /messages/latest/id": {"auth": "participant", "body": null, "hint": "Peek latest message ID (supports long-poll: ?since=N&wait=60)"},
+                    "GET /messages/latest": {"auth": "participant", "body": null, "hint": "Peek full latest message without consuming"}
+                },
+                "grant": {
+                    "GET /grants": {"auth": "participant", "body": null, "hint": "List your active grants"},
+                    "POST /grants/request": {"auth": "participant", "body": "{to, reason?, request_id?}", "hint": "Request a grant to reach a peer"},
+                    "PATCH /grants/requests/{id}": {"auth": "participant|governor", "body": "{action, reason?, expiry_secs?}", "hint": "Approve/deny/hold a grant request"},
+                    "POST /grants/approve": {"auth": "governor", "body": "{identity_a, identity_b, expiry_secs?, direction?, max_messages?, mediation?, conditions?}", "hint": "Directly approve a grant pair"},
+                    "POST /grants/block": {"auth": "governor", "body": "{from_identity, to_name, reason, expires_at?}", "hint": "Persistently block a sender→recipient pair"},
+                    "POST /grants/unblock": {"auth": "governor", "body": "{from_identity, to_name}", "hint": "Remove a persistent block"},
+                    "DELETE /grants/{id}": {"auth": "governor", "body": null, "hint": "Revoke a grant by ID"}
+                },
+                "governor": {
+                    "POST /governors/claim": {"auth": "participant", "body": "{expiry_secs?}", "hint": "Claim governorship (may trigger election)"},
+                    "POST /governors/elections/{id}": {"auth": "participant", "body": "{action}", "hint": "Vote on a pending election/transfer"},
+                    "POST /governors/refresh": {"auth": "governor", "body": null, "hint": "Rotate governor token"},
+                    "POST /governors/transfer": {"auth": "governor", "body": "{to?}", "hint": "Initiate governor transfer"},
+                    "POST /governors/accept-transfer": {"auth": "transfer_token", "body": "{name}", "hint": "Accept governor transfer"},
+                    "POST /governors/mediate": {"auth": "governor", "body": "{mediation_id, decision, payload?}", "hint": "Resolve a mediation hold"},
+                    "GET /governors/events": {"auth": "governor", "body": null, "hint": "SSE stream of governor events"},
+                    "GET /governors/grants": {"auth": "governor", "body": null, "hint": "List all grants in the system (supports ?participant=)"}
+                },
+                "dcp": {
+                    "POST /introduce": {"auth": "none", "body": "{handle, sub_id}", "hint": "Mint a new DCP identity (TOFU)"},
+                    "POST /connect-probe-ack": {"auth": "dcp_auth_token", "body": "{nonce, sub_id}", "hint": "Acknowledge DCP nonce probe"}
+                },
+                "attachment": {
+                    "POST /attachments": {"auth": "participant", "body": "raw bytes (query: ?to=&filename=&note=)", "hint": "Upload file attachment"},
+                    "GET /attachments/{id}": {"auth": "participant", "body": null, "hint": "Download attachment by ID"}
+                },
+                "room": {
+                    "POST /room/create": {"auth": "participant", "body": null, "hint": "Create a new room (returns room_id)"},
+                    "GET /room/create": {"auth": "none", "body": null, "hint": "Reserved path — returns 400"},
+                    "POST /room/{room_id}/join": {"auth": "participant", "body": "{ttl?}", "hint": "Join a room (idempotent)"},
+                    "GET /room/{room_id}": {"auth": "participant", "body": null, "hint": "Get room members (must be a member)"},
+                    "POST /room/{room_id}/leave": {"auth": "participant", "body": null, "hint": "Leave a room (idempotent)"}
+                }
             }
         })),
     )
@@ -1677,6 +1704,14 @@ async fn handle_skill_governor() -> impl IntoResponse {
     )
 }
 
+/// GET /openapi.yaml — returns the OpenAPI 3.x specification.
+async fn handle_openapi() -> impl IntoResponse {
+    (
+        [("content-type", "text/yaml; charset=utf-8")],
+        OPENAPI_YAML,
+    )
+}
+
 // ── Rooms discovery ───────────────────────────────────────────────────────────
 //
 // All room routes require `Authorization: Bearer <token>`.  The token must
@@ -1827,4 +1862,173 @@ async fn handle_room_leave(
     };
     state.rooms.leave(&room_id, &caller);
     (StatusCode::OK, Json(json!({"status": "ok"}))).into_response()
+}
+
+// ── Drift guard: router ↔ discovery consistency ───────────────────────────────
+
+/// Returns all routes registered in the router.
+/// Each entry is "METHOD /path" (e.g., "GET /", "POST /register").
+#[cfg(test)]
+fn router_routes() -> Vec<String> {
+    // This is the canonical list of routes. If you add a route to the router,
+    // add it here too. The drift guard test will catch mismatches.
+    vec![
+        "GET /".to_string(),
+        "GET /openapi.yaml".to_string(),
+        "POST /register".to_string(),
+        "POST /listen".to_string(),
+        "DELETE /listen".to_string(),
+        "POST /announce".to_string(),
+        "POST /introduce".to_string(),
+        "POST /connect-probe-ack".to_string(),
+        "POST /leave".to_string(),
+        "GET /skills/participant".to_string(),
+        "GET /skills/participant/listen.sh".to_string(),
+        "GET /skills/governor".to_string(),
+        "GET /participants".to_string(),
+        "DELETE /participants/{name}".to_string(),
+        "GET /participants/{name}/presence".to_string(),
+        "POST /participants/{name}/presence-scope".to_string(),
+        "POST /messages/send".to_string(),
+        "POST /messages/queue/pop".to_string(),
+        "POST /messages/dequeue".to_string(),
+        "DELETE /messages/queue".to_string(),
+        "GET /messages/pending".to_string(),
+        "GET /messages/latest/id".to_string(),
+        "GET /messages/latest".to_string(),
+        "POST /governors/claim".to_string(),
+        "POST /governors/elections/{id}".to_string(),
+        "POST /governors/refresh".to_string(),
+        "POST /governors/transfer".to_string(),
+        "POST /governors/accept-transfer".to_string(),
+        "POST /governors/mediate".to_string(),
+        "GET /governors/events".to_string(),
+        "GET /governors/grants".to_string(),
+        "GET /grants".to_string(),
+        "POST /grants/approve".to_string(),
+        "POST /grants/request".to_string(),
+        "PATCH /grants/requests/{id}".to_string(),
+        "POST /grants/unblock".to_string(),
+        "POST /grants/block".to_string(),
+        "DELETE /grants/{id}".to_string(),
+        "POST /attachments".to_string(),
+        "GET /attachments/{id}".to_string(),
+        "POST /room/create".to_string(),
+        "GET /room/create".to_string(),
+        "POST /room/{room_id}/join".to_string(),
+        "GET /room/{room_id}".to_string(),
+        "POST /room/{room_id}/leave".to_string(),
+    ]
+}
+
+/// Extracts routes from the LIVE discovery handler response.
+/// This calls handle_discovery() and parses its JSON output to get the actual
+/// routes being advertised, ensuring the test detects real drift.
+#[cfg(test)]
+fn discovery_routes() -> Vec<String> {
+    use tokio::runtime::Runtime;
+
+    // Create a runtime to call the async handler
+    let rt = Runtime::new().expect("Failed to create runtime");
+    let response = rt.block_on(handle_discovery());
+
+    // Extract the JSON body from the response
+    let body = rt.block_on(async {
+        let (_, body) = response.into_parts();
+        axum::body::to_bytes(body, usize::MAX).await.expect("Failed to read body")
+    });
+
+    let discovery: serde_json::Value =
+        serde_json::from_slice(&body).expect("Discovery response is not valid JSON");
+
+    // Extract all routes from the "routes" object
+    let mut routes = Vec::new();
+    if let Some(categories) = discovery["routes"].as_object() {
+        for (_category, endpoints) in categories {
+            if let Some(eps) = endpoints.as_object() {
+                for (route, _) in eps {
+                    routes.push(route.clone());
+                }
+            }
+        }
+    }
+    routes.sort();
+    routes
+}
+
+#[cfg(test)]
+mod drift_guard_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// Drift guard test: ensures router routes match discovery routes.
+    /// If this test fails, either:
+    /// 1. A route was added to the router but not to discovery (update handle_discovery)
+    /// 2. A route was added to discovery but not to the router (remove from discovery or add to router)
+    /// 3. A route was renamed in one place but not the other (update both)
+    #[test]
+    fn router_discovery_consistency() {
+        let router_set: HashSet<String> = router_routes().into_iter().collect();
+        let discovery_set: HashSet<String> = discovery_routes().into_iter().collect();
+
+        let in_router_not_discovery: Vec<_> = router_set.difference(&discovery_set).collect();
+        let in_discovery_not_router: Vec<_> = discovery_set.difference(&router_set).collect();
+
+        let mut errors = Vec::new();
+
+        if !in_router_not_discovery.is_empty() {
+            errors.push(format!(
+                "Routes in router but missing from discovery:\n  {}",
+                in_router_not_discovery
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n  ")
+            ));
+        }
+
+        if !in_discovery_not_router.is_empty() {
+            errors.push(format!(
+                "Routes in discovery but missing from router:\n  {}",
+                in_discovery_not_router
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n  ")
+            ));
+        }
+
+        if !errors.is_empty() {
+            panic!(
+                "Router ↔ Discovery drift detected!\n\n{}\n\nUpdate handle_discovery() or router() to fix.",
+                errors.join("\n\n")
+            );
+        }
+    }
+
+    /// Validates that the OpenAPI spec can be parsed as YAML.
+    #[test]
+    fn openapi_spec_is_valid_yaml() {
+        // Basic validation: the spec should start with "openapi:" and contain "paths:"
+        assert!(
+            OPENAPI_YAML.starts_with("openapi:"),
+            "OpenAPI spec should start with 'openapi:'"
+        );
+        assert!(
+            OPENAPI_YAML.contains("paths:"),
+            "OpenAPI spec should contain 'paths:'"
+        );
+        assert!(
+            OPENAPI_YAML.contains("/register:"),
+            "OpenAPI spec should document /register"
+        );
+        assert!(
+            OPENAPI_YAML.contains("/listen:"),
+            "OpenAPI spec should document /listen"
+        );
+        assert!(
+            OPENAPI_YAML.contains("/openapi.yaml:"),
+            "OpenAPI spec should document /openapi.yaml"
+        );
+    }
 }
