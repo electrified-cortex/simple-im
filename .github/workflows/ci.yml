@@ -31,6 +31,8 @@ jobs:
 
       - name: Test
         run: cargo test --all
+        env:
+          TMPDIR: ${{ runner.temp }}
 
       - name: Release build
         run: cargo build --release
