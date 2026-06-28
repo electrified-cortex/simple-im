@@ -298,7 +298,11 @@ mod tests {
         ));
         assert!(!store.shares_room("alice", "bob"));
         // shares_room prunes + removes the now-empty room
-        assert_eq!(store.room_count(), 0, "empty room must be removed by shares_room cleanup");
+        assert_eq!(
+            store.room_count(),
+            0,
+            "empty room must be removed by shares_room cleanup"
+        );
     }
 
     // ── Room eviction tests (sim-rooms-empty-room-eviction) ─────────────────────
