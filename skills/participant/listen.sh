@@ -63,6 +63,17 @@ connect() {
         [[ -z "$line" ]] && continue
         [[ "$line" == :* ]] && continue
 
+        # Detect non-SSE error response (e.g. 401 AUTH_FAILED on stale/invalid token).
+        # S-IM restart clears all tokens — an agent with a pre-restart token in TOKEN_FILE
+        # will get AUTH_FAILED on the first POST /listen. Without this guard, FAIL_COUNT
+        # would increment 10 times and trigger a false SIM-DOWN. Instead: clear the file
+        # and break; the outer loop's next iteration will call /agents/register for a fresh token.
+        if [[ "$line" == *'"AUTH_FAILED"'* || "$line" == *'"TOKEN_REJECTED"'* ]]; then
+            echo >&2 "sim: token rejected — clearing for re-registration"
+            > "$TOKEN_FILE"
+            break
+        fi
+
         if [[ "$line" == data:* ]]; then
             data="${line#data: }"
             type=$(echo "$data" | grep -o '"type":"[^"]*"' | head -1 | sed 's/"type":"//;s/"//')
