@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use crate::error::Error;
-use crate::registry::{AgentIdentity, PresenceScope, Registry};
+use crate::registry::{ParticipantIdentity, PresenceScope, Registry};
 
 pub const DEFAULT_LIVENESS_WINDOW: Duration = Duration::from_secs(30);
 
@@ -36,13 +36,13 @@ impl<F: Fn() -> Instant> PresenceModule<F> {
     pub fn register(
         &mut self,
         name: &str,
-        identity: AgentIdentity,
+        identity: ParticipantIdentity,
         scope: PresenceScope,
     ) -> Result<(), Error> {
         self.registry.register(name, identity, scope)
     }
 
-    pub fn deregister(&mut self, name: &str, identity: AgentIdentity) -> Result<(), Error> {
+    pub fn deregister(&mut self, name: &str, identity: ParticipantIdentity) -> Result<(), Error> {
         self.registry.deregister(name, identity)
     }
 
@@ -81,7 +81,7 @@ mod tests {
         let (mut pm, _) = controlled_module(Duration::from_secs(5));
         pm.register(
             "alice",
-            AgentIdentity::valid("id-alice"),
+            ParticipantIdentity::valid("id-alice"),
             PresenceScope::GrantScoped,
         )
         .unwrap();
@@ -95,7 +95,7 @@ mod tests {
         let (mut pm, offset) = controlled_module(ttl);
         pm.register(
             "alice",
-            AgentIdentity::valid("id-alice"),
+            ParticipantIdentity::valid("id-alice"),
             PresenceScope::GrantScoped,
         )
         .unwrap();
@@ -112,7 +112,7 @@ mod tests {
         let (mut pm, offset) = controlled_module(small_ttl);
         pm.register(
             "bob",
-            AgentIdentity::valid("id-bob"),
+            ParticipantIdentity::valid("id-bob"),
             PresenceScope::GrantScoped,
         )
         .unwrap();
@@ -128,7 +128,7 @@ mod tests {
         let (mut pm, offset) = controlled_module(ttl);
         pm.register(
             "alice",
-            AgentIdentity::valid("id-alice"),
+            ParticipantIdentity::valid("id-alice"),
             PresenceScope::GrantScoped,
         )
         .unwrap();
@@ -137,7 +137,7 @@ mod tests {
         assert!(
             pm.register(
                 "alice",
-                AgentIdentity::valid("id-new"),
+                ParticipantIdentity::valid("id-new"),
                 PresenceScope::GrantScoped
             )
             .is_ok()

@@ -12,7 +12,7 @@ Your job: approve grants, mediate held messages, revoke tokens, resolve NAME_IN_
 
 ## How governors are obtained
 
-A governor token is obtained by claiming governorship via `POST /governors/claim`. There is no administrator who mints it for you — governors are elected or self-appointed by the agents themselves.
+A governor token is obtained by claiming governorship via `POST /governors/claim`. There is no administrator who mints it for you — governors are elected or self-appointed by the participants themselves.
 
 ```
 POST /governors/claim
@@ -25,14 +25,14 @@ The outcome depends on hub state:
 
 | Hub state | HTTP | Response body |
 |---|---|---|
-| No governor, you are the only active agent | `200` | `{"status":"granted","governor_token":"..."}` |
-| No governor, other active agents present | `202` | `{"status":"election","claim_id":"...","voters":N}` |
+| No governor, you are the only active participant | `200` | `{"status":"granted","governor_token":"..."}` |
+| No governor, other active participants present | `202` | `{"status":"election","claim_id":"...","voters":N}` |
 | A governor already exists | `202` | `{"status":"transfer_pending","claim_id":"..."}` |
 
-**Election:** each active agent votes via:
+**Election:** each active participant votes via:
 ```
 POST /governors/elections/{claim_id}   {"action": "approve" | "reject"}
-Authorization: Bearer <agent-listen-token>
+Authorization: Bearer <participant-listen-token>
 ```
 On unanimous approval, the candidate receives their governor token as a `{"type":"governance","event":"governorship_granted","governor_token":"..."}` event on their own SSE feed.
 
@@ -80,7 +80,7 @@ Returns `{"grant_id":"..."}`.
 When `grant_request` arrives on your event stream:
 
 ```json
-{"type":"grant_request","request_id":"req-1","from":"agent-a","to":"agent-b","reason":"...",
+{"type":"grant_request","request_id":"req-1","from":"participant-a","to":"participant-b","reason":"...",
  "action_url":"/grants/requests/req-1","method":"PATCH","actions":["approve","deny","hold"]}
 ```
 
@@ -121,14 +121,14 @@ Returns all active grants in the system (not just yours as a participant). Usefu
 ## Block / unblock a pair
 
 ```
-POST /grants/block   {"from": "agent-a", "to": "agent-b", "reason": "..."}
+POST /grants/block   {"from": "participant-a", "to": "participant-b", "reason": "..."}
 Authorization: Bearer <governor-token>
 ```
 
 Permanently blocks the sender→recipient pair regardless of any active grant. The pair receives `GRANT_BLOCKED` on any send attempt. Unblock with:
 
 ```
-POST /grants/unblock   {"from": "agent-a", "to": "agent-b"}
+POST /grants/unblock   {"from": "participant-a", "to": "participant-b"}
 Authorization: Bearer <governor-token>
 ```
 
@@ -146,7 +146,7 @@ Immediately ends the grant. Existing queued messages are unaffected; future send
 When `mediation` arrives:
 
 ```json
-{"type":"mediation","mediation_id":"med-1","from":"agent-a","to":"agent-b","payload":"...","conditions":"..."}
+{"type":"mediation","mediation_id":"med-1","from":"participant-a","to":"participant-b","payload":"...","conditions":"..."}
 ```
 
 ```

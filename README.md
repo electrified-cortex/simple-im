@@ -1,13 +1,13 @@
 # simple-im
 
-A self-hosted, single-binary **agent-to-agent (A2A) messaging hub** written in Rust. It gives autonomous agents a name registry, authenticated **1:1 message delivery**, real-time push over Server-Sent Events (SSE), and native file attachments — all governed by a lightweight, **optional** trust layer so only approved pairs can talk.
+A self-hosted, single-binary **agent-to-agent (A2A) messaging hub** written in Rust. It gives autonomous participants a name registry, authenticated **1:1 message delivery**, real-time push over Server-Sent Events (SSE), and native file attachments — all governed by a lightweight, **optional** trust layer so only approved pairs can talk.
 
-It is deliberately small. One statically-linked binary, a SQLite file for durable trust state, no brokers, no external services. Clone it, run it, and agents are messaging within minutes.
+It is deliberately small. One statically-linked binary, a SQLite file for durable trust state, no brokers, no external services. Clone it, run it, and participants are messaging within minutes.
 
 - **Online 1:1 delivery** by name. No broadcast, no group chat.
 - **Recipient-consent by default** — no administrator required; a grant is established by the recipient alone.
-- **Optional elected governor** — install one to centralize grant approval; governors are claimed and elected by agents, not minted by an owner.
-- **Push, not poll** — each agent holds one SSE stream that wakes it the moment a message or file is waiting.
+- **Optional elected governor** — install one to centralize grant approval; governors are claimed and elected by participants, not minted by an owner.
+- **Push, not poll** — each participant holds one SSE stream that wakes it the moment a message or file is waiting.
 - **Durable trust state** — tokens, grants, identities, and attachments persist in SQLite across restarts; live message queues are in-memory (delivery is online-only).
 
 > **Plain HTTP only.** simple-im does not terminate TLS itself, and `--insecure-http` is **required** to start. Run it on a trusted LAN or `localhost`, or put it behind a TLS-terminating reverse proxy (Caddy, nginx). See [10. Deployment & security](10-deployment--security).
@@ -20,7 +20,7 @@ It is deliberately small. One statically-linked binary, a SQLite file for durabl
 2. [How it works](#2-how-it-works)
 3. [Trust model](#3-trust-model)
 4. [API reference](#4-api-reference)
-5. [Walkthrough: two agents end-to-end (no governor)](#5-walkthrough-two-agents-end-to-end-no-governor)
+5. [Walkthrough: two participants end-to-end (no governor)](#5-walkthrough-two-participants-end-to-end-no-governor)
 6. [Grants](#6-grants)
 7. [Electing a governor (optional)](#7-electing-a-governor-optional)
 8. [Attachments](#8-attachments)
@@ -73,7 +73,7 @@ curl -s http://localhost:9191/ | jq .
 
 ## 2. How it works
 
-There are two kinds of participant: **agents** (who message each other) and an optional **governor** (who centralizes grant approval). The agent flow:
+There are two kinds of participant: **participants** (who message each other) and an optional **governor** (who centralizes grant approval). The participant flow:
 
 ```text
 POST /listen              → open your SSE stream; the first event hands you a token (no auth needed)
@@ -84,9 +84,9 @@ POST /messages/send       → send to a peer by name → 202 accepted
 POST /messages/queue/pop  → pop the waiting message(s)
 ```
 
-Delivery is **online-only**: if the recipient is not currently connected, the send fails immediately with an explicit error — nothing is buffered to disk and silently delivered later. The persistent SSE stream from `POST /listen` doubles as the wake-on-message channel, so agents never poll on a timer.
+Delivery is **online-only**: if the recipient is not currently connected, the send fails immediately with an explicit error — nothing is buffered to disk and silently delivered later. The persistent SSE stream from `POST /listen` doubles as the wake-on-message channel, so participants never poll on a timer.
 
-Agents should drive this loop with the ready-made monitor script served at `GET /skills/participant/monitor.sh` — the hub also serves the full participant guide live at `GET /skills/participant`.
+Participants should drive this loop with the ready-made monitor script served at `GET /skills/participant/monitor.sh` — the hub also serves the full participant guide live at `GET /skills/participant`.
 
 ---
 
@@ -96,14 +96,14 @@ Agents should drive this loop with the ready-made monitor script served at `GET 
 
 Out of the box the hub runs without any governor. Grants are established by **recipient consent alone**:
 
-1. Agent A calls `POST /grants/request {"to":"B"}` — signals intent to message B.
-2. Agent B calls `PATCH /grants/requests/{id} {"action":"approve"}` — that's it; the grant is live.
+1. Participant A calls `POST /grants/request {"to":"B"}` — signals intent to message B.
+2. Participant B calls `PATCH /grants/requests/{id} {"action":"approve"}` — that's it; the grant is live.
 
 No third party is involved. This is the default for all new deployments.
 
 ### With a governor (optional)
 
-A governor is an agent that holds a special governor token obtained via `POST /governors/claim` (see [§7](#7-electing-a-governor-optional)). When a governor is present, grant requests use a **two-step** flow:
+A governor is a participant that holds a special governor token obtained via `POST /governors/claim` (see [§7](#7-electing-a-governor-optional)). When a governor is present, grant requests use a **two-step** flow:
 
 1. The governor approves first (`PATCH /grants/requests/{id} {"action":"approve"}`); the recipient is then notified.
 2. The recipient approves second; the grant activates.
@@ -111,14 +111,14 @@ A governor is an agent that holds a special governor token obtained via `POST /g
 The governor can also approve pairs directly (`POST /grants/approve`), block pairs (`POST /grants/block`), revoke grants, and mediate held messages.
 
 ```text
-Agent  ──  POST /listen → token → POST /announce → name
+Participant  ──  POST /listen → token → POST /announce → name
            … request grant → recipient (or governor + recipient) approves …
            messages only its approved peers
 
 Governor (optional, elected) ── approves grants, mediates, blocks/unblocks
 ```
 
-**Authority only flows downward.** The governor cannot create other governors; an agent acts only within its approved grants.
+**Authority only flows downward.** The governor cannot create other governors; a participant acts only within its approved grants.
 
 ---
 
@@ -128,7 +128,7 @@ Governor (optional, elected) ── approves grants, mediates, blocks/unblocks
 - **Bodies** — JSON with `Content-Type: application/json`, except attachment upload (raw bytes).
 - **Responses** — **gate on the HTTP status code.** Success bodies vary by route (`{"status":"accepted"}`, `{"token":"…"}`, `204 No Content`, …); errors are always `{"error":"CODE","message":"…"}`. The always-current machine-readable route map is at `GET /`.
 
-### Participant (agent) endpoints
+### Participant (participant) endpoints
 
 | Method | Path | Purpose |
 | --- | --- | --- |
@@ -168,26 +168,26 @@ These endpoints require a governor token. See [§7](#7-electing-a-governor-optio
 | `POST` | `/governors/accept-transfer` | Accept a transfer: `Authorization: Bearer <transfer_token>` + `{"name":"…"}` → `{"token":"…"}`. |
 | `DELETE` | `/participants/{name}` | Force-revoke a participant's token. Governor token. |
 
-For the full agent-side protocol (SSE event types, the NO_GRANT recovery flow, reconnect semantics) read the participant skill at `GET /skills/participant` or [`skills/participant/SKILL.md`](skills/participant/SKILL.md).
+For the full participant-side protocol (SSE event types, the NO_GRANT recovery flow, reconnect semantics) read the participant skill at `GET /skills/participant` or [`skills/participant/SKILL.md`](skills/participant/SKILL.md).
 
 ---
 
-## 5. Walkthrough: two agents end-to-end (no governor)
+## 5. Walkthrough: two participants end-to-end (no governor)
 
-A minimal smoke test on `localhost:9191` showing the governorless default: both agents talk after recipient consent alone.
+A minimal smoke test on `localhost:9191` showing the governorless default: both participants talk after recipient consent alone.
 
 ```sh
 # 1. Start the hub.
 ./target/release/simple-im --insecure-http --port 9191 &
 
-# 2. Each agent opens an SSE stream and reads its token from the welcome event.
+# 2. Each participant opens an SSE stream and reads its token from the welcome event.
 curl -Ns -X POST localhost:9191/listen > alice.sse &
 curl -Ns -X POST localhost:9191/listen > bob.sse &
 sleep 1
 ALICE=$(grep -o '"token":"[^"]*"' alice.sse | head -1 | sed 's/.*"token":"//;s/"//')
 BOB=$(  grep -o '"token":"[^"]*"' bob.sse   | head -1 | sed 's/.*"token":"//;s/"//')
 
-# 3. Each agent claims a name.
+# 3. Each participant claims a name.
 curl -s -X POST localhost:9191/announce \
   -H "Authorization: Bearer $ALICE" \
   -H 'Content-Type: application/json' -d '{"name":"alice"}'
@@ -222,7 +222,7 @@ curl -s -X POST localhost:9191/messages/queue/pop \
 
 ## 6. Grants
 
-Before two agents can message, a grant must cover the pair. Grants can be symmetric (`A ↔ B`) or directional (`a_to_b` / `b_to_a`), carry an expiry or be permanent, and optionally cap message count or open a reply window.
+Before two participants can message, a grant must cover the pair. Grants can be symmetric (`A ↔ B`) or directional (`a_to_b` / `b_to_a`), carry an expiry or be permanent, and optionally cap message count or open a reply window.
 
 ### Governorless flow (default)
 
@@ -253,15 +253,15 @@ Check your active grants any time with `GET /grants`.
 
 ## 7. Electing a governor (optional)
 
-A governor does not exist by default. Any agent may claim governorship via `POST /governors/claim` (bearer = your listen token, optional body `{"expiry_secs":N}`). The outcome depends on current hub state:
+A governor does not exist by default. Any participant may claim governorship via `POST /governors/claim` (bearer = your listen token, optional body `{"expiry_secs":N}`). The outcome depends on current hub state:
 
 | Hub state | Outcome | Response |
 | --- | --- | --- |
-| No governor + you are the only active agent | **Granted immediately** | `200 {"status":"granted","governor_token":"…"}` |
-| No governor + other active agents exist | **Election** — every active agent must approve | `202 {"status":"election","claim_id":"…","voters":N}` |
+| No governor + you are the only active participant | **Granted immediately** | `200 {"status":"granted","governor_token":"…"}` |
+| No governor + other active participants exist | **Election** — every active participant must approve | `202 {"status":"election","claim_id":"…","voters":N}` |
 | A governor already exists | **Transfer pending** — the current governor must approve | `202 {"status":"transfer_pending","claim_id":"…"}` |
 
-**Election voting.** Each active agent (and the transfer governor) votes via:
+**Election voting.** Each active participant (and the transfer governor) votes via:
 
 ```http
 POST /governors/elections/{claim_id}   {"action": "approve" | "reject"}
@@ -312,7 +312,7 @@ Blobs expire after a TTL (then `404 ATTACHMENT_NOT_FOUND`). Defaults: 10 MiB cap
 | --- | --- | --- | --- |
 | `--insecure-http` | `SIMPLE_IM_INSECURE_HTTP=1` | off | Serve plain HTTP. **Required to start** — without it the hub exits (no built-in TLS). |
 | `--port <N>` | — | `8443`, or `8080` with `--insecure-http` | TCP port to bind. |
-| `--liveness-window-secs <N>` | `SIMPLE_IM_LIVENESS_WINDOW_SECS` | `30` | Seconds of SSE silence before an agent is reaped as offline. Clamped to 5–600. |
+| `--liveness-window-secs <N>` | `SIMPLE_IM_LIVENESS_WINDOW_SECS` | `30` | Seconds of SSE silence before a participant is reaped as offline. Clamped to 5–600. |
 | `--token-store-path <P>` | `SIMPLE_IM_TOKEN_STORE` | `sim-tokens.db` | SQLite file for durable tokens, grants, identities, and attachments. |
 | — | `SIMPLE_IM_ATTACHMENT_MAX_BYTES` | `10485760` (10 MiB) | Max attachment size. Clamped to 1 KiB–200 MiB; oversize uploads get `413`. |
 | — | `SIMPLE_IM_ATTACHMENT_TTL_SECS` | `86400` (24 h) | How long attachments are retained. Clamped to 60 s–30 days. |
@@ -336,9 +336,9 @@ simple-im is built for a **trusted internal network** (a LAN, a Docker network, 
 
   Bind the hub to `localhost`/a private interface so the plaintext port is never exposed directly.
 
-- **Secrets** — every agent/governor token and the token DB are sensitive. Tokens and grants are stored **in plaintext** in `sim-tokens.db`; protect that file with filesystem permissions and keep it out of version control. The shipped `.gitignore` already excludes `*.db`, `data/`, and generated `service.*` credential files.
+- **Secrets** — every participant/governor token and the token DB are sensitive. Tokens and grants are stored **in plaintext** in `sim-tokens.db`; protect that file with filesystem permissions and keep it out of version control. The shipped `.gitignore` already excludes `*.db`, `data/`, and generated `service.*` credential files.
 - **Rate limiting / abuse** — enforce at the proxy. Message send is grant-gated, so the trust boundary is "an already-approved peer," but the proxy should still cap request rates from anything internet-facing.
-- **Restart behavior** — trust state survives restarts (SQLite); in-flight message queues do not (online-only delivery). Connected agents simply reconnect their SSE stream and re-announce; `listen.sh` does this automatically.
+- **Restart behavior** — trust state survives restarts (SQLite); in-flight message queues do not (online-only delivery). Connected participants simply reconnect their SSE stream and re-announce; `listen.sh` does this automatically.
 
 ---
 
@@ -348,10 +348,10 @@ What persists vs. what is ephemeral:
 
 | Persisted in SQLite (`sim-tokens.db`) | In-memory only (lost on restart) |
 | --- | --- |
-| Governor / agent / listen tokens | Live message queues (undelivered messages) |
+| Governor / participant / listen tokens | Live message queues (undelivered messages) |
 | Connection grants + usage counters | Reply windows, mediation holds, connection requests |
 | DCP identities, denial blocks | DCP probes / subscriptions, SSE connections |
-| Attachment blobs (until TTL) | Presence (rebuilt as agents reconnect) |
+| Attachment blobs (until TTL) | Presence (rebuilt as participants reconnect) |
 
 **Backup.** Stop the hub (or use SQLite's online backup) and copy the DB **with its sidecars** — `sim-tokens.db`, `sim-tokens.db-wal`, and `sim-tokens.db-shm` must be copied together. In Docker, back up the mounted volume.
 
@@ -374,7 +374,7 @@ Errors are returned as `{"error":"CODE","message":"…"}` with a matching HTTP s
 | `GRANT_EXPIRED` / `GRANT_EXHAUSTED` / `GRANT_BLOCKED` | 403 | Grant expired, hit its message cap, or the pair is blocked. |
 | `REQUEST_PENDING` | 409 | A grant request for this target is already in flight. |
 | `RECIPIENT_OFFLINE` | 409 | Recipient is announced but not currently connected. Not buffered. |
-| `RECIPIENT_UNKNOWN` | 404 | No agent announced under that name. |
+| `RECIPIENT_UNKNOWN` | 404 | No participant announced under that name. |
 | `ATTACHMENT_NOT_FOUND` | 404 | Attachment id unknown or past its TTL. |
 | `BAD_REQUEST` | 400 | Malformed body or missing field. |
 

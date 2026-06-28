@@ -159,7 +159,7 @@ Response MUST include `grant_id` (new). Example: `{"ok": true, "grant_id": "g-42
 - `{"ok": false, "error": "BLOCKED"}` — governor blocked
 - New errors: `GRANT_EXHAUSTED`, `MEDIATION_UNAVAILABLE`
 
-**`POST /agents/register`** — new optional field:
+**`POST /register`** — new optional field:
 ```jsonc
 {"name": "alice", "presence_scope": "grant_scoped"}
 ```

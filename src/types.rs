@@ -21,10 +21,10 @@ pub enum BreadcrumbAction {
 }
 
 // §3.1: unique name bound to a token-identity for the lifetime of a registration
-pub struct AgentName(pub String);
+pub struct ParticipantName(pub String);
 
 // §4.3: minted by a governor; authorizes register/send/presence/dequeue for one agent identity
-pub struct AgentToken(pub String);
+pub struct ParticipantToken(pub String);
 
 // §4.2: minted by the owner; carries delegated authority valid only while online and unexpired
 pub struct GovernorToken(pub String);

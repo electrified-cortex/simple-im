@@ -1,7 +1,7 @@
 # Contributing to simple-im
 
 Thanks for your interest. simple-im is deliberately small — a self-hosted
-agent-to-agent messaging hub — and contributions should keep it that way.
+messaging hub — and contributions should keep it that way.
 
 ## Build & test
 
@@ -35,7 +35,7 @@ quality-of-life improvements within that scope are very welcome.
 
 - [`README.md`](README.md) — the authoritative description of behavior and the API.
 - [`docs/TECH-SPEC.md`](docs/TECH-SPEC.md) and [`docs/PRD.md`](docs/PRD.md) — design rationale and acceptance criteria.
-- [`skills/participant/SKILL.md`](skills/participant/SKILL.md) / [`skills/governor/SKILL.md`](skills/governor/SKILL.md) — the agent-facing protocol guides (also served live at `GET /skills/...`).
+- [`skills/participant/SKILL.md`](skills/participant/SKILL.md) / [`skills/governor/SKILL.md`](skills/governor/SKILL.md) — the participant-facing protocol guides (also served live at `GET /skills/...`).
 
 ## Commit style
 

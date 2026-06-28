@@ -21,13 +21,13 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::delivery::{
-    AgentInfo, AnnounceResult, ApproveStatus, ClaimOutcome, ClaimResolution, DeliveryHub,
-    MediationDecision, MediationResult,
+    AnnounceResult, ApproveStatus, ClaimOutcome, ClaimResolution, DeliveryHub, MediationDecision,
+    MediationResult, ParticipantInfo,
 };
 use crate::error::Error;
 use crate::rooms::RoomStore;
 use crate::trust::{ApproveGrantRequest, GrantDirection, GrantMediation};
-use crate::types::{AgentToken, GovernorToken, Payload};
+use crate::types::{GovernorToken, ParticipantToken, Payload};
 
 // ── Bundled skill files ───────────────────────────────────────────────────────
 
@@ -117,7 +117,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let max_attach = state.attachment_max_bytes;
     Router::new()
         .route("/", get(handle_discovery))
-        .route("/register", post(handle_agents_register))
+        .route("/register", post(handle_register))
         .route("/listen", post(handle_listen))
         .route("/listen", delete(handle_cancel_listen))
         .route("/announce", post(handle_announce))
@@ -425,11 +425,11 @@ async fn handle_list_participants(
         None => return auth_failed(),
     };
     let gov = GovernorToken(tok_str);
-    match state.hub.list_agents(&gov) {
+    match state.hub.list_participants(&gov) {
         Ok(agents) => {
             let participants_json: Vec<_> = agents
                 .iter()
-                .map(|a: &AgentInfo| json!({"name": a.name, "identity": a.identity, "status": a.status}))
+                .map(|a: &ParticipantInfo| json!({"name": a.name, "identity": a.identity, "status": a.status}))
                 .collect();
             (
                 StatusCode::OK,
@@ -712,7 +712,7 @@ async fn handle_send(
         Some(t) => t,
         None => return auth_failed(),
     };
-    let token = AgentToken(tok_str);
+    let token = ParticipantToken(tok_str);
     let payload = Payload(body.payload.into_bytes());
 
     // Route: if `to` is present use name routing; if only `to_token` is present use token routing.
@@ -1304,11 +1304,11 @@ fn sanitize_filename(name: &str) -> String {
 }
 
 // ── POST /register ─────────────────────────────────────────────────────────────
-// Mint a new agent token for future /listen use.
+// Mint a new participant token for future /listen use.
 // No authentication required (anyone can register, same as anonymous /listen before).
 
-async fn handle_agents_register(State(state): State<Arc<AppState>>) -> Response {
-    let token = state.hub.register_agent();
+async fn handle_register(State(state): State<Arc<AppState>>) -> Response {
+    let token = state.hub.register_participant();
     (StatusCode::OK, Json(json!({"token": token}))).into_response()
 }
 

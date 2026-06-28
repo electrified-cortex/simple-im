@@ -21,7 +21,7 @@ network, or `localhost`). Operators are responsible for the perimeter:
   to start. Terminate TLS at a reverse proxy (Caddy, nginx) and bind the hub to
   a private interface. Tokens travel in `Authorization` headers, so an
   unencrypted public network would expose them.
-- **Tokens are bearer secrets.** Listen, agent, and governor tokens grant their
+- **Tokens are bearer secrets.** Listen, participant, and governor tokens grant their
   holder's access. Treat them like passwords; never commit them. The
   participant skill writes them to `service.*` files that are gitignored.
 - **Trust state is stored unencrypted.** `sim-tokens.db` (SQLite) holds tokens,
