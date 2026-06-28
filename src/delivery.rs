@@ -3743,6 +3743,7 @@ impl DeliveryHub {
             // do not echo it back. Exception: governor session-link path presents a governor
             // token and receives a newly minted listen token — the agent does NOT have it yet,
             // so we include it in the welcome so they can use it for announce/dequeue.
+            // AC8: Both paths now include subscription_id for unambiguous subscription identity.
             {
                 let name_opt = inner.listen_tokens.get(&token).and_then(|s| s.name.clone());
                 let governor_minted = token.as_str() != provided_token;
@@ -3750,6 +3751,7 @@ impl DeliveryHub {
                     serde_json::json!({
                         "type": "service",
                         "event": "welcome",
+                        "subscription_id": &token,
                         "token": &token,
                         "name": name_opt,
                         "instructions": "Call POST /announce to register your name. You will receive notify events when messages arrive — call POST /messages/dequeue to retrieve them.",
@@ -3758,6 +3760,7 @@ impl DeliveryHub {
                     serde_json::json!({
                         "type": "service",
                         "event": "welcome",
+                        "subscription_id": &token,
                         "name": name_opt,
                         "instructions": "Call POST /announce to register your name. You will receive notify events when messages arrive — call POST /messages/dequeue to retrieve them.",
                     })
@@ -7770,6 +7773,63 @@ mod tests {
         assert!(
             matches!(result, Ok(true)),
             "Minted agent with grant should see target's real status"
+        );
+    }
+
+    /// AC9: Second open_listen without force=true returns Error::ActiveSubscription.
+    #[test]
+    fn ac_listen_conflict_returns_active_subscription_error() {
+        let hub = make_hub(Duration::from_secs(30));
+        let gov = hub.install_governor(None);
+        let tok = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
+
+        // Open first listen stream.
+        let (token, _rx1) = hub
+            .open_listen(Some(&tok.0), None, None, None, false)
+            .expect("first open_listen must succeed");
+
+        // Second open_listen without force → should return ActiveSubscription error.
+        let result = hub.open_listen(Some(&token), None, None, None, false);
+        assert!(
+            matches!(result, Err(Error::ActiveSubscription)),
+            "second open_listen without force must return ActiveSubscription error, got: {:?}",
+            result
+        );
+    }
+
+    /// AC9: Second open_listen with force=true supersedes prior stream and returns same token.
+    #[test]
+    fn ac_listen_force_takeover_supersedes_prior_stream() {
+        let hub = make_hub(Duration::from_secs(30));
+        let gov = hub.install_governor(None);
+        let tok = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
+
+        // Open first listen stream.
+        let (token1, mut rx1) = hub
+            .open_listen(Some(&tok.0), None, None, None, false)
+            .expect("first open_listen must succeed");
+
+        // Second open_listen with force=true → should succeed and return same token.
+        let (token2, _rx2) = hub
+            .open_listen(Some(&token1), None, None, None, true)
+            .expect("force takeover open_listen must succeed");
+
+        assert_eq!(
+            token1, token2,
+            "force takeover must return same token, got token1={}, token2={}",
+            token1, token2
+        );
+
+        // The "superseded" event is sent synchronously inside open_listen before it returns,
+        // so try_recv() works here without any async runtime — event is already queued.
+        let superseded_event = rx1.try_recv().ok();
+        assert!(
+            superseded_event
+                .as_ref()
+                .map(|e| e.contains("superseded"))
+                .unwrap_or(false),
+            "old SSE rx should receive superseded event, got: {:?}",
+            superseded_event
         );
     }
 }
