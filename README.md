@@ -9,6 +9,7 @@ It is deliberately small. One statically-linked binary, a SQLite file for durabl
 - **Optional elected governor** — install one to centralize grant approval; governors are claimed and elected by participants, not minted by an owner.
 - **Push, not poll** — each participant holds one SSE stream that wakes it the moment a message or file is waiting.
 - **Durable trust state** — tokens, grants, identities, and attachments persist in SQLite across restarts; live message queues are in-memory (delivery is online-only).
+- **Rooms discovery** — announced participants can join transient rooms to find peers outside their existing grants; co-presence in a room unlocks mutual grant requests.
 
 > **Plain HTTP only.** simple-im does not terminate TLS itself, and `--insecure-http` is **required** to start. Run it on a trusted LAN or `localhost`, or put it behind a TLS-terminating reverse proxy (Caddy, nginx). See [10. Deployment & security](10-deployment--security).
 
@@ -167,6 +168,21 @@ These endpoints require a governor token. See [§7](#7-electing-a-governor-optio
 | `POST` | `/governors/transfer` | Initiate governor authority transfer → `{"transfer_token":"…"}`. Governor token. |
 | `POST` | `/governors/accept-transfer` | Accept a transfer: `Authorization: Bearer <transfer_token>` + `{"name":"…"}` → `{"token":"…"}`. |
 | `DELETE` | `/participants/{name}` | Force-revoke a participant's token. Governor token. |
+
+### Rooms endpoints
+
+Rooms are transient, in-memory discovery spaces. Two participants co-present in a room may submit grant requests to each other without a pre-existing grant — rooms are the first-contact bootstrap path. Rooms do not persist across server restarts.
+
+All room routes require `Authorization: Bearer <token>` with an **announced** name.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/room/create` | Create a new room → `{"room_id":"<uuid>"}`. Caller is **not** auto-joined. |
+| `POST` | `/room/{room_id}/join` | Join the room. Optional body `{"ttl":N}` (seconds; default 300). Re-joining resets the TTL. Returns `{"members":[{"name":"…","online":true\|false},…]}`. |
+| `GET` | `/room/{room_id}` | List current members → `{"members":[{"name":"…","online":true\|false},…]}`. `403 FORBIDDEN` if the caller is not a member. |
+| `POST` | `/room/{room_id}/leave` | Leave the room → `{"status":"ok"}`. Idempotent — `200` even if the caller was not a member or the room does not exist. |
+
+> **Reserved name.** The path segment `create` is reserved and may not be used as a `room_id`. Passing `create` as the `room_id` in any dynamic route (`GET /room/create`, `POST /room/create/join`, `POST /room/create/leave`) returns `400 BAD_REQUEST`.
 
 For the full participant-side protocol (SSE event types, the NO_GRANT recovery flow, reconnect semantics) read the participant skill at `GET /skills/participant` or [`skills/participant/SKILL.md`](skills/participant/SKILL.md).
 
