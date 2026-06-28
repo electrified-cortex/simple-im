@@ -58,11 +58,7 @@ impl TestServer {
 
 /// POST /register — mint a fresh token (new-participant flow).
 async fn register_agent_tok(server: &TestServer, client: &reqwest::Client) -> String {
-    let r = client
-        .post(server.url("/register"))
-        .send()
-        .await
-        .unwrap();
+    let r = client.post(server.url("/register")).send().await.unwrap();
     assert_eq!(r.status(), StatusCode::OK, "POST /register failed");
     let body: Value = r.json().await.unwrap();
     body["token"].as_str().unwrap().to_owned()
@@ -107,7 +103,10 @@ async fn listen_get_token(
             let w: Value = serde_json::from_str(line.trim_start_matches("data:").trim()).unwrap();
             assert_eq!(w["event"], "welcome");
             // If server included a minted listen token (governor case), use it; else use registered tok.
-            break w["token"].as_str().map(|t| t.to_string()).unwrap_or_else(|| tok.to_string());
+            break w["token"]
+                .as_str()
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| tok.to_string());
         }
     };
 
@@ -162,7 +161,10 @@ async fn listen_and_get_welcome(
     assert_eq!(parsed["event"], "welcome");
     // Normal agents use their registered token. Governor session-link path receives a
     // minted listen token in the welcome — use it when present.
-    let token = parsed["token"].as_str().map(|t| t.to_string()).unwrap_or_else(|| tok.to_string());
+    let token = parsed["token"]
+        .as_str()
+        .map(|t| t.to_string())
+        .unwrap_or_else(|| tok.to_string());
     (token, welcome_json)
 }
 
@@ -433,7 +435,12 @@ async fn ac_l1_second_listen_supersedes_first() {
 
     // First listen — get the token.
     let _rtok = register_agent_tok(&server, &client).await;
-    let r = client.post(server.url("/listen")).header("Authorization", format!("Bearer {}", _rtok)).send().await.unwrap();
+    let r = client
+        .post(server.url("/listen"))
+        .header("Authorization", format!("Bearer {}", _rtok))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), StatusCode::OK);
 
     let mut first_stream = r.bytes_stream();
@@ -441,9 +448,14 @@ async fn ac_l1_second_listen_supersedes_first() {
     // Consume welcome event; token comes from registration, not welcome.
     loop {
         let chunk = tokio::time::timeout(Duration::from_secs(5), first_stream.next())
-            .await.unwrap().unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         buf.push_str(&String::from_utf8_lossy(&chunk));
-        if buf.lines().any(|l| l.starts_with("data:")) { break; }
+        if buf.lines().any(|l| l.starts_with("data:")) {
+            break;
+        }
     }
     let token = _rtok.clone();
 
@@ -486,7 +498,12 @@ async fn ac_n1_first_message_triggers_notify() {
 
     // Receiver.
     let _rtok = register_agent_tok(&server, &client).await;
-    let r = client.post(server.url("/listen")).header("Authorization", format!("Bearer {}", _rtok)).send().await.unwrap();
+    let r = client
+        .post(server.url("/listen"))
+        .header("Authorization", format!("Bearer {}", _rtok))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), StatusCode::OK);
 
     let mut stream = r.bytes_stream();
@@ -494,9 +511,14 @@ async fn ac_n1_first_message_triggers_notify() {
     // Consume welcome event; token comes from registration, not welcome.
     loop {
         let chunk = tokio::time::timeout(Duration::from_secs(5), stream.next())
-            .await.unwrap().unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         buf.push_str(&String::from_utf8_lossy(&chunk));
-        if buf.lines().any(|l| l.starts_with("data:")) { break; }
+        if buf.lines().any(|l| l.starts_with("data:")) {
+            break;
+        }
     }
     let recv_token = _rtok.clone();
 
@@ -561,15 +583,25 @@ async fn ac_n2_rapid_messages_single_notify() {
     let client = server.client();
 
     let _rtok = register_agent_tok(&server, &client).await;
-    let r = client.post(server.url("/listen")).header("Authorization", format!("Bearer {}", _rtok)).send().await.unwrap();
+    let r = client
+        .post(server.url("/listen"))
+        .header("Authorization", format!("Bearer {}", _rtok))
+        .send()
+        .await
+        .unwrap();
     let mut stream = r.bytes_stream();
     let mut buf = String::new();
     // Consume welcome event; token comes from registration, not welcome.
     loop {
         let chunk = tokio::time::timeout(Duration::from_secs(5), stream.next())
-            .await.unwrap().unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         buf.push_str(&String::from_utf8_lossy(&chunk));
-        if buf.lines().any(|l| l.starts_with("data:")) { break; }
+        if buf.lines().any(|l| l.starts_with("data:")) {
+            break;
+        }
     }
     let recv_token = _rtok.clone();
 
@@ -643,15 +675,25 @@ async fn ac_n3_dequeue_then_new_message_triggers_notify() {
     let client = server.client();
 
     let _rtok = register_agent_tok(&server, &client).await;
-    let r = client.post(server.url("/listen")).header("Authorization", format!("Bearer {}", _rtok)).send().await.unwrap();
+    let r = client
+        .post(server.url("/listen"))
+        .header("Authorization", format!("Bearer {}", _rtok))
+        .send()
+        .await
+        .unwrap();
     let mut stream = r.bytes_stream();
     let mut buf = String::new();
     // Consume welcome event; token comes from registration, not welcome.
     loop {
         let chunk = tokio::time::timeout(Duration::from_secs(5), stream.next())
-            .await.unwrap().unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         buf.push_str(&String::from_utf8_lossy(&chunk));
-        if buf.lines().any(|l| l.starts_with("data:")) { break; }
+        if buf.lines().any(|l| l.starts_with("data:")) {
+            break;
+        }
     }
     let recv_token = _rtok.clone();
 
@@ -745,15 +787,25 @@ async fn ac_n4_race_free_dequeue_then_arrival_fires_notify() {
     let client = server.client();
 
     let _rtok = register_agent_tok(&server, &client).await;
-    let r = client.post(server.url("/listen")).header("Authorization", format!("Bearer {}", _rtok)).send().await.unwrap();
+    let r = client
+        .post(server.url("/listen"))
+        .header("Authorization", format!("Bearer {}", _rtok))
+        .send()
+        .await
+        .unwrap();
     let mut stream = r.bytes_stream();
     let mut buf = String::new();
     // Consume welcome event; token comes from registration, not welcome.
     loop {
         let chunk = tokio::time::timeout(Duration::from_secs(5), stream.next())
-            .await.unwrap().unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         buf.push_str(&String::from_utf8_lossy(&chunk));
-        if buf.lines().any(|l| l.starts_with("data:")) { break; }
+        if buf.lines().any(|l| l.starts_with("data:")) {
+            break;
+        }
     }
     let recv_token = _rtok.clone();
 
@@ -927,15 +979,25 @@ async fn ac_r1_r3_token_revocation_atomic() {
     let client = server.client();
 
     let _rtok = register_agent_tok(&server, &client).await;
-    let r = client.post(server.url("/listen")).header("Authorization", format!("Bearer {}", _rtok)).send().await.unwrap();
+    let r = client
+        .post(server.url("/listen"))
+        .header("Authorization", format!("Bearer {}", _rtok))
+        .send()
+        .await
+        .unwrap();
     let mut stream = r.bytes_stream();
     let mut buf = String::new();
     // Consume welcome event; token comes from registration, not welcome.
     loop {
         let chunk = tokio::time::timeout(Duration::from_secs(5), stream.next())
-            .await.unwrap().unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         buf.push_str(&String::from_utf8_lossy(&chunk));
-        if buf.lines().any(|l| l.starts_with("data:")) { break; }
+        if buf.lines().any(|l| l.starts_with("data:")) {
+            break;
+        }
     }
     let agent_tok = _rtok.clone();
 
@@ -1006,15 +1068,25 @@ async fn ac_d4_thread_filter_on_single_dequeue() {
 
     // Receiver.
     let _rtok = register_agent_tok(&server, &client).await;
-    let r = client.post(server.url("/listen")).header("Authorization", format!("Bearer {}", _rtok)).send().await.unwrap();
+    let r = client
+        .post(server.url("/listen"))
+        .header("Authorization", format!("Bearer {}", _rtok))
+        .send()
+        .await
+        .unwrap();
     let mut stream = r.bytes_stream();
     let mut buf = String::new();
     // Consume welcome event; token comes from registration, not welcome.
     loop {
         let chunk = tokio::time::timeout(Duration::from_secs(5), stream.next())
-            .await.unwrap().unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         buf.push_str(&String::from_utf8_lossy(&chunk));
-        if buf.lines().any(|l| l.starts_with("data:")) { break; }
+        if buf.lines().any(|l| l.starts_with("data:")) {
+            break;
+        }
     }
     let recv_tok = _rtok.clone();
     client
@@ -1112,15 +1184,25 @@ async fn ac_s3_send_by_token_routes_to_recipient() {
 
     // Receiver.
     let _rtok = register_agent_tok(&server, &client).await;
-    let r = client.post(server.url("/listen")).header("Authorization", format!("Bearer {}", _rtok)).send().await.unwrap();
+    let r = client
+        .post(server.url("/listen"))
+        .header("Authorization", format!("Bearer {}", _rtok))
+        .send()
+        .await
+        .unwrap();
     let mut stream = r.bytes_stream();
     let mut buf = String::new();
     // Consume welcome event; token comes from registration, not welcome.
     loop {
         let chunk = tokio::time::timeout(Duration::from_secs(5), stream.next())
-            .await.unwrap().unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         buf.push_str(&String::from_utf8_lossy(&chunk));
-        if buf.lines().any(|l| l.starts_with("data:")) { break; }
+        if buf.lines().any(|l| l.starts_with("data:")) {
+            break;
+        }
     }
     let recv_tok = _rtok.clone();
     client
@@ -1252,16 +1334,26 @@ async fn ac_n5_service_events_bypass_notify_interlock() {
 
     // Receiver with active SSE.
     let _rtok = register_agent_tok(&server, &client).await;
-    let r = client.post(server.url("/listen")).header("Authorization", format!("Bearer {}", _rtok)).send().await.unwrap();
+    let r = client
+        .post(server.url("/listen"))
+        .header("Authorization", format!("Bearer {}", _rtok))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), StatusCode::OK);
     let mut stream = r.bytes_stream();
     let mut buf = String::new();
     // Consume welcome event; token comes from registration, not welcome.
     loop {
         let chunk = tokio::time::timeout(Duration::from_secs(5), stream.next())
-            .await.unwrap().unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         buf.push_str(&String::from_utf8_lossy(&chunk));
-        if buf.lines().any(|l| l.starts_with("data:")) { break; }
+        if buf.lines().any(|l| l.starts_with("data:")) {
+            break;
+        }
     }
     let recv_token = _rtok.clone();
     client
@@ -1517,16 +1609,26 @@ async fn ac_n5_service_events_bypass_notify_suppressed() {
 
     // Open SSE and keep it alive.
     let _rtok = register_agent_tok(&server, &client).await;
-    let r = client.post(server.url("/listen")).header("Authorization", format!("Bearer {}", _rtok)).send().await.unwrap();
+    let r = client
+        .post(server.url("/listen"))
+        .header("Authorization", format!("Bearer {}", _rtok))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), StatusCode::OK);
     let mut stream = r.bytes_stream();
     let mut buf = String::new();
     // Consume welcome event; token comes from registration, not welcome.
     loop {
         let chunk = tokio::time::timeout(Duration::from_secs(5), stream.next())
-            .await.unwrap().unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         buf.push_str(&String::from_utf8_lossy(&chunk));
-        if buf.lines().any(|l| l.starts_with("data:")) { break; }
+        if buf.lines().any(|l| l.starts_with("data:")) {
+            break;
+        }
     }
     let agent_tok = _rtok.clone();
 
@@ -2141,7 +2243,12 @@ async fn spawn_server_with_governor_ttl(liveness_secs: u64) -> (TestServer, Stri
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    (TestServer { base_url: format!("http://127.0.0.1:{}", addr.port()) }, gov_tok)
+    (
+        TestServer {
+            base_url: format!("http://127.0.0.1:{}", addr.port()),
+        },
+        gov_tok,
+    )
 }
 
 // ── AC1: presence returns "online" for a reachable agent ─────────────────────
@@ -2436,15 +2543,25 @@ async fn setup_send_pair(
 
     // Receiver — keep SSE open for notify delivery.
     let _rtok = register_agent_tok(&server, &client).await;
-    let r = client.post(server.url("/listen")).header("Authorization", format!("Bearer {}", _rtok)).send().await.unwrap();
+    let r = client
+        .post(server.url("/listen"))
+        .header("Authorization", format!("Bearer {}", _rtok))
+        .send()
+        .await
+        .unwrap();
     let mut stream = r.bytes_stream();
     let mut buf = String::new();
     // Consume welcome event; token comes from registration, not welcome.
     loop {
         let chunk = tokio::time::timeout(Duration::from_secs(5), stream.next())
-            .await.unwrap().unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         buf.push_str(&String::from_utf8_lossy(&chunk));
-        if buf.lines().any(|l| l.starts_with("data:")) { break; }
+        if buf.lines().any(|l| l.starts_with("data:")) {
+            break;
+        }
     }
     let recv_token = _rtok.clone();
     // Keep stream alive in background.
@@ -2671,7 +2788,12 @@ async fn ac_lid3_sub_event_contains_last_message_id() {
 
     // POST /listen — read until we see the sub event (second data event after welcome).
     let _rtok = register_agent_tok(&server, &client).await;
-    let r = client.post(server.url("/listen")).header("Authorization", format!("Bearer {}", _rtok)).send().await.unwrap();
+    let r = client
+        .post(server.url("/listen"))
+        .header("Authorization", format!("Bearer {}", _rtok))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), StatusCode::OK);
     let mut stream = r.bytes_stream();
     let mut buf = String::new();
@@ -2905,13 +3027,17 @@ async fn ac_pp1_announce_sends_online_to_grant_peer_sse() {
     // Agent A: open listen stream (observer).
     let tok_a = hub.register_agent();
 
-    let (_, mut rx_a) = hub.open_listen(Some(&tok_a), None, None, None, false).unwrap();
+    let (_, mut rx_a) = hub
+        .open_listen(Some(&tok_a), None, None, None, false)
+        .unwrap();
     hub.announce(&tok_a, "PpA", false).unwrap();
 
     // Agent B: open listen stream but do NOT announce yet.
     let tok_b = hub.register_agent();
 
-    let (_, _rx_b) = hub.open_listen(Some(&tok_b), None, None, None, false).unwrap();
+    let (_, _rx_b) = hub
+        .open_listen(Some(&tok_b), None, None, None, false)
+        .unwrap();
 
     // Establish grant with explicit names (B not yet announced, so FP1 wouldn't find name_b).
     hub.approve_grant_req(
@@ -2955,14 +3081,16 @@ async fn ac_pp2_cancel_listen_sends_offline_to_grant_peer_sse() {
 
     let tok_a = hub.register_agent();
 
-
-    let (_, mut rx_a) = hub.open_listen(Some(&tok_a), None, None, None, false).unwrap();
+    let (_, mut rx_a) = hub
+        .open_listen(Some(&tok_a), None, None, None, false)
+        .unwrap();
     hub.announce(&tok_a, "PpA2", false).unwrap();
 
     let tok_b = hub.register_agent();
 
-
-    let (_, _rx_b) = hub.open_listen(Some(&tok_b), None, None, None, false).unwrap();
+    let (_, _rx_b) = hub
+        .open_listen(Some(&tok_b), None, None, None, false)
+        .unwrap();
     hub.announce(&tok_b, "PpB2", false).unwrap();
 
     hub.approve_grant_req(
@@ -3006,14 +3134,16 @@ async fn ac_pp3_sse_drop_sends_offline_to_grant_peer_sse() {
 
     let tok_a = hub.register_agent();
 
-
-    let (_, mut rx_a) = hub.open_listen(Some(&tok_a), None, None, None, false).unwrap();
+    let (_, mut rx_a) = hub
+        .open_listen(Some(&tok_a), None, None, None, false)
+        .unwrap();
     hub.announce(&tok_a, "PpA3", false).unwrap();
 
     let tok_b = hub.register_agent();
 
-
-    let (_, _rx_b) = hub.open_listen(Some(&tok_b), None, None, None, false).unwrap();
+    let (_, _rx_b) = hub
+        .open_listen(Some(&tok_b), None, None, None, false)
+        .unwrap();
     hub.announce(&tok_b, "PpB3", false).unwrap();
 
     hub.approve_grant_req(
@@ -3059,13 +3189,16 @@ async fn ac_pp4_no_grant_no_presence_event_to_non_peer() {
     // A and B have a grant (A is the observer with active SSE).
     let tok_a = hub.register_agent();
 
-    let (_, mut rx_a) = hub.open_listen(Some(&tok_a), None, None, None, false).unwrap();
+    let (_, mut rx_a) = hub
+        .open_listen(Some(&tok_a), None, None, None, false)
+        .unwrap();
     hub.announce(&tok_a, "PpA4", false).unwrap();
 
     let tok_b = hub.register_agent();
 
-
-    let (_, _rx_b) = hub.open_listen(Some(&tok_b), None, None, None, false).unwrap();
+    let (_, _rx_b) = hub
+        .open_listen(Some(&tok_b), None, None, None, false)
+        .unwrap();
     hub.announce(&tok_b, "PpB4", false).unwrap();
 
     hub.approve_grant_req(
@@ -3084,7 +3217,9 @@ async fn ac_pp4_no_grant_no_presence_event_to_non_peer() {
     // C has NO grant with A.
     let tok_c = hub.register_agent();
 
-    let (_, _rx_c) = hub.open_listen(Some(&tok_c), None, None, None, false).unwrap();
+    let (_, _rx_c) = hub
+        .open_listen(Some(&tok_c), None, None, None, false)
+        .unwrap();
 
     // Drain setup events so we start fresh.
     drain_receiver(&mut rx_a);
@@ -3125,7 +3260,9 @@ async fn ac_pp5_minted_agent_deregister_sends_offline_to_listen_peer() {
     // Alice: V2 listen-flow agent (observer — will receive presence events).
     let tok_a = hub.register_agent();
 
-    let (_, mut rx_a) = hub.open_listen(Some(&tok_a), None, None, None, false).unwrap();
+    let (_, mut rx_a) = hub
+        .open_listen(Some(&tok_a), None, None, None, false)
+        .unwrap();
     hub.announce(&tok_a, "PpA5", false).unwrap();
 
     // Bob: minted agent with a stable identity distinct from his token.
@@ -3172,13 +3309,17 @@ async fn ac_pp6_force_eviction_sends_offline_to_grant_peer_sse() {
     // Agent A: the observer — has an active SSE stream and a grant with B.
     let tok_a = hub.register_agent();
 
-    let (_, mut rx_a) = hub.open_listen(Some(&tok_a), None, None, None, false).unwrap();
+    let (_, mut rx_a) = hub
+        .open_listen(Some(&tok_a), None, None, None, false)
+        .unwrap();
     hub.announce(&tok_a, "PpA6", false).unwrap();
 
     // Agent B: announces "PpB6" — will be force-evicted.
     let tok_b = hub.register_agent();
 
-    let (_, _rx_b) = hub.open_listen(Some(&tok_b), None, None, None, false).unwrap();
+    let (_, _rx_b) = hub
+        .open_listen(Some(&tok_b), None, None, None, false)
+        .unwrap();
     hub.announce(&tok_b, "PpB6", false).unwrap();
 
     // Approve grant between A and B with explicit names.
@@ -3201,7 +3342,9 @@ async fn ac_pp6_force_eviction_sends_offline_to_grant_peer_sse() {
     // Agent C force-evicts B by announcing "PpB6" with force=true.
     let tok_c = hub.register_agent();
 
-    let (_, _rx_c) = hub.open_listen(Some(&tok_c), None, None, None, false).unwrap();
+    let (_, _rx_c) = hub
+        .open_listen(Some(&tok_c), None, None, None, false)
+        .unwrap();
     hub.announce(&tok_c, "PpB6", true).unwrap();
 
     // A must receive sim_offline for "PpB6".
@@ -3232,13 +3375,17 @@ async fn ac_pp6b_stale_holder_reclaim_sends_offline_to_grant_peer_sse() {
     // Agent A: the observer.
     let tok_a = hub.register_agent();
 
-    let (_, mut rx_a) = hub.open_listen(Some(&tok_a), None, None, None, false).unwrap();
+    let (_, mut rx_a) = hub
+        .open_listen(Some(&tok_a), None, None, None, false)
+        .unwrap();
     hub.announce(&tok_a, "PpA6b", false).unwrap();
 
     // Agent B: announces "PpB6b" then its SSE drops without cancel_listen.
     let tok_b = hub.register_agent();
 
-    let (_, _rx_b) = hub.open_listen(Some(&tok_b), None, None, None, false).unwrap();
+    let (_, _rx_b) = hub
+        .open_listen(Some(&tok_b), None, None, None, false)
+        .unwrap();
     hub.announce(&tok_b, "PpB6b", false).unwrap();
 
     // Approve grant between A and B.
@@ -3266,7 +3413,9 @@ async fn ac_pp6b_stale_holder_reclaim_sends_offline_to_grant_peer_sse() {
     // Agent C reclaims "PpB6b" without force (stale holder → no NAME_IN_USE returned).
     let tok_c = hub.register_agent();
 
-    let (_, _rx_c) = hub.open_listen(Some(&tok_c), None, None, None, false).unwrap();
+    let (_, _rx_c) = hub
+        .open_listen(Some(&tok_c), None, None, None, false)
+        .unwrap();
     // B's name binding persists after close_listen; a non-force announce by C should
     // evict the stale binding and fire sim_offline to A.
     hub.announce(&tok_c, "PpB6b", false).unwrap();
@@ -3300,7 +3449,9 @@ async fn ac_startup_announce_first_sub_only() {
     // AC1: first subscriber gets sim_online
     let _tok1 = hub.register_agent();
 
-    let (_, mut rx1) = hub.open_listen(Some(&_tok1), None, None, None, false).unwrap();
+    let (_, mut rx1) = hub
+        .open_listen(Some(&_tok1), None, None, None, false)
+        .unwrap();
     let mut events1 = vec![];
     while let Ok(ev) = rx1.try_recv() {
         events1.push(ev);
@@ -3318,7 +3469,9 @@ async fn ac_startup_announce_first_sub_only() {
     // AC2: second subscriber does NOT get sim_online
     let _tok2 = hub.register_agent();
 
-    let (_, mut rx2) = hub.open_listen(Some(&_tok2), None, None, None, false).unwrap();
+    let (_, mut rx2) = hub
+        .open_listen(Some(&_tok2), None, None, None, false)
+        .unwrap();
     let mut events2 = vec![];
     while let Ok(ev) = rx2.try_recv() {
         events2.push(ev);

@@ -123,19 +123,14 @@ pub enum ClaimOutcome {
 /// Current state of a pending governance claim after a vote is cast.
 pub enum ClaimResolution {
     /// Not all required votes have been received yet.
-    Waiting {
-        approved: usize,
-        required: usize,
-    },
+    Waiting { approved: usize, required: usize },
     /// All required votes approved; the candidate is now governor.
     Established {
         candidate_name: String,
         governor_token: String,
     },
     /// At least one required voter rejected the claim.
-    Rejected {
-        candidate_name: String,
-    },
+    Rejected { candidate_name: String },
 }
 
 /// Result of approving a grant request at one of the two required stages.
@@ -3651,7 +3646,9 @@ impl DeliveryHub {
                             break t;
                         }
                     };
-                    inner.listen_tokens.insert(new_tok.clone(), V2TokenState::new());
+                    inner
+                        .listen_tokens
+                        .insert(new_tok.clone(), V2TokenState::new());
                     new_tok
                 } else {
                     // Not a listen token or governor token — auth failed.
@@ -4617,10 +4614,7 @@ impl DeliveryHub {
     pub fn presence_for_token(&self, token: &str, target_name: &str) -> Result<bool, Error> {
         let inner = self.lock();
         // Validate querier token.
-        let querier_state = inner
-            .listen_tokens
-            .get(token)
-            .ok_or(Error::TokenRejected)?;
+        let querier_state = inner.listen_tokens.get(token).ok_or(Error::TokenRejected)?;
         if querier_state.revoked {
             return Err(Error::TokenRevoked);
         }
@@ -4794,18 +4788,31 @@ impl DeliveryHub {
         let agent_token = crate::types::AgentToken(token_str.to_string());
         if inner.trust.validate_agent_token(&agent_token).is_ok() {
             // Get agent's identity for grant check.
-            let querier_identity = inner.trust.agent_identity(&agent_token).map(|s| s.to_string());
+            let querier_identity = inner
+                .trust
+                .agent_identity(&agent_token)
+                .map(|s| s.to_string());
 
             // Grant check for minted agent querier.
             let has_grant = match (&target_tok, &querier_identity) {
                 (Some(t_tok), Some(q_id)) => {
                     inner
                         .trust
-                        .check_grant_directed_with_names(q_id, t_tok.as_str(), None, Some(target_name))
+                        .check_grant_directed_with_names(
+                            q_id,
+                            t_tok.as_str(),
+                            None,
+                            Some(target_name),
+                        )
                         .is_ok()
                         || inner
                             .trust
-                            .check_grant_directed_with_names(t_tok.as_str(), q_id, Some(target_name), None)
+                            .check_grant_directed_with_names(
+                                t_tok.as_str(),
+                                q_id,
+                                Some(target_name),
+                                None,
+                            )
                             .is_ok()
                 }
                 (None, Some(q_id)) => {
@@ -4813,11 +4820,21 @@ impl DeliveryHub {
                     if let Some(agent_state) = inner.agents.get(target_name) {
                         inner
                             .trust
-                            .check_grant_directed_with_names(q_id, &agent_state.identity, None, Some(target_name))
+                            .check_grant_directed_with_names(
+                                q_id,
+                                &agent_state.identity,
+                                None,
+                                Some(target_name),
+                            )
                             .is_ok()
                             || inner
                                 .trust
-                                .check_grant_directed_with_names(&agent_state.identity, q_id, Some(target_name), None)
+                                .check_grant_directed_with_names(
+                                    &agent_state.identity,
+                                    q_id,
+                                    Some(target_name),
+                                    None,
+                                )
                                 .is_ok()
                     } else {
                         false
@@ -6300,7 +6317,9 @@ mod tests {
 
         // Bob is a listen-flow client — register first, then open_listen.
         let bob_token = hub.register_agent();
-        let (bob_token, rx1) = hub.open_listen(Some(&bob_token), None, Some("bob"), None, false).unwrap();
+        let (bob_token, rx1) = hub
+            .open_listen(Some(&bob_token), None, Some("bob"), None, false)
+            .unwrap();
         // Alice is a regular agent with a Notify grant to Bob.
         hub.register("alice", &tok_a, PresenceScope::Public)
             .unwrap();
@@ -6327,8 +6346,9 @@ mod tests {
 
         // Simulate reconnect: open_listen with the same token (force=true to supersede).
         // SIM-1 fix: open_listen must reset notify_suppressed and emit a catch-up NOTIFY.
-        let (returned_token, mut rx2) =
-            hub.open_listen(Some(&bob_token), None, None, None, true).unwrap();
+        let (returned_token, mut rx2) = hub
+            .open_listen(Some(&bob_token), None, None, None, true)
+            .unwrap();
         assert_eq!(
             returned_token, bob_token,
             "reconnect must return same token"
@@ -7454,7 +7474,9 @@ mod tests {
         let hub = make_hub(Duration::from_secs(30));
 
         let reg_token = hub.register_agent();
-        let (token, _rx) = hub.open_listen(Some(&reg_token), None, None, None, false).unwrap();
+        let (token, _rx) = hub
+            .open_listen(Some(&reg_token), None, None, None, false)
+            .unwrap();
 
         // ever_granted = false means the token would NOT be persisted to DB yet.
         let inner = hub.inner.lock().unwrap();
@@ -7550,7 +7572,9 @@ mod tests {
         let hub = make_hub(Duration::from_secs(30));
 
         let reg_token = hub.register_agent();
-        let (stale, _rx) = hub.open_listen(Some(&reg_token), None, None, None, false).unwrap();
+        let (stale, _rx) = hub
+            .open_listen(Some(&reg_token), None, None, None, false)
+            .unwrap();
 
         {
             let inner = hub.inner.lock().unwrap();
@@ -7587,7 +7611,9 @@ mod tests {
 
         // Agent A: full listen-flow session (the observer — will receive presence events).
         let reg_a = hub.register_agent();
-        let (tok_a, mut rx_a) = hub.open_listen(Some(&reg_a), None, None, None, false).unwrap();
+        let (tok_a, mut rx_a) = hub
+            .open_listen(Some(&reg_a), None, None, None, false)
+            .unwrap();
         hub.announce(&tok_a, "GcA6", false).unwrap();
 
         // Agent B: issue token + announce, but NO open_listen (ever_listened stays false).
@@ -7650,7 +7676,9 @@ mod tests {
 
             // Issue token for bob and announce its name.
             let reg_bob = hub.register_agent();
-            let (v2_tok, _rx) = hub.open_listen(Some(&reg_bob), None, None, None, false).unwrap();
+            let (v2_tok, _rx) = hub
+                .open_listen(Some(&reg_bob), None, None, None, false)
+                .unwrap();
             hub.announce(&v2_tok, "bob", false).unwrap();
 
             // Register alice so request_grant() can route by name.
@@ -7704,7 +7732,9 @@ mod tests {
         let v2_tok = {
             let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
             let reg_bob = hub.register_agent();
-            let (v2_tok, _rx) = hub.open_listen(Some(&reg_bob), None, None, None, false).unwrap();
+            let (v2_tok, _rx) = hub
+                .open_listen(Some(&reg_bob), None, None, None, false)
+                .unwrap();
             hub.announce(&v2_tok, "bob", false).unwrap();
             v2_tok
         };
@@ -7739,7 +7769,9 @@ mod tests {
         let v2_tok = {
             let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
             let reg_bob = hub.register_agent();
-            let (v2_tok, _rx) = hub.open_listen(Some(&reg_bob), None, None, None, false).unwrap();
+            let (v2_tok, _rx) = hub
+                .open_listen(Some(&reg_bob), None, None, None, false)
+                .unwrap();
             hub.announce(&v2_tok, "bob", false).unwrap();
             v2_tok
         };
@@ -7765,7 +7797,9 @@ mod tests {
         let v2_tok = {
             let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
             let reg_charlie = hub.register_agent();
-            let (v2_tok, _rx) = hub.open_listen(Some(&reg_charlie), None, None, None, false).unwrap();
+            let (v2_tok, _rx) = hub
+                .open_listen(Some(&reg_charlie), None, None, None, false)
+                .unwrap();
             hub.announce(&v2_tok, name, false).unwrap();
             v2_tok
         };
@@ -8003,8 +8037,12 @@ mod tests {
         let reg_b = hub.register_agent();
 
         // Open listen for both.
-        let (listen_a, _rx_a) = hub.open_listen(Some(&reg_a), None, None, None, false).unwrap();
-        let (listen_b, _rx_b) = hub.open_listen(Some(&reg_b), None, None, None, false).unwrap();
+        let (listen_a, _rx_a) = hub
+            .open_listen(Some(&reg_a), None, None, None, false)
+            .unwrap();
+        let (listen_b, _rx_b) = hub
+            .open_listen(Some(&reg_b), None, None, None, false)
+            .unwrap();
 
         // Announce both.
         hub.announce(&listen_a, "alice", false).unwrap();
@@ -8029,8 +8067,12 @@ mod tests {
         let reg_b = hub.register_agent();
 
         // Open listen for both.
-        let (listen_a, _rx_a) = hub.open_listen(Some(&reg_a), None, None, None, false).unwrap();
-        let (listen_b, _rx_b) = hub.open_listen(Some(&reg_b), None, None, None, false).unwrap();
+        let (listen_a, _rx_a) = hub
+            .open_listen(Some(&reg_a), None, None, None, false)
+            .unwrap();
+        let (listen_b, _rx_b) = hub
+            .open_listen(Some(&reg_b), None, None, None, false)
+            .unwrap();
 
         // Announce both (this updates name_to_token mappings).
         hub.announce(&listen_a, "alice", false).unwrap();
@@ -8058,8 +8100,12 @@ mod tests {
         let reg_b = hub.register_agent();
 
         // Open listen for both.
-        let (listen_a, _rx_a) = hub.open_listen(Some(&reg_a), None, None, None, false).unwrap();
-        let (listen_b, _rx_b) = hub.open_listen(Some(&reg_b), None, None, None, false).unwrap();
+        let (listen_a, _rx_a) = hub
+            .open_listen(Some(&reg_a), None, None, None, false)
+            .unwrap();
+        let (listen_b, _rx_b) = hub
+            .open_listen(Some(&reg_b), None, None, None, false)
+            .unwrap();
 
         // Announce both.
         hub.announce(&listen_a, "alice", false).unwrap();
@@ -8091,8 +8137,10 @@ mod tests {
         let tok_b = hub.mint_agent_token(&gov, "id-bob", None).unwrap();
 
         // Register both.
-        hub.register("alice", &tok_a, PresenceScope::GrantScoped).unwrap();
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped).unwrap();
+        hub.register("alice", &tok_a, PresenceScope::GrantScoped)
+            .unwrap();
+        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
+            .unwrap();
 
         // A uses presence_any_token with minted agent token → no grant → false.
         let result = hub.presence_any_token(&tok_a.0, "bob");
@@ -8114,8 +8162,10 @@ mod tests {
         hub.approve_grant(&gov, "id-alice", "id-bob", None).unwrap();
 
         // Register both.
-        hub.register("alice", &tok_a, PresenceScope::GrantScoped).unwrap();
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped).unwrap();
+        hub.register("alice", &tok_a, PresenceScope::GrantScoped)
+            .unwrap();
+        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
+            .unwrap();
 
         // A with grant → sees bob's real status.
         let result = hub.presence_any_token(&tok_a.0, "bob");

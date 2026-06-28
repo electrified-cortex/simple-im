@@ -34,7 +34,6 @@ const PARTICIPANT_SKILL_MD: &str = include_str!("../skills/participant/SKILL.md"
 const PARTICIPANT_LISTEN_SH: &str = include_str!("../skills/participant/listen.sh");
 const GOVERNOR_SKILL_MD: &str = include_str!("../skills/governor/SKILL.md");
 
-
 // ── State ─────────────────────────────────────────────────────────────────────
 
 /// Shared Axum application state holding the delivery hub and attachment configuration.
@@ -1300,16 +1299,14 @@ async fn handle_listen(
 
     let name_to_bind = body.as_ref().and_then(|b| b.0.name.as_deref());
 
-    let (token, rx) = match state.hub.open_listen(
-        Some(&token),
-        peer_ip,
-        name_to_bind,
-        observed_host,
-        force,
-    ) {
-        Ok(pair) => pair,
-        Err(e) => return err_response(e),
-    };
+    let (token, rx) =
+        match state
+            .hub
+            .open_listen(Some(&token), peer_ip, name_to_bind, observed_host, force)
+        {
+            Ok(pair) => pair,
+            Err(e) => return err_response(e),
+        };
 
     let token_for_drop = token.clone();
     let state_for_drop = Arc::clone(&state);
@@ -1627,4 +1624,3 @@ async fn handle_skill_governor() -> impl IntoResponse {
         GOVERNOR_SKILL_MD,
     )
 }
-
