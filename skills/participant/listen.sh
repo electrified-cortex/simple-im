@@ -127,9 +127,11 @@ while true; do
     connect_end=$(date +%s)
     elapsed=$((connect_end - connect_start))
 
-    # Revoke flag: governor intentionally cycled the token — not a server failure.
-    # Reset backoff and skip FAIL_COUNT increment so a revoke storm can't trigger SIM-DOWN.
-    if [[ -f "$SCRIPT_DIR/.sim_revoke_flag" ]]; then
+    # Re-registration triggers — two cases, both are intentional, not server failures:
+    #   1. Revoke flag: governor explicitly cycled the token (service/revoked handler).
+    #   2. Empty/missing TOKEN_FILE: AUTH_FAILED on stale token cleared the file (redeploy recovery).
+    # In both cases: reset backoff, skip FAIL_COUNT increment, continue to re-register.
+    if [[ -f "$SCRIPT_DIR/.sim_revoke_flag" ]] || [[ ! -s "$TOKEN_FILE" ]]; then
         rm -f "$SCRIPT_DIR/.sim_revoke_flag"
         BACKOFF=2
         continue
