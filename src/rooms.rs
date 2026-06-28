@@ -152,21 +152,22 @@ impl RoomStore {
 
     /// Return `true` if `name_a` and `name_b` are currently co-present in any room.
     ///
-    /// Performs lazy TTL pruning on every room it visits.  As a side-effect, rooms
-    /// that are left empty after pruning are removed from the outer HashMap, keeping
-    /// memory bounded on long-running servers.
+    /// Performs lazy TTL pruning of expired members on every room it visits.
+    ///
+    /// **Does NOT remove empty rooms** — that is `leave()`'s responsibility.  Evicting
+    /// rooms here would create a TOCTOU race: a room created but not yet joined would be
+    /// removed before the creator has a chance to call `join()`, causing a spurious 404.
     pub fn shares_room(&self, name_a: &str, name_b: &str) -> bool {
         let mut rooms = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
-        let mut co_present = false;
-        rooms.retain(|_, room| {
+        for room in rooms.values_mut() {
             room.members.retain(|_, m| m.expires_at > now);
             if room.members.contains_key(name_a) && room.members.contains_key(name_b) {
-                co_present = true;
+                return true; // early-exit restored
             }
-            !room.members.is_empty()
-        });
-        co_present
+            // NOTE: do NOT remove empty rooms here — leave() handles that
+        }
+        false
     }
 
     /// Returns the number of rooms currently in the store.
@@ -297,11 +298,12 @@ mod tests {
             Err(RoomError::NotMember)
         ));
         assert!(!store.shares_room("alice", "bob"));
-        // shares_room prunes + removes the now-empty room
+        // shares_room prunes expired members but does NOT remove the room —
+        // empty-room eviction is leave()'s responsibility, not shares_room()'s.
         assert_eq!(
             store.room_count(),
-            0,
-            "empty room must be removed by shares_room cleanup"
+            1,
+            "room must persist after shares_room TTL pruning; only leave() removes rooms"
         );
     }
 
@@ -355,17 +357,17 @@ mod tests {
     }
 
     #[test]
-    fn shares_room_removes_empty_rooms_after_ttl() {
+    fn shares_room_prunes_expired_members_but_keeps_room() {
         let store = RoomStore::new();
         let id = store.create();
         store.join(&id, "alice", Some(0)).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1));
-        // shares_room prunes all rooms and removes empty ones
+        // shares_room prunes expired members but does NOT remove the empty room
         assert!(!store.shares_room("alice", "bob"));
         assert_eq!(
             store.room_count(),
-            0,
-            "empty room must be removed by shares_room after TTL pruning"
+            1,
+            "room must remain after shares_room pruning; only leave() removes empty rooms"
         );
     }
 
@@ -383,5 +385,18 @@ mod tests {
             "alice should be back after rejoin"
         );
         assert!(store.members(&id, "alice").is_ok());
+    }
+
+    // ── TOCTOU regression (sim-p2-rooms-fixes) ──────────────────────────────────
+
+    #[test]
+    fn shares_room_does_not_evict_newly_created_empty_room() {
+        let store = RoomStore::new();
+        let id = store.create();
+        // shares_room() must not evict rooms that haven't been joined yet
+        assert!(!store.shares_room("alice", "bob"));
+        // Room must still exist so a subsequent join succeeds
+        store.join(&id, "alice", None).unwrap(); // must NOT return RoomNotFound
+        assert_eq!(store.room_count(), 1);
     }
 }
