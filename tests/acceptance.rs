@@ -3077,7 +3077,7 @@ async fn ac_pp1_announce_sends_online_to_grant_peer_sse() {
     let (hub, gov) = make_presence_hub();
 
     // Agent A: open listen stream (observer).
-    let tok_a = hub.register_agent();
+    let tok_a = hub.register_participant();
 
     let (_, mut rx_a) = hub
         .open_listen(Some(&tok_a), None, None, None, false)
@@ -3085,7 +3085,7 @@ async fn ac_pp1_announce_sends_online_to_grant_peer_sse() {
     hub.announce(&tok_a, "PpA", false).unwrap();
 
     // Agent B: open listen stream but do NOT announce yet.
-    let tok_b = hub.register_agent();
+    let tok_b = hub.register_participant();
 
     let (_, _rx_b) = hub
         .open_listen(Some(&tok_b), None, None, None, false)
@@ -3131,14 +3131,14 @@ async fn ac_pp2_cancel_listen_sends_offline_to_grant_peer_sse() {
 
     let (hub, gov) = make_presence_hub();
 
-    let tok_a = hub.register_agent();
+    let tok_a = hub.register_participant();
 
     let (_, mut rx_a) = hub
         .open_listen(Some(&tok_a), None, None, None, false)
         .unwrap();
     hub.announce(&tok_a, "PpA2", false).unwrap();
 
-    let tok_b = hub.register_agent();
+    let tok_b = hub.register_participant();
 
     let (_, _rx_b) = hub
         .open_listen(Some(&tok_b), None, None, None, false)
@@ -3184,14 +3184,14 @@ async fn ac_pp3_sse_drop_sends_offline_to_grant_peer_sse() {
 
     let (hub, gov) = make_presence_hub();
 
-    let tok_a = hub.register_agent();
+    let tok_a = hub.register_participant();
 
     let (_, mut rx_a) = hub
         .open_listen(Some(&tok_a), None, None, None, false)
         .unwrap();
     hub.announce(&tok_a, "PpA3", false).unwrap();
 
-    let tok_b = hub.register_agent();
+    let tok_b = hub.register_participant();
 
     let (_, _rx_b) = hub
         .open_listen(Some(&tok_b), None, None, None, false)
@@ -3239,14 +3239,14 @@ async fn ac_pp4_no_grant_no_presence_event_to_non_peer() {
     let (hub, gov) = make_presence_hub();
 
     // A and B have a grant (A is the observer with active SSE).
-    let tok_a = hub.register_agent();
+    let tok_a = hub.register_participant();
 
     let (_, mut rx_a) = hub
         .open_listen(Some(&tok_a), None, None, None, false)
         .unwrap();
     hub.announce(&tok_a, "PpA4", false).unwrap();
 
-    let tok_b = hub.register_agent();
+    let tok_b = hub.register_participant();
 
     let (_, _rx_b) = hub
         .open_listen(Some(&tok_b), None, None, None, false)
@@ -3267,7 +3267,7 @@ async fn ac_pp4_no_grant_no_presence_event_to_non_peer() {
     .unwrap();
 
     // C has NO grant with A.
-    let tok_c = hub.register_agent();
+    let tok_c = hub.register_participant();
 
     let (_, _rx_c) = hub
         .open_listen(Some(&tok_c), None, None, None, false)
@@ -3310,7 +3310,7 @@ async fn ac_pp5_minted_agent_deregister_sends_offline_to_listen_peer() {
     let (hub, gov) = make_presence_hub();
 
     // Alice: V2 listen-flow agent (observer — will receive presence events).
-    let tok_a = hub.register_agent();
+    let tok_a = hub.register_participant();
 
     let (_, mut rx_a) = hub
         .open_listen(Some(&tok_a), None, None, None, false)
@@ -3359,7 +3359,7 @@ async fn ac_pp6_force_eviction_sends_offline_to_grant_peer_sse() {
     let (hub, gov) = make_presence_hub();
 
     // Agent A: the observer — has an active SSE stream and a grant with B.
-    let tok_a = hub.register_agent();
+    let tok_a = hub.register_participant();
 
     let (_, mut rx_a) = hub
         .open_listen(Some(&tok_a), None, None, None, false)
@@ -3367,7 +3367,7 @@ async fn ac_pp6_force_eviction_sends_offline_to_grant_peer_sse() {
     hub.announce(&tok_a, "PpA6", false).unwrap();
 
     // Agent B: announces "PpB6" — will be force-evicted.
-    let tok_b = hub.register_agent();
+    let tok_b = hub.register_participant();
 
     let (_, _rx_b) = hub
         .open_listen(Some(&tok_b), None, None, None, false)
@@ -3392,7 +3392,7 @@ async fn ac_pp6_force_eviction_sends_offline_to_grant_peer_sse() {
     drain_receiver(&mut rx_a);
 
     // Agent C force-evicts B by announcing "PpB6" with force=true.
-    let tok_c = hub.register_agent();
+    let tok_c = hub.register_participant();
 
     let (_, _rx_c) = hub
         .open_listen(Some(&tok_c), None, None, None, false)
@@ -3425,7 +3425,7 @@ async fn ac_pp6b_stale_holder_reclaim_sends_offline_to_grant_peer_sse() {
     let (hub, gov) = make_presence_hub();
 
     // Agent A: the observer.
-    let tok_a = hub.register_agent();
+    let tok_a = hub.register_participant();
 
     let (_, mut rx_a) = hub
         .open_listen(Some(&tok_a), None, None, None, false)
@@ -3433,7 +3433,7 @@ async fn ac_pp6b_stale_holder_reclaim_sends_offline_to_grant_peer_sse() {
     hub.announce(&tok_a, "PpA6b", false).unwrap();
 
     // Agent B: announces "PpB6b" then its SSE drops without cancel_listen.
-    let tok_b = hub.register_agent();
+    let tok_b = hub.register_participant();
 
     let (_, _rx_b) = hub
         .open_listen(Some(&tok_b), None, None, None, false)
@@ -3463,7 +3463,7 @@ async fn ac_pp6b_stale_holder_reclaim_sends_offline_to_grant_peer_sse() {
     drain_receiver(&mut rx_a);
 
     // Agent C reclaims "PpB6b" without force (stale holder → no NAME_IN_USE returned).
-    let tok_c = hub.register_agent();
+    let tok_c = hub.register_participant();
 
     let (_, _rx_c) = hub
         .open_listen(Some(&tok_c), None, None, None, false)
@@ -3499,7 +3499,7 @@ fn make_hub() -> simple_im::delivery::DeliveryHub {
 async fn ac_startup_announce_first_sub_only() {
     let hub = make_hub();
     // AC1: first subscriber gets sim_online
-    let _tok1 = hub.register_agent();
+    let _tok1 = hub.register_participant();
 
     let (_, mut rx1) = hub
         .open_listen(Some(&_tok1), None, None, None, false)
@@ -3519,7 +3519,7 @@ async fn ac_startup_announce_first_sub_only() {
     );
 
     // AC2: second subscriber does NOT get sim_online
-    let _tok2 = hub.register_agent();
+    let _tok2 = hub.register_participant();
 
     let (_, mut rx2) = hub
         .open_listen(Some(&_tok2), None, None, None, false)

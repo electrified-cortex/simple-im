@@ -3572,7 +3572,7 @@ impl DeliveryHub {
     ///
     /// Use this token with `open_listen()` to start listening.
     /// This replaces the old anonymous /listen flow — now agents must register first.
-    pub fn register_agent(&self) -> String {
+    pub fn register_participant(&self) -> String {
         let mut inner = self.lock();
         let mut rng = rand::thread_rng();
         loop {
@@ -3588,7 +3588,7 @@ impl DeliveryHub {
     /// Opens an SSE listen stream for a token.
     ///
     /// Token is REQUIRED. If no token or unknown token, returns `AuthFailed`.
-    /// Use `register_agent()` to obtain a token before calling this.
+    /// Use `register_participant()` to obtain a token before calling this.
     ///
     /// `force`: if true and an active SSE exists for this token, supersede it.
     ///          if false and an active SSE exists, return `ActiveSubscription` error.
@@ -3614,7 +3614,7 @@ impl DeliveryHub {
             let mut inner = self.lock();
             let gc_offline_events = inner.gc_tokens();
 
-            // Token must exist in listen_tokens (pre-registered via register_agent).
+            // Token must exist in listen_tokens (pre-registered via register_participant).
             let token = if inner.listen_tokens.contains_key(provided_token) {
                 if inner
                     .listen_tokens
@@ -6421,7 +6421,7 @@ mod tests {
         let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
 
         // Bob is a listen-flow client — register first, then open_listen.
-        let bob_token = hub.register_agent();
+        let bob_token = hub.register_participant();
         let (bob_token, rx1) = hub
             .open_listen(Some(&bob_token), None, Some("bob"), None, false)
             .unwrap();
@@ -7599,7 +7599,7 @@ mod tests {
     fn ac_t2_token_not_persisted_before_first_grant() {
         let hub = make_hub(Duration::from_secs(30));
 
-        let reg_token = hub.register_agent();
+        let reg_token = hub.register_participant();
         let (token, _rx) = hub
             .open_listen(Some(&reg_token), None, None, None, false)
             .unwrap();
@@ -7697,7 +7697,7 @@ mod tests {
     fn ac_t5_gc_no_grant_ttl_removes_listened_never_granted_token() {
         let hub = make_hub(Duration::from_secs(30));
 
-        let reg_token = hub.register_agent();
+        let reg_token = hub.register_participant();
         let (stale, _rx) = hub
             .open_listen(Some(&reg_token), None, None, None, false)
             .unwrap();
@@ -7736,7 +7736,7 @@ mod tests {
         let gov = hub.install_governor(None);
 
         // Agent A: full listen-flow session (the observer — will receive presence events).
-        let reg_a = hub.register_agent();
+        let reg_a = hub.register_participant();
         let (tok_a, mut rx_a) = hub
             .open_listen(Some(&reg_a), None, None, None, false)
             .unwrap();
@@ -7801,7 +7801,7 @@ mod tests {
             let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
 
             // Issue token for bob and announce its name.
-            let reg_bob = hub.register_agent();
+            let reg_bob = hub.register_participant();
             let (v2_tok, _rx) = hub
                 .open_listen(Some(&reg_bob), None, None, None, false)
                 .unwrap();
@@ -7857,7 +7857,7 @@ mod tests {
 
         let v2_tok = {
             let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
-            let reg_bob = hub.register_agent();
+            let reg_bob = hub.register_participant();
             let (v2_tok, _rx) = hub
                 .open_listen(Some(&reg_bob), None, None, None, false)
                 .unwrap();
@@ -7896,7 +7896,7 @@ mod tests {
 
         let v2_tok = {
             let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
-            let reg_bob = hub.register_agent();
+            let reg_bob = hub.register_participant();
             let (v2_tok, _rx) = hub
                 .open_listen(Some(&reg_bob), None, None, None, false)
                 .unwrap();
@@ -7924,7 +7924,7 @@ mod tests {
 
         let v2_tok = {
             let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
-            let reg_charlie = hub.register_agent();
+            let reg_charlie = hub.register_participant();
             let (v2_tok, _rx) = hub
                 .open_listen(Some(&reg_charlie), None, None, None, false)
                 .unwrap();
@@ -8161,8 +8161,8 @@ mod tests {
         let _gov = hub.install_governor(None);
 
         // Register listen tokens for A and B (no grant between them).
-        let reg_a = hub.register_agent();
-        let reg_b = hub.register_agent();
+        let reg_a = hub.register_participant();
+        let reg_b = hub.register_participant();
 
         // Open listen for both.
         let (listen_a, _rx_a) = hub
@@ -8191,8 +8191,8 @@ mod tests {
         let gov = hub.install_governor(None);
 
         // Register listen tokens.
-        let reg_a = hub.register_agent();
-        let reg_b = hub.register_agent();
+        let reg_a = hub.register_participant();
+        let reg_b = hub.register_participant();
 
         // Open listen for both.
         let (listen_a, _rx_a) = hub
@@ -8224,8 +8224,8 @@ mod tests {
         let gov = hub.install_governor(None);
 
         // Register listen tokens.
-        let reg_a = hub.register_agent();
-        let reg_b = hub.register_agent();
+        let reg_a = hub.register_participant();
+        let reg_b = hub.register_participant();
 
         // Open listen for both.
         let (listen_a, _rx_a) = hub

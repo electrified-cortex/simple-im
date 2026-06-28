@@ -1304,11 +1304,11 @@ fn sanitize_filename(name: &str) -> String {
 }
 
 // ── POST /register ─────────────────────────────────────────────────────────────
-// Mint a new agent token for future /listen use.
+// Mint a new participant token for future /listen use.
 // No authentication required (anyone can register, same as anonymous /listen before).
 
 async fn handle_register(State(state): State<Arc<AppState>>) -> Response {
-    let token = state.hub.register_agent();
+    let token = state.hub.register_participant();
     (StatusCode::OK, Json(json!({"token": token}))).into_response()
 }
 
