@@ -3637,12 +3637,30 @@ impl DeliveryHub {
 
                 provided_token.to_string()
             } else {
-                // Unknown token — auth failed (no anonymous minting).
-                drop(inner);
-                for (senders, name) in gc_offline_events {
-                    push_presence_event(senders, &name, "offline");
+                // Unknown token — check if it's a governor token (governor session-link flow).
+                // Governors may present their governor token to /listen to establish an identity
+                // link so that announce() can later enqueue the governor_role breadcrumb.
+                let gov_candidate = GovernorToken(provided_token.to_string());
+                if inner.trust.validate_governor_token(&gov_candidate).is_ok() {
+                    // Mint a new listen token and link the governor identity to it.
+                    let mut rng = rand::thread_rng();
+                    let new_tok = loop {
+                        let digits: u64 = rng.gen_range(10_000_000..=999_999_999_999);
+                        let t = digits.to_string();
+                        if !inner.listen_tokens.contains_key(&t) {
+                            break t;
+                        }
+                    };
+                    inner.listen_tokens.insert(new_tok.clone(), V2TokenState::new());
+                    new_tok
+                } else {
+                    // Not a listen token or governor token — auth failed.
+                    drop(inner);
+                    for (senders, name) in gc_offline_events {
+                        push_presence_event(senders, &name, "offline");
+                    }
+                    return Err(Error::AuthFailed);
                 }
-                return Err(Error::AuthFailed);
             };
 
             let (tx, rx) = mpsc::unbounded_channel::<String>();

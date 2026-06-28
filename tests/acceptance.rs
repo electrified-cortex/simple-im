@@ -56,18 +56,39 @@ impl TestServer {
     }
 }
 
+/// POST /agents/register — mint a fresh token (new-agent flow).
+async fn register_agent_tok(server: &TestServer, client: &reqwest::Client) -> String {
+    let r = client
+        .post(server.url("/agents/register"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK, "POST /agents/register failed");
+    let body: Value = r.json().await.unwrap();
+    body["token"].as_str().unwrap().to_owned()
+}
+
 /// POST /listen, read the welcome event, return (token, task_handle).
 /// The task_handle keeps the SSE connection alive — drop it when done.
+/// When existing_token is None, auto-registers via POST /agents/register first.
 async fn listen_get_token(
     server: &TestServer,
     client: &reqwest::Client,
     existing_token: Option<&str>,
 ) -> (String, tokio::task::JoinHandle<()>) {
-    let mut req = client.post(server.url("/listen"));
-    if let Some(tok) = existing_token {
-        req = req.header("Authorization", format!("Bearer {}", tok));
-    }
-    let r = req.send().await.unwrap();
+    let owned;
+    let tok: &str = if let Some(t) = existing_token {
+        t
+    } else {
+        owned = register_agent_tok(server, client).await;
+        &owned
+    };
+    let r = client
+        .post(server.url("/listen"))
+        .header("Authorization", format!("Bearer {}", tok))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), StatusCode::OK, "POST /listen failed");
 
     let mut stream = r.bytes_stream();
@@ -97,16 +118,25 @@ async fn listen_get_token(
 }
 
 /// POST /listen and read the first SSE event. Drops the stream (agent goes offline after).
+/// When existing_token is None, auto-registers via POST /agents/register first.
 async fn listen_and_get_welcome(
     server: &TestServer,
     client: &reqwest::Client,
     existing_token: Option<&str>,
 ) -> (String, String) {
-    let mut req = client.post(server.url("/listen"));
-    if let Some(tok) = existing_token {
-        req = req.header("Authorization", format!("Bearer {}", tok));
-    }
-    let r = req.send().await.unwrap();
+    let owned;
+    let tok: &str = if let Some(t) = existing_token {
+        t
+    } else {
+        owned = register_agent_tok(server, client).await;
+        &owned
+    };
+    let r = client
+        .post(server.url("/listen"))
+        .header("Authorization", format!("Bearer {}", tok))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), StatusCode::OK, "POST /listen failed");
 
     let mut stream = r.bytes_stream();
@@ -387,7 +417,8 @@ async fn ac_l1_second_listen_supersedes_first() {
     let client = server.client();
 
     // First listen — get the token.
-    let r = client.post(server.url("/listen")).send().await.unwrap();
+    let _rtok = register_agent_tok(&server, &client).await;
+    let r = client.post(server.url("/listen")).header("Authorization", format!("Bearer {}", _rtok)).send().await.unwrap();
     assert_eq!(r.status(), StatusCode::OK);
 
     let mut first_stream = r.bytes_stream();
@@ -406,9 +437,9 @@ async fn ac_l1_second_listen_supersedes_first() {
         }
     };
 
-    // Second listen with same token — should supersede the first.
+    // Second listen with same token + force=true — should supersede the first.
     let _r2 = client
-        .post(server.url("/listen"))
+        .post(server.url("/listen?force=true"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await
@@ -444,7 +475,8 @@ async fn ac_n1_first_message_triggers_notify() {
     let client = server.client();
 
     // Receiver.
-    let r = client.post(server.url("/listen")).send().await.unwrap();
+    let _rtok = register_agent_tok(&server, &client).await;
+    let r = client.post(server.url("/listen")).header("Authorization", format!("Bearer {}", _rtok)).send().await.unwrap();
     assert_eq!(r.status(), StatusCode::OK);
 
     let mut stream = r.bytes_stream();
@@ -522,7 +554,8 @@ async fn ac_n2_rapid_messages_single_notify() {
     let (server, gov) = TestServer::spawn_with_governor().await;
     let client = server.client();
 
-    let r = client.post(server.url("/listen")).send().await.unwrap();
+    let _rtok = register_agent_tok(&server, &client).await;
+    let r = client.post(server.url("/listen")).header("Authorization", format!("Bearer {}", _rtok)).send().await.unwrap();
     let mut stream = r.bytes_stream();
     let mut buf = String::new();
     let recv_token = loop {
@@ -607,7 +640,8 @@ async fn ac_n3_dequeue_then_new_message_triggers_notify() {
     let (server, gov) = TestServer::spawn_with_governor().await;
     let client = server.client();
 
-    let r = client.post(server.url("/listen")).send().await.unwrap();
+    let _rtok = register_agent_tok(&server, &client).await;
+    let r = client.post(server.url("/listen")).header("Authorization", format!("Bearer {}", _rtok)).send().await.unwrap();
     let mut stream = r.bytes_stream();
     let mut buf = String::new();
     let recv_token = loop {
@@ -712,7 +746,8 @@ async fn ac_n4_race_free_dequeue_then_arrival_fires_notify() {
     let (server, gov) = TestServer::spawn_with_governor().await;
     let client = server.client();
 
-    let r = client.post(server.url("/listen")).send().await.unwrap();
+    let _rtok = register_agent_tok(&server, &client).await;
+    let r = client.post(server.url("/listen")).header("Authorization", format!("Bearer {}", _rtok)).send().await.unwrap();
     let mut stream = r.bytes_stream();
     let mut buf = String::new();
     let recv_token = loop {
@@ -897,7 +932,8 @@ async fn ac_r1_r3_token_revocation_atomic() {
     let (server, gov) = TestServer::spawn_with_governor().await;
     let client = server.client();
 
-    let r = client.post(server.url("/listen")).send().await.unwrap();
+    let _rtok = register_agent_tok(&server, &client).await;
+    let r = client.post(server.url("/listen")).header("Authorization", format!("Bearer {}", _rtok)).send().await.unwrap();
     let mut stream = r.bytes_stream();
     let mut buf = String::new();
     let agent_tok = loop {
@@ -979,7 +1015,8 @@ async fn ac_d4_thread_filter_on_single_dequeue() {
     let client = server.client();
 
     // Receiver.
-    let r = client.post(server.url("/listen")).send().await.unwrap();
+    let _rtok = register_agent_tok(&server, &client).await;
+    let r = client.post(server.url("/listen")).header("Authorization", format!("Bearer {}", _rtok)).send().await.unwrap();
     let mut stream = r.bytes_stream();
     let mut buf = String::new();
     let recv_tok = loop {
@@ -1088,7 +1125,8 @@ async fn ac_s3_send_by_token_routes_to_recipient() {
     let client = server.client();
 
     // Receiver.
-    let r = client.post(server.url("/listen")).send().await.unwrap();
+    let _rtok = register_agent_tok(&server, &client).await;
+    let r = client.post(server.url("/listen")).header("Authorization", format!("Bearer {}", _rtok)).send().await.unwrap();
     let mut stream = r.bytes_stream();
     let mut buf = String::new();
     let recv_tok = loop {
@@ -1231,7 +1269,8 @@ async fn ac_n5_service_events_bypass_notify_interlock() {
     let client = server.client();
 
     // Receiver with active SSE.
-    let r = client.post(server.url("/listen")).send().await.unwrap();
+    let _rtok = register_agent_tok(&server, &client).await;
+    let r = client.post(server.url("/listen")).header("Authorization", format!("Bearer {}", _rtok)).send().await.unwrap();
     assert_eq!(r.status(), StatusCode::OK);
     let mut stream = r.bytes_stream();
     let mut buf = String::new();
@@ -1499,7 +1538,8 @@ async fn ac_n5_service_events_bypass_notify_suppressed() {
     let client = server.client();
 
     // Open SSE and keep it alive.
-    let r = client.post(server.url("/listen")).send().await.unwrap();
+    let _rtok = register_agent_tok(&server, &client).await;
+    let r = client.post(server.url("/listen")).header("Authorization", format!("Bearer {}", _rtok)).send().await.unwrap();
     assert_eq!(r.status(), StatusCode::OK);
     let mut stream = r.bytes_stream();
     let mut buf = String::new();
@@ -2114,11 +2154,28 @@ async fn spawn_server_with_ttl(liveness_secs: u64) -> TestServer {
     }
 }
 
+/// Helper: spawn a TestServer with a custom liveness window AND a governor.
+async fn spawn_server_with_governor_ttl(liveness_secs: u64) -> (TestServer, String) {
+    use simple_im::delivery::DeliveryHub;
+    let hub = DeliveryHub::new(Duration::from_secs(liveness_secs));
+    let gov = hub.install_governor(None);
+    let gov_tok = gov.0.clone();
+    let state = Arc::new(AppState::new_with_hub(hub));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = simple_im::http::router(Arc::clone(&state));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (TestServer { base_url: format!("http://127.0.0.1:{}", addr.port()) }, gov_tok)
+}
+
 // ── AC1: presence returns "online" for a reachable agent ─────────────────────
 
 #[tokio::test]
 async fn ac_pr1_presence_online_after_announce() {
-    let server = TestServer::spawn().await;
+    // Need governor to approve the grant required by the new grant-gated visibility model.
+    let (server, gov) = TestServer::spawn_with_governor().await;
     let client = server.client();
 
     // Agent A: open SSE and keep it alive; announce.
@@ -2137,8 +2194,17 @@ async fn ac_pr1_presence_online_after_announce() {
         "announce must return 204"
     );
 
-    // Agent B: any valid token — just needs to issue a listen token for auth.
+    // Agent B: register and open a listen session for querying.
     let (tok_b, _stream_b) = listen_get_token(&server, &client, None).await;
+
+    // Grant required for B to see A's presence (new grant-gated visibility model).
+    client
+        .post(server.url("/grants/approve"))
+        .header("Authorization", format!("Bearer {}", gov))
+        .json(&json!({"identity_a": tok_a, "identity_b": tok_b}))
+        .send()
+        .await
+        .unwrap();
 
     // AC1: Agent B queries Agent A's presence — A has active SSE and has announced.
     let r = client
@@ -2165,7 +2231,8 @@ async fn ac_pr2_presence_recovers_after_sse_drop_and_reannounce() {
     // Use a 1-second liveness TTL so we can drive the offline→online transition
     // within the test.  With the 30 s default the agent would stay online via the
     // registry for far too long to be observable in a unit test.
-    let server = spawn_server_with_ttl(1).await;
+    // Governor needed for grant approval (new grant-gated visibility model).
+    let (server, gov) = spawn_server_with_governor_ttl(1).await;
     let client = server.client();
 
     // Agent A: open SSE, announce.
@@ -2186,6 +2253,15 @@ async fn ac_pr2_presence_recovers_after_sse_drop_and_reannounce() {
 
     // Querier token.
     let (tok_q, _stream_q) = listen_get_token(&server, &client, None).await;
+
+    // Grant required for querier to see agent A's presence (new grant-gated visibility model).
+    client
+        .post(server.url("/grants/approve"))
+        .header("Authorization", format!("Bearer {}", gov))
+        .json(&json!({"identity_a": tok_a, "identity_b": tok_q}))
+        .send()
+        .await
+        .unwrap();
 
     // Verify agent is online before dropping SSE.
     let r = client
@@ -2306,7 +2382,8 @@ async fn ac_gov_breadcrumb_on_connect() {
     let client = server.client();
 
     // Governor: POST /listen with their governor token as bearer.
-    // The server detects this is a governor token and records the session link.
+    // The server detects this is a governor token, mints a linked listen token,
+    // and records the session link so announce() can enqueue the governor_role breadcrumb.
     let (listen_tok, _stream) = listen_get_token(&server, &client, Some(&gov_token)).await;
 
     // Governor: POST /announce — this triggers the governor-role breadcrumb to be enqueued.
@@ -2384,7 +2461,8 @@ async fn setup_send_pair(
     let client = server.client();
 
     // Receiver — keep SSE open for notify delivery.
-    let r = client.post(server.url("/listen")).send().await.unwrap();
+    let _rtok = register_agent_tok(&server, &client).await;
+    let r = client.post(server.url("/listen")).header("Authorization", format!("Bearer {}", _rtok)).send().await.unwrap();
     let mut stream = r.bytes_stream();
     let mut buf = String::new();
     let recv_token = loop {
@@ -2622,7 +2700,8 @@ async fn ac_lid3_sub_event_contains_last_message_id() {
     let client = server.client();
 
     // POST /listen — read until we see the sub event (second data event after welcome).
-    let r = client.post(server.url("/listen")).send().await.unwrap();
+    let _rtok = register_agent_tok(&server, &client).await;
+    let r = client.post(server.url("/listen")).header("Authorization", format!("Bearer {}", _rtok)).send().await.unwrap();
     assert_eq!(r.status(), StatusCode::OK);
     let mut stream = r.bytes_stream();
     let mut buf = String::new();
@@ -2854,11 +2933,15 @@ async fn ac_pp1_announce_sends_online_to_grant_peer_sse() {
     let (hub, gov) = make_presence_hub();
 
     // Agent A: open listen stream (observer).
-    let (tok_a, mut rx_a) = hub.open_listen(None, None, None, None).unwrap();
+    let tok_a = hub.register_agent();
+
+    let (_, mut rx_a) = hub.open_listen(Some(&tok_a), None, None, None, false).unwrap();
     hub.announce(&tok_a, "PpA", false).unwrap();
 
     // Agent B: open listen stream but do NOT announce yet.
-    let (tok_b, _rx_b) = hub.open_listen(None, None, None, None).unwrap();
+    let tok_b = hub.register_agent();
+
+    let (_, _rx_b) = hub.open_listen(Some(&tok_b), None, None, None, false).unwrap();
 
     // Establish grant with explicit names (B not yet announced, so FP1 wouldn't find name_b).
     hub.approve_grant_req(
@@ -2900,10 +2983,16 @@ async fn ac_pp2_cancel_listen_sends_offline_to_grant_peer_sse() {
 
     let (hub, gov) = make_presence_hub();
 
-    let (tok_a, mut rx_a) = hub.open_listen(None, None, None, None).unwrap();
+    let tok_a = hub.register_agent();
+
+
+    let (_, mut rx_a) = hub.open_listen(Some(&tok_a), None, None, None, false).unwrap();
     hub.announce(&tok_a, "PpA2", false).unwrap();
 
-    let (tok_b, _rx_b) = hub.open_listen(None, None, None, None).unwrap();
+    let tok_b = hub.register_agent();
+
+
+    let (_, _rx_b) = hub.open_listen(Some(&tok_b), None, None, None, false).unwrap();
     hub.announce(&tok_b, "PpB2", false).unwrap();
 
     hub.approve_grant_req(
@@ -2945,10 +3034,16 @@ async fn ac_pp3_sse_drop_sends_offline_to_grant_peer_sse() {
 
     let (hub, gov) = make_presence_hub();
 
-    let (tok_a, mut rx_a) = hub.open_listen(None, None, None, None).unwrap();
+    let tok_a = hub.register_agent();
+
+
+    let (_, mut rx_a) = hub.open_listen(Some(&tok_a), None, None, None, false).unwrap();
     hub.announce(&tok_a, "PpA3", false).unwrap();
 
-    let (tok_b, _rx_b) = hub.open_listen(None, None, None, None).unwrap();
+    let tok_b = hub.register_agent();
+
+
+    let (_, _rx_b) = hub.open_listen(Some(&tok_b), None, None, None, false).unwrap();
     hub.announce(&tok_b, "PpB3", false).unwrap();
 
     hub.approve_grant_req(
@@ -2992,10 +3087,15 @@ async fn ac_pp4_no_grant_no_presence_event_to_non_peer() {
     let (hub, gov) = make_presence_hub();
 
     // A and B have a grant (A is the observer with active SSE).
-    let (tok_a, mut rx_a) = hub.open_listen(None, None, None, None).unwrap();
+    let tok_a = hub.register_agent();
+
+    let (_, mut rx_a) = hub.open_listen(Some(&tok_a), None, None, None, false).unwrap();
     hub.announce(&tok_a, "PpA4", false).unwrap();
 
-    let (tok_b, _rx_b) = hub.open_listen(None, None, None, None).unwrap();
+    let tok_b = hub.register_agent();
+
+
+    let (_, _rx_b) = hub.open_listen(Some(&tok_b), None, None, None, false).unwrap();
     hub.announce(&tok_b, "PpB4", false).unwrap();
 
     hub.approve_grant_req(
@@ -3012,7 +3112,9 @@ async fn ac_pp4_no_grant_no_presence_event_to_non_peer() {
     .unwrap();
 
     // C has NO grant with A.
-    let (tok_c, _rx_c) = hub.open_listen(None, None, None, None).unwrap();
+    let tok_c = hub.register_agent();
+
+    let (_, _rx_c) = hub.open_listen(Some(&tok_c), None, None, None, false).unwrap();
 
     // Drain setup events so we start fresh.
     drain_receiver(&mut rx_a);
@@ -3051,7 +3153,9 @@ async fn ac_pp5_minted_agent_deregister_sends_offline_to_listen_peer() {
     let (hub, gov) = make_presence_hub();
 
     // Alice: V2 listen-flow agent (observer — will receive presence events).
-    let (tok_a, mut rx_a) = hub.open_listen(None, None, None, None).unwrap();
+    let tok_a = hub.register_agent();
+
+    let (_, mut rx_a) = hub.open_listen(Some(&tok_a), None, None, None, false).unwrap();
     hub.announce(&tok_a, "PpA5", false).unwrap();
 
     // Bob: minted agent with a stable identity distinct from his token.
@@ -3096,11 +3200,15 @@ async fn ac_pp6_force_eviction_sends_offline_to_grant_peer_sse() {
     let (hub, gov) = make_presence_hub();
 
     // Agent A: the observer — has an active SSE stream and a grant with B.
-    let (tok_a, mut rx_a) = hub.open_listen(None, None, None, None).unwrap();
+    let tok_a = hub.register_agent();
+
+    let (_, mut rx_a) = hub.open_listen(Some(&tok_a), None, None, None, false).unwrap();
     hub.announce(&tok_a, "PpA6", false).unwrap();
 
     // Agent B: announces "PpB6" — will be force-evicted.
-    let (tok_b, _rx_b) = hub.open_listen(None, None, None, None).unwrap();
+    let tok_b = hub.register_agent();
+
+    let (_, _rx_b) = hub.open_listen(Some(&tok_b), None, None, None, false).unwrap();
     hub.announce(&tok_b, "PpB6", false).unwrap();
 
     // Approve grant between A and B with explicit names.
@@ -3121,7 +3229,9 @@ async fn ac_pp6_force_eviction_sends_offline_to_grant_peer_sse() {
     drain_receiver(&mut rx_a);
 
     // Agent C force-evicts B by announcing "PpB6" with force=true.
-    let (tok_c, _rx_c) = hub.open_listen(None, None, None, None).unwrap();
+    let tok_c = hub.register_agent();
+
+    let (_, _rx_c) = hub.open_listen(Some(&tok_c), None, None, None, false).unwrap();
     hub.announce(&tok_c, "PpB6", true).unwrap();
 
     // A must receive sim_offline for "PpB6".
@@ -3150,11 +3260,15 @@ async fn ac_pp6b_stale_holder_reclaim_sends_offline_to_grant_peer_sse() {
     let (hub, gov) = make_presence_hub();
 
     // Agent A: the observer.
-    let (tok_a, mut rx_a) = hub.open_listen(None, None, None, None).unwrap();
+    let tok_a = hub.register_agent();
+
+    let (_, mut rx_a) = hub.open_listen(Some(&tok_a), None, None, None, false).unwrap();
     hub.announce(&tok_a, "PpA6b", false).unwrap();
 
     // Agent B: announces "PpB6b" then its SSE drops without cancel_listen.
-    let (tok_b, _rx_b) = hub.open_listen(None, None, None, None).unwrap();
+    let tok_b = hub.register_agent();
+
+    let (_, _rx_b) = hub.open_listen(Some(&tok_b), None, None, None, false).unwrap();
     hub.announce(&tok_b, "PpB6b", false).unwrap();
 
     // Approve grant between A and B.
@@ -3180,7 +3294,9 @@ async fn ac_pp6b_stale_holder_reclaim_sends_offline_to_grant_peer_sse() {
     drain_receiver(&mut rx_a);
 
     // Agent C reclaims "PpB6b" without force (stale holder → no NAME_IN_USE returned).
-    let (tok_c, _rx_c) = hub.open_listen(None, None, None, None).unwrap();
+    let tok_c = hub.register_agent();
+
+    let (_, _rx_c) = hub.open_listen(Some(&tok_c), None, None, None, false).unwrap();
     // B's name binding persists after close_listen; a non-force announce by C should
     // evict the stale binding and fire sim_offline to A.
     hub.announce(&tok_c, "PpB6b", false).unwrap();
@@ -3212,7 +3328,9 @@ fn make_hub() -> simple_im::delivery::DeliveryHub {
 async fn ac_startup_announce_first_sub_only() {
     let hub = make_hub();
     // AC1: first subscriber gets sim_online
-    let (_tok1, mut rx1) = hub.open_listen(None, None, None, None).unwrap();
+    let _tok1 = hub.register_agent();
+
+    let (_, mut rx1) = hub.open_listen(Some(&_tok1), None, None, None, false).unwrap();
     let mut events1 = vec![];
     while let Ok(ev) = rx1.try_recv() {
         events1.push(ev);
@@ -3228,7 +3346,9 @@ async fn ac_startup_announce_first_sub_only() {
     );
 
     // AC2: second subscriber does NOT get sim_online
-    let (_tok2, mut rx2) = hub.open_listen(None, None, None, None).unwrap();
+    let _tok2 = hub.register_agent();
+
+    let (_, mut rx2) = hub.open_listen(Some(&_tok2), None, None, None, false).unwrap();
     let mut events2 = vec![];
     while let Ok(ev) = rx2.try_recv() {
         events2.push(ev);
