@@ -93,6 +93,9 @@ async fn listen_get_token(
 
     let mut stream = r.bytes_stream();
     let mut buffer = String::new();
+    // Wait for the welcome event. Normal agents already know their token (from registration).
+    // Exception: governor session-link path — server mints a new listen token and includes it
+    // in the welcome. In that case, extract from the welcome; otherwise use tok.
     let token = loop {
         let chunk = tokio::time::timeout(Duration::from_secs(5), stream.next())
             .await
@@ -103,7 +106,8 @@ async fn listen_get_token(
         if let Some(line) = buffer.lines().find(|l| l.starts_with("data:")) {
             let w: Value = serde_json::from_str(line.trim_start_matches("data:").trim()).unwrap();
             assert_eq!(w["event"], "welcome");
-            break w["token"].as_str().unwrap().to_string();
+            // If server included a minted listen token (governor case), use it; else use registered tok.
+            break w["token"].as_str().map(|t| t.to_string()).unwrap_or_else(|| tok.to_string());
         }
     };
 
@@ -156,20 +160,23 @@ async fn listen_and_get_welcome(
     let parsed: Value = serde_json::from_str(&welcome_json).unwrap();
     assert_eq!(parsed["type"], "service");
     assert_eq!(parsed["event"], "welcome");
-    let token = parsed["token"].as_str().unwrap().to_owned();
+    // Normal agents use their registered token. Governor session-link path receives a
+    // minted listen token in the welcome — use it when present.
+    let token = parsed["token"].as_str().map(|t| t.to_string()).unwrap_or_else(|| tok.to_string());
     (token, welcome_json)
 }
 
-// ── AC-T1: POST /listen returns SSE with 8-12 digit token ─────────────────────
+// ── AC-T1: POST /agents/register returns 8-12 digit token; welcome has no token ──
 
 #[tokio::test]
 async fn ac_t1_listen_returns_token_in_welcome_event() {
     let server = TestServer::spawn().await;
     let client = server.client();
 
-    let (token, _welcome) = listen_and_get_welcome(&server, &client, None).await;
+    // Token comes from POST /agents/register, not from the welcome event.
+    let (token, welcome_json) = listen_and_get_welcome(&server, &client, None).await;
 
-    // Token must be 8-12 digits.
+    // Registered token must be 8-12 digits.
     assert!(
         token.len() >= 8 && token.len() <= 12,
         "token length: {}",
@@ -179,6 +186,14 @@ async fn ac_t1_listen_returns_token_in_welcome_event() {
         token.chars().all(|c| c.is_ascii_digit()),
         "token must be numeric: {}",
         token
+    );
+
+    // Welcome event must NOT contain a token field.
+    let welcome: Value = serde_json::from_str(&welcome_json).unwrap();
+    assert!(
+        welcome.get("token").is_none(),
+        "welcome event must not echo token, got: {}",
+        welcome
     );
 }
 
@@ -423,19 +438,14 @@ async fn ac_l1_second_listen_supersedes_first() {
 
     let mut first_stream = r.bytes_stream();
     let mut buf = String::new();
-    let token = loop {
+    // Consume welcome event; token comes from registration, not welcome.
+    loop {
         let chunk = tokio::time::timeout(Duration::from_secs(5), first_stream.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+            .await.unwrap().unwrap().unwrap();
         buf.push_str(&String::from_utf8_lossy(&chunk));
-        if let Some(line) = buf.lines().find(|l| l.starts_with("data:")) {
-            let welcome: Value =
-                serde_json::from_str(line.trim_start_matches("data:").trim()).unwrap();
-            break welcome["token"].as_str().unwrap().to_string();
-        }
-    };
+        if buf.lines().any(|l| l.starts_with("data:")) { break; }
+    }
+    let token = _rtok.clone();
 
     // Second listen with same token + force=true — should supersede the first.
     let _r2 = client
@@ -481,18 +491,14 @@ async fn ac_n1_first_message_triggers_notify() {
 
     let mut stream = r.bytes_stream();
     let mut buf = String::new();
-    let recv_token = loop {
+    // Consume welcome event; token comes from registration, not welcome.
+    loop {
         let chunk = tokio::time::timeout(Duration::from_secs(5), stream.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+            .await.unwrap().unwrap().unwrap();
         buf.push_str(&String::from_utf8_lossy(&chunk));
-        if let Some(line) = buf.lines().find(|l| l.starts_with("data:")) {
-            let w: Value = serde_json::from_str(line.trim_start_matches("data:").trim()).unwrap();
-            break w["token"].as_str().unwrap().to_string();
-        }
-    };
+        if buf.lines().any(|l| l.starts_with("data:")) { break; }
+    }
+    let recv_token = _rtok.clone();
 
     client
         .post(server.url("/announce"))
@@ -558,18 +564,14 @@ async fn ac_n2_rapid_messages_single_notify() {
     let r = client.post(server.url("/listen")).header("Authorization", format!("Bearer {}", _rtok)).send().await.unwrap();
     let mut stream = r.bytes_stream();
     let mut buf = String::new();
-    let recv_token = loop {
+    // Consume welcome event; token comes from registration, not welcome.
+    loop {
         let chunk = tokio::time::timeout(Duration::from_secs(5), stream.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+            .await.unwrap().unwrap().unwrap();
         buf.push_str(&String::from_utf8_lossy(&chunk));
-        if let Some(line) = buf.lines().find(|l| l.starts_with("data:")) {
-            let w: Value = serde_json::from_str(line.trim_start_matches("data:").trim()).unwrap();
-            break w["token"].as_str().unwrap().to_string();
-        }
-    };
+        if buf.lines().any(|l| l.starts_with("data:")) { break; }
+    }
+    let recv_token = _rtok.clone();
 
     client
         .post(server.url("/announce"))
@@ -644,18 +646,14 @@ async fn ac_n3_dequeue_then_new_message_triggers_notify() {
     let r = client.post(server.url("/listen")).header("Authorization", format!("Bearer {}", _rtok)).send().await.unwrap();
     let mut stream = r.bytes_stream();
     let mut buf = String::new();
-    let recv_token = loop {
+    // Consume welcome event; token comes from registration, not welcome.
+    loop {
         let chunk = tokio::time::timeout(Duration::from_secs(5), stream.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+            .await.unwrap().unwrap().unwrap();
         buf.push_str(&String::from_utf8_lossy(&chunk));
-        if let Some(line) = buf.lines().find(|l| l.starts_with("data:")) {
-            let w: Value = serde_json::from_str(line.trim_start_matches("data:").trim()).unwrap();
-            break w["token"].as_str().unwrap().to_string();
-        }
-    };
+        if buf.lines().any(|l| l.starts_with("data:")) { break; }
+    }
+    let recv_token = _rtok.clone();
 
     client
         .post(server.url("/announce"))
@@ -750,18 +748,14 @@ async fn ac_n4_race_free_dequeue_then_arrival_fires_notify() {
     let r = client.post(server.url("/listen")).header("Authorization", format!("Bearer {}", _rtok)).send().await.unwrap();
     let mut stream = r.bytes_stream();
     let mut buf = String::new();
-    let recv_token = loop {
+    // Consume welcome event; token comes from registration, not welcome.
+    loop {
         let chunk = tokio::time::timeout(Duration::from_secs(5), stream.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+            .await.unwrap().unwrap().unwrap();
         buf.push_str(&String::from_utf8_lossy(&chunk));
-        if let Some(line) = buf.lines().find(|l| l.starts_with("data:")) {
-            let w: Value = serde_json::from_str(line.trim_start_matches("data:").trim()).unwrap();
-            break w["token"].as_str().unwrap().to_string();
-        }
-    };
+        if buf.lines().any(|l| l.starts_with("data:")) { break; }
+    }
+    let recv_token = _rtok.clone();
 
     client
         .post(server.url("/announce"))
@@ -936,18 +930,14 @@ async fn ac_r1_r3_token_revocation_atomic() {
     let r = client.post(server.url("/listen")).header("Authorization", format!("Bearer {}", _rtok)).send().await.unwrap();
     let mut stream = r.bytes_stream();
     let mut buf = String::new();
-    let agent_tok = loop {
+    // Consume welcome event; token comes from registration, not welcome.
+    loop {
         let chunk = tokio::time::timeout(Duration::from_secs(5), stream.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+            .await.unwrap().unwrap().unwrap();
         buf.push_str(&String::from_utf8_lossy(&chunk));
-        if let Some(line) = buf.lines().find(|l| l.starts_with("data:")) {
-            let w: Value = serde_json::from_str(line.trim_start_matches("data:").trim()).unwrap();
-            break w["token"].as_str().unwrap().to_string();
-        }
-    };
+        if buf.lines().any(|l| l.starts_with("data:")) { break; }
+    }
+    let agent_tok = _rtok.clone();
 
     // Announce a name (required for DELETE /participants/{name}).
     client
@@ -1019,18 +1009,14 @@ async fn ac_d4_thread_filter_on_single_dequeue() {
     let r = client.post(server.url("/listen")).header("Authorization", format!("Bearer {}", _rtok)).send().await.unwrap();
     let mut stream = r.bytes_stream();
     let mut buf = String::new();
-    let recv_tok = loop {
+    // Consume welcome event; token comes from registration, not welcome.
+    loop {
         let chunk = tokio::time::timeout(Duration::from_secs(5), stream.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+            .await.unwrap().unwrap().unwrap();
         buf.push_str(&String::from_utf8_lossy(&chunk));
-        if let Some(line) = buf.lines().find(|l| l.starts_with("data:")) {
-            let w: Value = serde_json::from_str(line.trim_start_matches("data:").trim()).unwrap();
-            break w["token"].as_str().unwrap().to_string();
-        }
-    };
+        if buf.lines().any(|l| l.starts_with("data:")) { break; }
+    }
+    let recv_tok = _rtok.clone();
     client
         .post(server.url("/announce"))
         .header("Authorization", format!("Bearer {}", recv_tok))
@@ -1129,18 +1115,14 @@ async fn ac_s3_send_by_token_routes_to_recipient() {
     let r = client.post(server.url("/listen")).header("Authorization", format!("Bearer {}", _rtok)).send().await.unwrap();
     let mut stream = r.bytes_stream();
     let mut buf = String::new();
-    let recv_tok = loop {
+    // Consume welcome event; token comes from registration, not welcome.
+    loop {
         let chunk = tokio::time::timeout(Duration::from_secs(5), stream.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+            .await.unwrap().unwrap().unwrap();
         buf.push_str(&String::from_utf8_lossy(&chunk));
-        if let Some(line) = buf.lines().find(|l| l.starts_with("data:")) {
-            let w: Value = serde_json::from_str(line.trim_start_matches("data:").trim()).unwrap();
-            break w["token"].as_str().unwrap().to_string();
-        }
-    };
+        if buf.lines().any(|l| l.starts_with("data:")) { break; }
+    }
+    let recv_tok = _rtok.clone();
     client
         .post(server.url("/announce"))
         .header("Authorization", format!("Bearer {}", recv_tok))
@@ -1274,18 +1256,14 @@ async fn ac_n5_service_events_bypass_notify_interlock() {
     assert_eq!(r.status(), StatusCode::OK);
     let mut stream = r.bytes_stream();
     let mut buf = String::new();
-    let recv_token = loop {
+    // Consume welcome event; token comes from registration, not welcome.
+    loop {
         let chunk = tokio::time::timeout(Duration::from_secs(5), stream.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+            .await.unwrap().unwrap().unwrap();
         buf.push_str(&String::from_utf8_lossy(&chunk));
-        if let Some(line) = buf.lines().find(|l| l.starts_with("data:")) {
-            let w: Value = serde_json::from_str(line.trim_start_matches("data:").trim()).unwrap();
-            break w["token"].as_str().unwrap().to_string();
-        }
-    };
+        if buf.lines().any(|l| l.starts_with("data:")) { break; }
+    }
+    let recv_token = _rtok.clone();
     client
         .post(server.url("/announce"))
         .header("Authorization", format!("Bearer {}", recv_token))
@@ -1543,18 +1521,14 @@ async fn ac_n5_service_events_bypass_notify_suppressed() {
     assert_eq!(r.status(), StatusCode::OK);
     let mut stream = r.bytes_stream();
     let mut buf = String::new();
-    let agent_tok = loop {
+    // Consume welcome event; token comes from registration, not welcome.
+    loop {
         let chunk = tokio::time::timeout(Duration::from_secs(5), stream.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+            .await.unwrap().unwrap().unwrap();
         buf.push_str(&String::from_utf8_lossy(&chunk));
-        if let Some(line) = buf.lines().find(|l| l.starts_with("data:")) {
-            let w: Value = serde_json::from_str(line.trim_start_matches("data:").trim()).unwrap();
-            break w["token"].as_str().unwrap().to_string();
-        }
-    };
+        if buf.lines().any(|l| l.starts_with("data:")) { break; }
+    }
+    let agent_tok = _rtok.clone();
 
     client
         .post(server.url("/announce"))
@@ -2465,18 +2439,14 @@ async fn setup_send_pair(
     let r = client.post(server.url("/listen")).header("Authorization", format!("Bearer {}", _rtok)).send().await.unwrap();
     let mut stream = r.bytes_stream();
     let mut buf = String::new();
-    let recv_token = loop {
+    // Consume welcome event; token comes from registration, not welcome.
+    loop {
         let chunk = tokio::time::timeout(Duration::from_secs(5), stream.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+            .await.unwrap().unwrap().unwrap();
         buf.push_str(&String::from_utf8_lossy(&chunk));
-        if let Some(line) = buf.lines().find(|l| l.starts_with("data:")) {
-            let w: Value = serde_json::from_str(line.trim_start_matches("data:").trim()).unwrap();
-            break w["token"].as_str().unwrap().to_string();
-        }
-    };
+        if buf.lines().any(|l| l.starts_with("data:")) { break; }
+    }
+    let recv_token = _rtok.clone();
     // Keep stream alive in background.
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(60)).await;

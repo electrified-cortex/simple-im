@@ -3792,16 +3792,30 @@ impl DeliveryHub {
                 (false, None, None)
             };
 
-            // Emit service/welcome — the agent's entry point. Contains the listen token
-            // and operating instructions so an agent reading the raw stream knows what to do next.
+            // Emit service/welcome — the agent's entry point.
+            // Normal agents already know their token (from POST /agents/register) so we
+            // do not echo it back. Exception: governor session-link path presents a governor
+            // token and receives a newly minted listen token — the agent does NOT have it yet,
+            // so we include it in the welcome so they can use it for announce/dequeue.
             {
                 let name_opt = inner.listen_tokens.get(&token).and_then(|s| s.name.clone());
-                let welcome = serde_json::json!({
-                    "type": "service",
-                    "event": "welcome",
-                    "name": name_opt,
-                    "instructions": "Call POST /announce to register your name. You will receive notify events when messages arrive — call POST /messages/dequeue to retrieve them.",
-                })
+                let governor_minted = token.as_str() != provided_token;
+                let welcome = if governor_minted {
+                    serde_json::json!({
+                        "type": "service",
+                        "event": "welcome",
+                        "token": &token,
+                        "name": name_opt,
+                        "instructions": "Call POST /announce to register your name. You will receive notify events when messages arrive — call POST /messages/dequeue to retrieve them.",
+                    })
+                } else {
+                    serde_json::json!({
+                        "type": "service",
+                        "event": "welcome",
+                        "name": name_opt,
+                        "instructions": "Call POST /announce to register your name. You will receive notify events when messages arrive — call POST /messages/dequeue to retrieve them.",
+                    })
+                }
                 .to_string();
                 let _ = tx.send(welcome);
             }
