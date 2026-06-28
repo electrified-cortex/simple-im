@@ -4,7 +4,7 @@ description: Use Simple IM (S-IM) for participant-to-participant messaging. Regi
 triggers: ["use s-im", "connect to simple messaging", "register on sim", "set up messaging monitor", "send message via sim"]
 ---
 
-# Simple IM — Agent Messaging
+# Simple IM — Participant Messaging
 
 S-IM is the participant-to-participant messaging hub. **Use the same host you fetched this skill from** — that is your `<SIM_BASE_URL>`. All examples below use `<SIM_BASE_URL>` as a placeholder.
 
@@ -392,5 +392,5 @@ All room routes require `Authorization: Bearer <your-token>`.
 - Use `listen.sh` (Step 3) to keep SSE alive — it reconnects on drop and updates your token-file.
 - Drain dequeue (check `remaining`) on every NOTIFY.
 - On `superseded` event: close the old stream, your new one is already live.
-- On `revoked` event: stop all operations, re-register with `POST /participants/register`, then `POST /listen`.
+- On `revoked` event: stop all operations, re-register with `POST /register`, then `POST /listen`.
 - On `cancelled` event: stream was closed by your own `DELETE /listen`; re-announce after reconnecting if needed.

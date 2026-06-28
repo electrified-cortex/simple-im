@@ -86,7 +86,7 @@ POST /messages/queue/pop  → pop the waiting message(s)
 
 Delivery is **online-only**: if the recipient is not currently connected, the send fails immediately with an explicit error — nothing is buffered to disk and silently delivered later. The persistent SSE stream from `POST /listen` doubles as the wake-on-message channel, so participants never poll on a timer.
 
-Agents should drive this loop with the ready-made monitor script served at `GET /skills/participant/monitor.sh` — the hub also serves the full participant guide live at `GET /skills/participant`.
+Participants should drive this loop with the ready-made monitor script served at `GET /skills/participant/monitor.sh` — the hub also serves the full participant guide live at `GET /skills/participant`.
 
 ---
 
@@ -96,14 +96,14 @@ Agents should drive this loop with the ready-made monitor script served at `GET 
 
 Out of the box the hub runs without any governor. Grants are established by **recipient consent alone**:
 
-1. Agent A calls `POST /grants/request {"to":"B"}` — signals intent to message B.
-2. Agent B calls `PATCH /grants/requests/{id} {"action":"approve"}` — that's it; the grant is live.
+1. Participant A calls `POST /grants/request {"to":"B"}` — signals intent to message B.
+2. Participant B calls `PATCH /grants/requests/{id} {"action":"approve"}` — that's it; the grant is live.
 
 No third party is involved. This is the default for all new deployments.
 
 ### With a governor (optional)
 
-A governor is an participant that holds a special governor token obtained via `POST /governors/claim` (see [§7](#7-electing-a-governor-optional)). When a governor is present, grant requests use a **two-step** flow:
+A governor is a participant that holds a special governor token obtained via `POST /governors/claim` (see [§7](#7-electing-a-governor-optional)). When a governor is present, grant requests use a **two-step** flow:
 
 1. The governor approves first (`PATCH /grants/requests/{id} {"action":"approve"}`); the recipient is then notified.
 2. The recipient approves second; the grant activates.
@@ -111,14 +111,14 @@ A governor is an participant that holds a special governor token obtained via `P
 The governor can also approve pairs directly (`POST /grants/approve`), block pairs (`POST /grants/block`), revoke grants, and mediate held messages.
 
 ```text
-Agent  ──  POST /listen → token → POST /announce → name
+Participant  ──  POST /listen → token → POST /announce → name
            … request grant → recipient (or governor + recipient) approves …
            messages only its approved peers
 
 Governor (optional, elected) ── approves grants, mediates, blocks/unblocks
 ```
 
-**Authority only flows downward.** The governor cannot create other governors; an participant acts only within its approved grants.
+**Authority only flows downward.** The governor cannot create other governors; a participant acts only within its approved grants.
 
 ---
 
@@ -312,7 +312,7 @@ Blobs expire after a TTL (then `404 ATTACHMENT_NOT_FOUND`). Defaults: 10 MiB cap
 | --- | --- | --- | --- |
 | `--insecure-http` | `SIMPLE_IM_INSECURE_HTTP=1` | off | Serve plain HTTP. **Required to start** — without it the hub exits (no built-in TLS). |
 | `--port <N>` | — | `8443`, or `8080` with `--insecure-http` | TCP port to bind. |
-| `--liveness-window-secs <N>` | `SIMPLE_IM_LIVENESS_WINDOW_SECS` | `30` | Seconds of SSE silence before an participant is reaped as offline. Clamped to 5–600. |
+| `--liveness-window-secs <N>` | `SIMPLE_IM_LIVENESS_WINDOW_SECS` | `30` | Seconds of SSE silence before a participant is reaped as offline. Clamped to 5–600. |
 | `--token-store-path <P>` | `SIMPLE_IM_TOKEN_STORE` | `sim-tokens.db` | SQLite file for durable tokens, grants, identities, and attachments. |
 | — | `SIMPLE_IM_ATTACHMENT_MAX_BYTES` | `10485760` (10 MiB) | Max attachment size. Clamped to 1 KiB–200 MiB; oversize uploads get `413`. |
 | — | `SIMPLE_IM_ATTACHMENT_TTL_SECS` | `86400` (24 h) | How long attachments are retained. Clamped to 60 s–30 days. |

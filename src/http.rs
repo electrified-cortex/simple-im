@@ -117,7 +117,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let max_attach = state.attachment_max_bytes;
     Router::new()
         .route("/", get(handle_discovery))
-        .route("/register", post(handle_agents_register))
+        .route("/register", post(handle_register))
         .route("/listen", post(handle_listen))
         .route("/listen", delete(handle_cancel_listen))
         .route("/announce", post(handle_announce))
@@ -1307,7 +1307,7 @@ fn sanitize_filename(name: &str) -> String {
 // Mint a new agent token for future /listen use.
 // No authentication required (anyone can register, same as anonymous /listen before).
 
-async fn handle_agents_register(State(state): State<Arc<AppState>>) -> Response {
+async fn handle_register(State(state): State<Arc<AppState>>) -> Response {
     let token = state.hub.register_agent();
     (StatusCode::OK, Json(json!({"token": token}))).into_response()
 }

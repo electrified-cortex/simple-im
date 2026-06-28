@@ -2255,7 +2255,7 @@ async fn ac_claim_transfer_existing_governor() {
     let payload_str = pop["message"]["payload"].as_str().unwrap_or("");
     assert!(
         payload_str.contains("governorship_granted"),
-        "Agent should receive governorship_granted, got: {pop}"
+        "Participant should receive governorship_granted, got: {pop}"
     );
 
     _sa.abort();
@@ -2350,7 +2350,7 @@ async fn ac_pr1_presence_online_after_announce() {
     let body: Value = r.json().await.unwrap();
     assert_eq!(
         body["status"], "online",
-        "agent with active SSE + announce must appear online: {:?}",
+        "participant with active SSE + announce must appear online: {:?}",
         body
     );
 
@@ -2502,7 +2502,7 @@ async fn ac_pr3_absent_participant_shows_offline_after_ttl_expires() {
     let body: Value = r.json().await.unwrap();
     assert_eq!(
         body["status"], "offline",
-        "absent agent (TTL expired, no SSE, no re-announce) must show offline: {:?}",
+        "absent participant (TTL expired, no SSE, no re-announce) must show offline: {:?}",
         body
     );
 }
@@ -3343,7 +3343,7 @@ async fn ac_pp5_minted_agent_deregister_sends_offline_to_listen_peer() {
     .await;
     assert!(
         ev.is_some(),
-        "Alice must receive presence offline event when minted agent PpB5 deregisters; got nothing"
+        "Alice must receive presence offline event when minted participant PpB5 deregisters; got nothing"
     );
 }
 
