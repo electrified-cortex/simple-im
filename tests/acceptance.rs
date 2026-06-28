@@ -1832,6 +1832,28 @@ async fn ac_s2_send_without_grant_request_pending_gov_event() {
         .await
         .unwrap();
 
+    // Rooms gate: both agents must share a room before requesting a grant.
+    let room_resp = client
+        .post(server.url("/room/create"))
+        .header("Authorization", format!("Bearer {}", sender))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(room_resp.status(), StatusCode::OK, "POST /room/create failed");
+    let room_id = room_resp.json::<Value>().await.unwrap()["room_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for tok in [&sender, &tok_b] {
+        let jr = client
+            .post(server.url(&format!("/room/{}/join", room_id)))
+            .header("Authorization", format!("Bearer {}", tok))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(jr.status(), StatusCode::OK, "room join failed");
+    }
+
     // A sends to B — no grant exists; server returns NO_GRANT (403).
     let r = client
         .post(server.url("/messages/send"))
@@ -1923,6 +1945,28 @@ async fn ac_governorless_recipient_consent_grant() {
         .unwrap();
     assert_eq!(r.status(), StatusCode::FORBIDDEN);
     assert_eq!(r.json::<Value>().await.unwrap()["error"], "NO_GRANT");
+
+    // Rooms gate: Alice and Bob must share a room to bootstrap the grant request.
+    let room_resp = client
+        .post(server.url("/room/create"))
+        .header("Authorization", format!("Bearer {}", alice))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(room_resp.status(), StatusCode::OK, "POST /room/create failed");
+    let room_id = room_resp.json::<Value>().await.unwrap()["room_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for (tok, name) in [(&alice, "GlAlice"), (&bob, "GlBob")] {
+        let jr = client
+            .post(server.url(&format!("/room/{}/join", room_id)))
+            .header("Authorization", format!("Bearer {}", tok))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(jr.status(), StatusCode::OK, "{name} room join failed");
+    }
 
     // Alice requests a grant — with no governor it routes straight to Bob.
     let rg = client
@@ -3484,5 +3528,437 @@ async fn ac_startup_announce_first_sub_only() {
         !has_sim_online_2,
         "AC2: second subscriber must NOT receive sim_online; got: {:?}",
         events2
+    );
+}
+
+// ── Rooms discovery tests ──────────────────────────────────────────────────────
+
+/// Helper: create, listen + announce an agent and return its token.
+async fn setup_agent(server: &TestServer, client: &reqwest::Client, name: &str) -> String {
+    let (tok, _) = listen_get_token(server, client, None).await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let r = client
+        .post(server.url("/announce"))
+        .header("Authorization", format!("Bearer {tok}"))
+        .json(&json!({"name": name}))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "announce {name} failed: {}", r.status());
+    tok
+}
+
+/// Helper: POST /room/create and return the room_id.
+async fn create_room(server: &TestServer, client: &reqwest::Client, tok: &str) -> String {
+    let r = client
+        .post(server.url("/room/create"))
+        .header("Authorization", format!("Bearer {tok}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK, "POST /room/create failed");
+    r.json::<Value>().await.unwrap()["room_id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// Helper: POST /room/{room_id}/join.
+async fn join_room(
+    server: &TestServer,
+    client: &reqwest::Client,
+    tok: &str,
+    room_id: &str,
+    ttl: Option<u64>,
+) -> Value {
+    let body = match ttl {
+        Some(t) => json!({"ttl": t}),
+        None => json!({}),
+    };
+    let r = client
+        .post(server.url(&format!("/room/{room_id}/join")))
+        .header("Authorization", format!("Bearer {tok}"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK, "POST /room/{room_id}/join failed");
+    r.json::<Value>().await.unwrap()
+}
+
+// AC1: POST /room/create returns {room_id} and caller is NOT auto-joined.
+#[tokio::test]
+async fn ac_room_1_create_returns_room_id_caller_not_joined() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    let alice = setup_agent(&server, &client, "RoomAlice1").await;
+
+    let r = client
+        .post(server.url("/room/create"))
+        .header("Authorization", format!("Bearer {alice}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK, "POST /room/create must return 200");
+    let body: Value = r.json().await.unwrap();
+    let room_id = body["room_id"].as_str().unwrap();
+    assert!(!room_id.is_empty(), "room_id must be non-empty");
+
+    // Caller must NOT be auto-joined — GET /room/{id} should return 403.
+    let get_r = client
+        .get(server.url(&format!("/room/{room_id}")))
+        .header("Authorization", format!("Bearer {alice}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        get_r.status(),
+        StatusCode::FORBIDDEN,
+        "caller must NOT be auto-joined after create"
+    );
+}
+
+// AC2: POST /room/{room_id}/join adds caller, returns member list, HTTP 200 on re-join.
+#[tokio::test]
+async fn ac_room_2_join_adds_caller_idempotent() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    let alice = setup_agent(&server, &client, "RoomAlice2").await;
+    let bob = setup_agent(&server, &client, "RoomBob2").await;
+
+    let room_id = create_room(&server, &client, &alice).await;
+
+    // Alice joins.
+    let j1 = join_room(&server, &client, &alice, &room_id, None).await;
+    let names: Vec<&str> = j1["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"RoomAlice2"), "alice must be in member list");
+
+    // Bob joins.
+    let j2 = join_room(&server, &client, &bob, &room_id, None).await;
+    let names2: Vec<&str> = j2["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["name"].as_str().unwrap())
+        .collect();
+    assert!(names2.contains(&"RoomAlice2"), "alice in list after bob joins");
+    assert!(names2.contains(&"RoomBob2"), "bob in list after bob joins");
+
+    // Re-join alice — must return 200 (idempotent).
+    let r_rejoin = client
+        .post(server.url(&format!("/room/{room_id}/join")))
+        .header("Authorization", format!("Bearer {alice}"))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_rejoin.status(), StatusCode::OK, "re-join must return 200");
+}
+
+// AC3: default TTL 300s applied when omitted; explicit TTL param accepted.
+#[tokio::test]
+async fn ac_room_3_ttl_default_and_explicit() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    let alice = setup_agent(&server, &client, "RoomAlice3").await;
+
+    let room_id = create_room(&server, &client, &alice).await;
+
+    // Join with explicit TTL (1 s) — member present immediately.
+    let j = join_room(&server, &client, &alice, &room_id, Some(1)).await;
+    let names: Vec<&str> = j["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"RoomAlice3"), "alice must be present with ttl=1");
+
+    // After TTL expires, alice should be silently removed.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+
+    // GET should return 403 (alice expired, no longer a member).
+    let get_r = client
+        .get(server.url(&format!("/room/{room_id}")))
+        .header("Authorization", format!("Bearer {alice}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        get_r.status(),
+        StatusCode::FORBIDDEN,
+        "alice must be removed after TTL expires"
+    );
+
+    // Re-join with no TTL (default 300 s) — must succeed.
+    let r = client
+        .post(server.url(&format!("/room/{room_id}/join")))
+        .header("Authorization", format!("Bearer {alice}"))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK, "join with default TTL must succeed");
+}
+
+// AC4: GET /room/{room_id} returns member list with online status; 403 if not member.
+#[tokio::test]
+async fn ac_room_4_get_member_list_and_access_control() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    let alice = setup_agent(&server, &client, "RoomAlice4").await;
+    let bob = setup_agent(&server, &client, "RoomBob4").await;
+
+    let room_id = create_room(&server, &client, &alice).await;
+
+    // Non-member GET must return 403.
+    let r403 = client
+        .get(server.url(&format!("/room/{room_id}")))
+        .header("Authorization", format!("Bearer {bob}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r403.status(), StatusCode::FORBIDDEN, "non-member GET must return 403");
+
+    // Alice joins; GET as Alice must return member list with online field.
+    join_room(&server, &client, &alice, &room_id, None).await;
+
+    let get_r = client
+        .get(server.url(&format!("/room/{room_id}")))
+        .header("Authorization", format!("Bearer {alice}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get_r.status(), StatusCode::OK, "member GET must return 200");
+    let body: Value = get_r.json().await.unwrap();
+    let members = body["members"].as_array().unwrap();
+    assert!(!members.is_empty(), "member list must not be empty");
+    // Each member must have name + online fields.
+    for m in members {
+        assert!(m["name"].is_string(), "member must have name");
+        assert!(m["online"].is_boolean(), "member must have online field");
+    }
+}
+
+// AC5: POST /room/{room_id}/leave removes caller; idempotent (200 if not member).
+#[tokio::test]
+async fn ac_room_5_leave_removes_caller_idempotent() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    let alice = setup_agent(&server, &client, "RoomAlice5").await;
+    let bob = setup_agent(&server, &client, "RoomBob5").await;
+
+    let room_id = create_room(&server, &client, &alice).await;
+    join_room(&server, &client, &alice, &room_id, None).await;
+    join_room(&server, &client, &bob, &room_id, None).await;
+
+    // Alice leaves.
+    let leave_r = client
+        .post(server.url(&format!("/room/{room_id}/leave")))
+        .header("Authorization", format!("Bearer {alice}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(leave_r.status(), StatusCode::OK, "leave must return 200");
+
+    // After leave, alice cannot GET the room.
+    let get_r = client
+        .get(server.url(&format!("/room/{room_id}")))
+        .header("Authorization", format!("Bearer {alice}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get_r.status(), StatusCode::FORBIDDEN, "alice must not see room after leaving");
+
+    // Bob still in room.
+    let bob_get = client
+        .get(server.url(&format!("/room/{room_id}")))
+        .header("Authorization", format!("Bearer {bob}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bob_get.status(), StatusCode::OK, "bob still in room");
+    let bob_body = bob_get.json::<Value>().await.unwrap();
+    let members: Vec<&str> = bob_body["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["name"].as_str().unwrap())
+        .collect();
+    assert!(!members.contains(&"RoomAlice5"), "alice must not appear after leave");
+
+    // Idempotent: alice leaving again must return 200.
+    let leave2 = client
+        .post(server.url(&format!("/room/{room_id}/leave")))
+        .header("Authorization", format!("Bearer {alice}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(leave2.status(), StatusCode::OK, "second leave must be idempotent 200");
+
+    // Leaving a non-existent room must also return 200.
+    let leave3 = client
+        .post(server.url("/room/nonexistent-room-id/leave"))
+        .header("Authorization", format!("Bearer {alice}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(leave3.status(), StatusCode::OK, "leave non-existent room must return 200");
+}
+
+// AC6: TTL expiry removes agent silently; no notification emitted.
+// AC7: No join/leave SSE events pushed to room members.
+#[tokio::test]
+async fn ac_room_6_7_ttl_expiry_silent_no_sse_events() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    let alice = setup_agent(&server, &client, "RoomAlice6").await;
+    let bob = setup_agent(&server, &client, "RoomBob6").await;
+
+    let room_id = create_room(&server, &client, &alice).await;
+
+    // Both join with 1-second TTL.
+    join_room(&server, &client, &alice, &room_id, Some(1)).await;
+    join_room(&server, &client, &bob, &room_id, Some(1)).await;
+
+    // After TTL expiry (1 s), membership is silently removed.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+
+    // GET should return 403 for alice (expired).
+    let get_r = client
+        .get(server.url(&format!("/room/{room_id}")))
+        .header("Authorization", format!("Bearer {alice}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        get_r.status(),
+        StatusCode::FORBIDDEN,
+        "alice must be removed silently after TTL"
+    );
+
+    // AC7: Bob's message queue must NOT contain any room-related events.
+    let pop = client
+        .post(server.url("/messages/queue/pop"))
+        .header("Authorization", format!("Bearer {bob}"))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    // No message queued (or no room event in any message).
+    if let Some(payload) = pop["message"]["payload"].as_str() {
+        assert!(
+            !payload.contains("room_join")
+                && !payload.contains("room_leave")
+                && !payload.contains("room_expire"),
+            "no room SSE events should be pushed to members; got: {payload}"
+        );
+    }
+}
+
+// AC8: Two co-present room agents CAN submit grant requests to each other.
+#[tokio::test]
+async fn ac_room_8_coroom_agents_can_request_grants() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    let alice = setup_agent(&server, &client, "RoomAlice8").await;
+    let bob = setup_agent(&server, &client, "RoomBob8").await;
+
+    let room_id = create_room(&server, &client, &alice).await;
+    join_room(&server, &client, &alice, &room_id, None).await;
+    join_room(&server, &client, &bob, &room_id, None).await;
+
+    // Alice requests grant from Bob — both in same room, should succeed.
+    let rg = client
+        .post(server.url("/grants/request"))
+        .header("Authorization", format!("Bearer {alice}"))
+        .json(&json!({"to": "RoomBob8", "reason": "we share a room"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        rg.status(),
+        StatusCode::OK,
+        "room co-presence must allow grant request: {}",
+        rg.json::<Value>().await.unwrap_or_default()
+    );
+}
+
+// AC9: Agents with no shared room AND no grant CANNOT submit grant requests.
+#[tokio::test]
+async fn ac_room_9_no_room_no_grant_cannot_request() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    let alice = setup_agent(&server, &client, "RoomAlice9").await;
+    let _bob = setup_agent(&server, &client, "RoomBob9").await;
+
+    // No room, no grant — Alice cannot request a grant from Bob.
+    let rg = client
+        .post(server.url("/grants/request"))
+        .header("Authorization", format!("Bearer {alice}"))
+        .json(&json!({"to": "RoomBob9", "reason": "cold contact"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        rg.status(),
+        StatusCode::FORBIDDEN,
+        "no shared room + no grant must return 403, got {}",
+        rg.status()
+    );
+}
+
+// AC10: "create" cannot be used as room_id in join/leave/get → 400.
+#[tokio::test]
+async fn ac_room_10_reserved_name_create_returns_400() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    let alice = setup_agent(&server, &client, "RoomAlice10").await;
+
+    // POST /room/create/join — "create" as room_id
+    let join_r = client
+        .post(server.url("/room/create/join"))
+        .header("Authorization", format!("Bearer {alice}"))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        join_r.status(),
+        StatusCode::BAD_REQUEST,
+        "join with room_id='create' must return 400"
+    );
+
+    // GET /room/create — "create" as room_id
+    let get_r = client
+        .get(server.url("/room/create"))
+        .header("Authorization", format!("Bearer {alice}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        get_r.status(),
+        StatusCode::BAD_REQUEST,
+        "GET with room_id='create' must return 400"
+    );
+
+    // POST /room/create/leave — "create" as room_id
+    let leave_r = client
+        .post(server.url("/room/create/leave"))
+        .header("Authorization", format!("Bearer {alice}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        leave_r.status(),
+        StatusCode::BAD_REQUEST,
+        "leave with room_id='create' must return 400"
     );
 }

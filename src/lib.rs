@@ -4,5 +4,6 @@ pub mod http;
 pub mod persistence;
 pub mod presence;
 pub mod registry;
+pub mod rooms;
 pub mod trust;
 pub mod types;
