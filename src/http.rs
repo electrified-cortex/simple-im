@@ -21,13 +21,13 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::delivery::{
-    AgentInfo, AnnounceResult, ApproveStatus, ClaimOutcome, ClaimResolution, DeliveryHub,
-    MediationDecision, MediationResult,
+    AnnounceResult, ApproveStatus, ClaimOutcome, ClaimResolution, DeliveryHub, MediationDecision,
+    MediationResult, ParticipantInfo,
 };
 use crate::error::Error;
 use crate::rooms::RoomStore;
 use crate::trust::{ApproveGrantRequest, GrantDirection, GrantMediation};
-use crate::types::{AgentToken, GovernorToken, Payload};
+use crate::types::{ParticipantToken, GovernorToken, Payload};
 
 // ── Bundled skill files ───────────────────────────────────────────────────────
 
@@ -425,11 +425,11 @@ async fn handle_list_participants(
         None => return auth_failed(),
     };
     let gov = GovernorToken(tok_str);
-    match state.hub.list_agents(&gov) {
+    match state.hub.list_participants(&gov) {
         Ok(agents) => {
             let participants_json: Vec<_> = agents
                 .iter()
-                .map(|a: &AgentInfo| json!({"name": a.name, "identity": a.identity, "status": a.status}))
+                .map(|a: &ParticipantInfo| json!({"name": a.name, "identity": a.identity, "status": a.status}))
                 .collect();
             (
                 StatusCode::OK,
@@ -712,7 +712,7 @@ async fn handle_send(
         Some(t) => t,
         None => return auth_failed(),
     };
-    let token = AgentToken(tok_str);
+    let token = ParticipantToken(tok_str);
     let payload = Payload(body.payload.into_bytes());
 
     // Route: if `to` is present use name routing; if only `to_token` is present use token routing.

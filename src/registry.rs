@@ -5,9 +5,9 @@ use crate::error::Error;
 
 /// Pre-validated agent identity derived from a token.
 /// `None` represents an absent or invalid token; the registry rejects it with `AuthFailed`.
-pub struct AgentIdentity(pub(crate) Option<String>);
+pub struct ParticipantIdentity(pub(crate) Option<String>);
 
-impl AgentIdentity {
+impl ParticipantIdentity {
     pub fn valid(id: impl Into<String>) -> Self {
         Self(Some(id.into()))
     }
@@ -58,7 +58,7 @@ impl<F: Fn() -> Instant> Registry<F> {
     pub fn register(
         &mut self,
         name: &str,
-        identity: AgentIdentity,
+        identity: ParticipantIdentity,
         scope: PresenceScope,
     ) -> Result<(), Error> {
         let id = identity.0.ok_or(Error::AuthFailed)?;
@@ -103,7 +103,7 @@ impl<F: Fn() -> Instant> Registry<F> {
     pub fn set_presence_scope(
         &mut self,
         name: &str,
-        identity: &AgentIdentity,
+        identity: &ParticipantIdentity,
         scope: PresenceScope,
     ) -> Result<(), Error> {
         let id = identity.0.as_deref().ok_or(Error::AuthFailed)?;
@@ -126,7 +126,7 @@ impl<F: Fn() -> Instant> Registry<F> {
         self.entries.remove(name);
     }
 
-    pub fn deregister(&mut self, name: &str, identity: AgentIdentity) -> Result<(), Error> {
+    pub fn deregister(&mut self, name: &str, identity: ParticipantIdentity) -> Result<(), Error> {
         let id = identity.0.ok_or(Error::AuthFailed)?;
         let now = (self.now)();
         let lapse = self.lapse_after;
@@ -182,7 +182,7 @@ mod tests {
         let (mut reg, _) = controlled_registry(Duration::from_secs(30));
         let result = reg.register(
             "alice",
-            AgentIdentity::valid("id-alice"),
+            ParticipantIdentity::valid("id-alice"),
             PresenceScope::GrantScoped,
         );
         assert!(result.is_ok());
@@ -195,13 +195,13 @@ mod tests {
         let (mut reg, _) = controlled_registry(Duration::from_secs(30));
         reg.register(
             "alice",
-            AgentIdentity::valid("id-alice"),
+            ParticipantIdentity::valid("id-alice"),
             PresenceScope::GrantScoped,
         )
         .unwrap();
         let result = reg.register(
             "alice",
-            AgentIdentity::valid("id-bob"),
+            ParticipantIdentity::valid("id-bob"),
             PresenceScope::GrantScoped,
         );
         assert!(matches!(result, Err(Error::NameInUse)));
@@ -214,13 +214,13 @@ mod tests {
         let (mut reg, _) = controlled_registry(Duration::from_secs(30));
         reg.register(
             "alice",
-            AgentIdentity::valid("id-alice"),
+            ParticipantIdentity::valid("id-alice"),
             PresenceScope::GrantScoped,
         )
         .unwrap();
         let result = reg.register(
             "alice",
-            AgentIdentity::valid("id-alice"),
+            ParticipantIdentity::valid("id-alice"),
             PresenceScope::GrantScoped,
         );
         assert!(result.is_ok());
@@ -233,15 +233,15 @@ mod tests {
         let (mut reg, _) = controlled_registry(Duration::from_secs(30));
         reg.register(
             "alice",
-            AgentIdentity::valid("id-alice"),
+            ParticipantIdentity::valid("id-alice"),
             PresenceScope::GrantScoped,
         )
         .unwrap();
-        reg.deregister("alice", AgentIdentity::valid("id-alice"))
+        reg.deregister("alice", ParticipantIdentity::valid("id-alice"))
             .unwrap();
         let result = reg.register(
             "alice",
-            AgentIdentity::valid("id-bob"),
+            ParticipantIdentity::valid("id-bob"),
             PresenceScope::GrantScoped,
         );
         assert!(result.is_ok());
@@ -254,7 +254,7 @@ mod tests {
         let (mut reg, offset) = controlled_registry(ttl);
         reg.register(
             "alice",
-            AgentIdentity::valid("id-alice"),
+            ParticipantIdentity::valid("id-alice"),
             PresenceScope::GrantScoped,
         )
         .unwrap();
@@ -264,7 +264,7 @@ mod tests {
         assert!(
             reg.register(
                 "alice",
-                AgentIdentity::valid("id-new"),
+                ParticipantIdentity::valid("id-new"),
                 PresenceScope::GrantScoped
             )
             .is_ok()
@@ -277,7 +277,7 @@ mod tests {
         let (mut reg, _) = controlled_registry(Duration::from_secs(30));
         let result = reg.register(
             "alice",
-            AgentIdentity::invalid(),
+            ParticipantIdentity::invalid(),
             PresenceScope::GrantScoped,
         );
         assert!(matches!(result, Err(Error::AuthFailed)));
@@ -290,11 +290,11 @@ mod tests {
         let (mut reg, _) = controlled_registry(Duration::from_secs(30));
         reg.register(
             "alice",
-            AgentIdentity::valid("id-alice"),
+            ParticipantIdentity::valid("id-alice"),
             PresenceScope::GrantScoped,
         )
         .unwrap();
-        let result = reg.deregister("alice", AgentIdentity::valid("id-intruder"));
+        let result = reg.deregister("alice", ParticipantIdentity::valid("id-intruder"));
         assert!(matches!(result, Err(Error::Forbidden)));
         assert!(reg.is_online("alice"));
     }

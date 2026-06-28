@@ -1,15 +1,15 @@
-//! In-memory rooms subsystem — opt-in discovery space for agent co-presence.
+//! In-memory rooms subsystem — opt-in discovery space for participant co-presence.
 //!
-//! Rooms allow agents to find peers outside their existing grant relationships.
+//! Rooms allow participants to find peers outside their existing grant relationships.
 //! Membership is transient (TTL-based) and rooms do not persist across server restarts.
 //!
 //! # Rules (from spec §rooms)
 //! - `create` returns a UUID; caller is NOT auto-joined.
 //! - `join` adds the caller, resets TTL on re-join, returns member list.
-//! - TTL defaults to 300 s; expiry removes the agent silently (lazy cleanup on access).
+//! - TTL defaults to 300 s; expiry removes the participant silently (lazy cleanup on access).
 //! - `get` returns member list with online status; 403 if caller not a member.
 //! - `leave` removes caller; idempotent if not a member or room not found.
-//! - Two agents co-present in a room may submit grant requests to each other.
+//! - Two participants co-present in a room may submit grant requests to each other.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -25,7 +25,7 @@ struct RoomMember {
 }
 
 struct Room {
-    /// Maps agent name → member record.
+    /// Maps participant name → member record.
     members: HashMap<String, RoomMember>,
 }
 
@@ -127,7 +127,7 @@ impl RoomStore {
 
     /// Remove `name` from room `room_id`.
     ///
-    /// Idempotent: returns `Ok(())` even if the agent was not a member or the room
+    /// Idempotent: returns `Ok(())` even if the participant was not a member or the room
     /// does not exist.
     pub fn leave(&self, room_id: &str, name: &str) {
         let mut rooms = self.inner.lock().unwrap();

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::error::Error;
 use crate::persistence::{PersistedGrant, PersistedToken};
-use crate::types::{AgentToken, GovernorToken};
+use crate::types::{ParticipantToken, GovernorToken};
 
 // ── Public enums ──────────────────────────────────────────────────────────────
 
@@ -83,7 +83,7 @@ struct PendingTransfer {
     to_identity: Option<String>,
 }
 
-struct AgentRecord {
+struct ParticipantRecord {
     identity: String,
     expires: Option<Instant>,
 }
@@ -113,7 +113,7 @@ where
     F: Fn() -> Instant,
 {
     governors: HashMap<String, GovernorRecord>,
-    agents: HashMap<String, AgentRecord>,
+    agents: HashMap<String, ParticipantRecord>,
     grants: Vec<Grant>,
     pending_transfers: HashMap<String, PendingTransfer>,
     counter: u64,
@@ -228,24 +228,24 @@ impl<F: Fn() -> Instant> TrustChain<F> {
     }
 
     /// Issues a new agent token under governor authority.
-    pub fn mint_agent_token(
+    pub fn mint_participant_token(
         &mut self,
         governor: &GovernorToken,
-        agent_identity: &str,
+        participant_identity: &str,
         expiry: Option<Duration>,
-    ) -> Result<AgentToken, Error> {
+    ) -> Result<ParticipantToken, Error> {
         self.verify_governor(governor)?;
         let now = (self.now)();
         let expires = expiry.map(|d| now + d.min(crate::types::MAX_EXPIRY));
         let id = self.next_id("agent");
         self.agents.insert(
             id.clone(),
-            AgentRecord {
-                identity: agent_identity.to_string(),
+            ParticipantRecord {
+                identity: participant_identity.to_string(),
                 expires,
             },
         );
-        Ok(AgentToken(id))
+        Ok(ParticipantToken(id))
     }
 
     /// Backward-compatible wrapper: Symmetric, no budget, opens_reply_window=true.
@@ -330,7 +330,7 @@ impl<F: Fn() -> Instant> TrustChain<F> {
     }
 
     /// Returns `Ok` if the token is a current, non-expired agent token.
-    pub fn validate_agent_token(&self, token: &AgentToken) -> Result<(), Error> {
+    pub fn validate_participant_token(&self, token: &ParticipantToken) -> Result<(), Error> {
         let record = self.agents.get(&token.0).ok_or(Error::AuthFailed)?;
         if let Some(expires) = record.expires
             && (self.now)() >= expires
@@ -341,7 +341,7 @@ impl<F: Fn() -> Instant> TrustChain<F> {
     }
 
     /// Returns the identity string bound to an agent token, if any.
-    pub fn agent_identity<'a>(&'a self, token: &AgentToken) -> Option<&'a str> {
+    pub fn participant_identity<'a>(&'a self, token: &ParticipantToken) -> Option<&'a str> {
         self.agents.get(&token.0).map(|r| r.identity.as_str())
     }
 
@@ -627,12 +627,15 @@ impl<F: Fn() -> Instant> TrustChain<F> {
 
     /// Rotate an agent token atomically: move the record to a fresh ID, invalidate the old one.
     /// Returns the new token. Identity and expiry are unchanged.
-    pub fn rotate_agent_token(&mut self, old_token: &AgentToken) -> Result<AgentToken, Error> {
-        self.validate_agent_token(old_token)?;
+    pub fn rotate_participant_token(
+        &mut self,
+        old_token: &ParticipantToken,
+    ) -> Result<ParticipantToken, Error> {
+        self.validate_participant_token(old_token)?;
         let record = self.agents.remove(&old_token.0).ok_or(Error::AuthFailed)?;
         let new_id = self.next_id("agent");
         self.agents.insert(new_id.clone(), record);
-        Ok(AgentToken(new_id))
+        Ok(ParticipantToken(new_id))
     }
 
     /// Rotate a governor token atomically: move the record to a fresh ID, invalidate the old one.
@@ -653,11 +656,11 @@ impl<F: Fn() -> Instant> TrustChain<F> {
 
     /// Governor force-rotate: invalidate all agent tokens with the given identity, mint one fresh
     /// token. Returns `(old_token_ids, new_token)` so the caller can update `token_to_name`.
-    pub fn governor_rotate_agent_token(
+    pub fn governor_rotate_participant_token(
         &mut self,
         gov: &GovernorToken,
         identity: &str,
-    ) -> Result<(Vec<String>, AgentToken), Error> {
+    ) -> Result<(Vec<String>, ParticipantToken), Error> {
         self.verify_governor(gov)?;
         let old_ids: Vec<String> = self
             .agents
@@ -674,11 +677,11 @@ impl<F: Fn() -> Instant> TrustChain<F> {
         }
         let new_id = self.next_id("agent");
         self.agents.insert(new_id.clone(), record);
-        Ok((old_ids, AgentToken(new_id)))
+        Ok((old_ids, ParticipantToken(new_id)))
     }
 
     /// Returns the expiry Instant for an agent token, or None if permanent or not found.
-    pub fn agent_expiry(&self, token: &AgentToken) -> Option<Instant> {
+    pub fn participant_expiry(&self, token: &ParticipantToken) -> Option<Instant> {
         self.agents.get(&token.0).and_then(|r| r.expires)
     }
 
@@ -811,7 +814,7 @@ impl<F: Fn() -> Instant> TrustChain<F> {
                 "agent" => {
                     self.agents.insert(
                         t.token,
-                        AgentRecord {
+                        ParticipantRecord {
                             identity: t.identity,
                             expires,
                         },
@@ -967,14 +970,14 @@ mod tests {
         let (mut chain, offset) = controlled_chain();
         let gov = chain.install_governor(None);
         let token = chain
-            .mint_agent_token(&gov, "alice", Some(Duration::from_secs(60)))
+            .mint_participant_token(&gov, "alice", Some(Duration::from_secs(60)))
             .unwrap();
 
-        assert!(chain.validate_agent_token(&token).is_ok());
+        assert!(chain.validate_participant_token(&token).is_ok());
 
         offset.set(Duration::from_secs(61));
         assert!(matches!(
-            chain.validate_agent_token(&token),
+            chain.validate_participant_token(&token),
             Err(Error::TokenExpired)
         ));
     }
@@ -984,11 +987,11 @@ mod tests {
     fn ac_tok_3_agent_token_rejected_for_governor_action() {
         let (mut chain, _) = controlled_chain();
         let gov = chain.install_governor(None);
-        let agent_token = chain.mint_agent_token(&gov, "alice", None).unwrap();
+        let agent_token = chain.mint_participant_token(&gov, "alice", None).unwrap();
 
         let fake_gov = GovernorToken(agent_token.0.clone());
         assert!(matches!(
-            chain.mint_agent_token(&fake_gov, "bob", None),
+            chain.mint_participant_token(&fake_gov, "bob", None),
             Err(Error::Forbidden)
         ));
         assert!(matches!(
@@ -1041,7 +1044,7 @@ mod tests {
         chain.revoke_all_governors();
 
         assert!(matches!(
-            chain.mint_agent_token(&gov, "carol", None),
+            chain.mint_participant_token(&gov, "carol", None),
             Err(Error::AuthFailed)
         ));
         assert!(matches!(
@@ -1060,7 +1063,7 @@ mod tests {
         chain.set_governor_online(&gov, false);
 
         assert!(matches!(
-            chain.mint_agent_token(&gov, "alice", None),
+            chain.mint_participant_token(&gov, "alice", None),
             Err(Error::AuthFailed)
         ));
         assert!(matches!(

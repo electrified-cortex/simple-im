@@ -57,7 +57,7 @@ impl TestServer {
 }
 
 /// POST /register — mint a fresh token (new-participant flow).
-async fn register_agent_tok(server: &TestServer, client: &reqwest::Client) -> String {
+async fn register_participant_tok(server: &TestServer, client: &reqwest::Client) -> String {
     let r = client.post(server.url("/register")).send().await.unwrap();
     assert_eq!(r.status(), StatusCode::OK, "POST /register failed");
     let body: Value = r.json().await.unwrap();
@@ -76,7 +76,7 @@ async fn listen_get_token(
     let tok: &str = if let Some(t) = existing_token {
         t
     } else {
-        owned = register_agent_tok(server, client).await;
+        owned = register_participant_tok(server, client).await;
         &owned
     };
     let r = client
@@ -131,7 +131,7 @@ async fn listen_and_get_welcome(
     let tok: &str = if let Some(t) = existing_token {
         t
     } else {
-        owned = register_agent_tok(server, client).await;
+        owned = register_participant_tok(server, client).await;
         &owned
     };
     let r = client
@@ -211,7 +211,7 @@ async fn ac_a1_announce_available_name_succeeds() {
     let r = client
         .post(server.url("/announce"))
         .header("Authorization", format!("Bearer {}", token))
-        .json(&json!({"name": "TestAgent"}))
+        .json(&json!({"name": "TestParticipant"}))
         .send()
         .await
         .unwrap();
@@ -273,7 +273,7 @@ async fn ac_d1_d5_dequeue_nonblocking_empty_returns_null() {
     let r = client
         .post(server.url("/announce"))
         .header("Authorization", format!("Bearer {}", token))
-        .json(&json!({"name": "AgentDQ"}))
+        .json(&json!({"name": "ParticipantDQ"}))
         .send()
         .await
         .unwrap();
@@ -434,7 +434,7 @@ async fn ac_l1_second_listen_supersedes_first() {
     let client = server.client();
 
     // First listen — get the token.
-    let _rtok = register_agent_tok(&server, &client).await;
+    let _rtok = register_participant_tok(&server, &client).await;
     let r = client
         .post(server.url("/listen"))
         .header("Authorization", format!("Bearer {}", _rtok))
@@ -497,7 +497,7 @@ async fn ac_n1_first_message_triggers_notify() {
     let client = server.client();
 
     // Receiver.
-    let _rtok = register_agent_tok(&server, &client).await;
+    let _rtok = register_participant_tok(&server, &client).await;
     let r = client
         .post(server.url("/listen"))
         .header("Authorization", format!("Bearer {}", _rtok))
@@ -582,7 +582,7 @@ async fn ac_n2_rapid_messages_single_notify() {
     let (server, gov) = TestServer::spawn_with_governor().await;
     let client = server.client();
 
-    let _rtok = register_agent_tok(&server, &client).await;
+    let _rtok = register_participant_tok(&server, &client).await;
     let r = client
         .post(server.url("/listen"))
         .header("Authorization", format!("Bearer {}", _rtok))
@@ -674,7 +674,7 @@ async fn ac_n3_dequeue_then_new_message_triggers_notify() {
     let (server, gov) = TestServer::spawn_with_governor().await;
     let client = server.client();
 
-    let _rtok = register_agent_tok(&server, &client).await;
+    let _rtok = register_participant_tok(&server, &client).await;
     let r = client
         .post(server.url("/listen"))
         .header("Authorization", format!("Bearer {}", _rtok))
@@ -786,7 +786,7 @@ async fn ac_n4_race_free_dequeue_then_arrival_fires_notify() {
     let (server, gov) = TestServer::spawn_with_governor().await;
     let client = server.client();
 
-    let _rtok = register_agent_tok(&server, &client).await;
+    let _rtok = register_participant_tok(&server, &client).await;
     let r = client
         .post(server.url("/listen"))
         .header("Authorization", format!("Bearer {}", _rtok))
@@ -978,7 +978,7 @@ async fn ac_r1_r3_token_revocation_atomic() {
     let (server, gov) = TestServer::spawn_with_governor().await;
     let client = server.client();
 
-    let _rtok = register_agent_tok(&server, &client).await;
+    let _rtok = register_participant_tok(&server, &client).await;
     let r = client
         .post(server.url("/listen"))
         .header("Authorization", format!("Bearer {}", _rtok))
@@ -999,13 +999,13 @@ async fn ac_r1_r3_token_revocation_atomic() {
             break;
         }
     }
-    let agent_tok = _rtok.clone();
+    let participant_tok = _rtok.clone();
 
     // Announce a name (required for DELETE /participants/{name}).
     client
         .post(server.url("/announce"))
-        .header("Authorization", format!("Bearer {}", agent_tok))
-        .json(&json!({"name": "RevokeTestAgent"}))
+        .header("Authorization", format!("Bearer {}", participant_tok))
+        .json(&json!({"name": "RevokeTestParticipant"}))
         .send()
         .await
         .unwrap();
@@ -1013,7 +1013,7 @@ async fn ac_r1_r3_token_revocation_atomic() {
     // Verify dequeue with the token works before revocation.
     let r = client
         .post(server.url("/messages/queue/pop"))
-        .header("Authorization", format!("Bearer {}", agent_tok))
+        .header("Authorization", format!("Bearer {}", participant_tok))
         .send()
         .await
         .unwrap();
@@ -1026,7 +1026,7 @@ async fn ac_r1_r3_token_revocation_atomic() {
     // AC-R1: Revoke via DELETE /participants/{name} with governor token.
     // Atomically deregisters and revokes the token.
     let r = client
-        .delete(server.url("/participants/RevokeTestAgent"))
+        .delete(server.url("/participants/RevokeTestParticipant"))
         .header("Authorization", format!("Bearer {}", gov))
         .send()
         .await
@@ -1040,7 +1040,7 @@ async fn ac_r1_r3_token_revocation_atomic() {
     // AC-R1: dequeue with the (now revoked) token must fail with 401.
     let r = client
         .post(server.url("/messages/queue/pop"))
-        .header("Authorization", format!("Bearer {}", agent_tok))
+        .header("Authorization", format!("Bearer {}", participant_tok))
         .send()
         .await
         .unwrap();
@@ -1067,7 +1067,7 @@ async fn ac_d4_thread_filter_on_single_dequeue() {
     let client = server.client();
 
     // Receiver.
-    let _rtok = register_agent_tok(&server, &client).await;
+    let _rtok = register_participant_tok(&server, &client).await;
     let r = client
         .post(server.url("/listen"))
         .header("Authorization", format!("Bearer {}", _rtok))
@@ -1183,7 +1183,7 @@ async fn ac_s3_send_by_token_routes_to_recipient() {
     let client = server.client();
 
     // Receiver.
-    let _rtok = register_agent_tok(&server, &client).await;
+    let _rtok = register_participant_tok(&server, &client).await;
     let r = client
         .post(server.url("/listen"))
         .header("Authorization", format!("Bearer {}", _rtok))
@@ -1333,7 +1333,7 @@ async fn ac_n5_service_events_bypass_notify_interlock() {
     let client = server.client();
 
     // Receiver with active SSE.
-    let _rtok = register_agent_tok(&server, &client).await;
+    let _rtok = register_participant_tok(&server, &client).await;
     let r = client
         .post(server.url("/listen"))
         .header("Authorization", format!("Bearer {}", _rtok))
@@ -1608,7 +1608,7 @@ async fn ac_n5_service_events_bypass_notify_suppressed() {
     let client = server.client();
 
     // Open SSE and keep it alive.
-    let _rtok = register_agent_tok(&server, &client).await;
+    let _rtok = register_participant_tok(&server, &client).await;
     let r = client
         .post(server.url("/listen"))
         .header("Authorization", format!("Bearer {}", _rtok))
@@ -1630,11 +1630,11 @@ async fn ac_n5_service_events_bypass_notify_suppressed() {
             break;
         }
     }
-    let agent_tok = _rtok.clone();
+    let participant_tok = _rtok.clone();
 
     client
         .post(server.url("/announce"))
-        .header("Authorization", format!("Bearer {}", agent_tok))
+        .header("Authorization", format!("Bearer {}", participant_tok))
         .json(&json!({"name": "N5Agent"}))
         .send()
         .await
@@ -1650,7 +1650,7 @@ async fn ac_n5_service_events_bypass_notify_suppressed() {
     client
         .post(server.url("/grants/approve"))
         .header("Authorization", format!("Bearer {}", gov))
-        .json(&json!({"identity_a": sender, "identity_b": agent_tok}))
+        .json(&json!({"identity_a": sender, "identity_b": participant_tok}))
         .send()
         .await
         .unwrap();
@@ -2197,11 +2197,11 @@ async fn ac_claim_transfer_existing_governor() {
     let client = server.client();
 
     // An agent listens, announces, and claims.
-    let (agent_tok, _sa) = listen_get_token(&server, &client, None).await;
+    let (participant_tok, _sa) = listen_get_token(&server, &client, None).await;
     tokio::time::sleep(Duration::from_millis(20)).await;
     client
         .post(server.url("/announce"))
-        .header("Authorization", format!("Bearer {}", agent_tok))
+        .header("Authorization", format!("Bearer {}", participant_tok))
         .json(&json!({"name": "TransferAgent"}))
         .send()
         .await
@@ -2209,7 +2209,7 @@ async fn ac_claim_transfer_existing_governor() {
 
     let r = client
         .post(server.url("/governors/claim"))
-        .header("Authorization", format!("Bearer {}", agent_tok))
+        .header("Authorization", format!("Bearer {}", participant_tok))
         .json(&json!({}))
         .send()
         .await
@@ -2245,7 +2245,7 @@ async fn ac_claim_transfer_existing_governor() {
     // Agent dequeues and should see governorship_granted.
     let pop = client
         .post(server.url("/messages/queue/pop"))
-        .header("Authorization", format!("Bearer {}", agent_tok))
+        .header("Authorization", format!("Bearer {}", participant_tok))
         .send()
         .await
         .unwrap()
@@ -2461,7 +2461,7 @@ async fn ac_pr2_presence_recovers_after_sse_drop_and_reannounce() {
 // ── AC3: absent agent (TTL expired, no re-announce) shows "offline" ───────────
 
 #[tokio::test]
-async fn ac_pr3_absent_agent_shows_offline_after_ttl_expires() {
+async fn ac_pr3_absent_participant_shows_offline_after_ttl_expires() {
     // Use a 1-second liveness window so the test doesn't take 30 s.
     let server = spawn_server_with_ttl(1).await;
     let client = server.client();
@@ -2594,7 +2594,7 @@ async fn setup_send_pair(
     let client = server.client();
 
     // Receiver — keep SSE open for notify delivery.
-    let _rtok = register_agent_tok(&server, &client).await;
+    let _rtok = register_participant_tok(&server, &client).await;
     let r = client
         .post(server.url("/listen"))
         .header("Authorization", format!("Bearer {}", _rtok))
@@ -2839,7 +2839,7 @@ async fn ac_lid3_sub_event_contains_last_message_id() {
     let client = server.client();
 
     // POST /listen — read until we see the sub event (second data event after welcome).
-    let _rtok = register_agent_tok(&server, &client).await;
+    let _rtok = register_participant_tok(&server, &client).await;
     let r = client
         .post(server.url("/listen"))
         .header("Authorization", format!("Bearer {}", _rtok))
@@ -3305,7 +3305,7 @@ async fn ac_pp4_no_grant_no_presence_event_to_non_peer() {
 #[tokio::test]
 async fn ac_pp5_minted_agent_deregister_sends_offline_to_listen_peer() {
     use simple_im::registry::PresenceScope;
-    use simple_im::types::AgentToken;
+    use simple_im::types::ParticipantToken;
 
     let (hub, gov) = make_presence_hub();
 
@@ -3317,8 +3317,8 @@ async fn ac_pp5_minted_agent_deregister_sends_offline_to_listen_peer() {
         .unwrap();
     hub.announce(&tok_a, "PpA5", false).unwrap();
 
-    // Bob: minted agent with a stable identity distinct from his token.
-    let bob_tok: AgentToken = hub.mint_agent_token(&gov, "bob-id-5", None).unwrap();
+    // Bob: minted participant with a stable identity distinct from his token.
+    let bob_tok: ParticipantToken = hub.mint_participant_token(&gov, "bob-id-5", None).unwrap();
     hub.register("PpB5", &bob_tok, PresenceScope::Public)
         .unwrap();
 
