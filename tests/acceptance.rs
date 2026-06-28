@@ -56,21 +56,21 @@ impl TestServer {
     }
 }
 
-/// POST /agents/register — mint a fresh token (new-agent flow).
+/// POST /register — mint a fresh token (new-participant flow).
 async fn register_agent_tok(server: &TestServer, client: &reqwest::Client) -> String {
     let r = client
-        .post(server.url("/agents/register"))
+        .post(server.url("/register"))
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), StatusCode::OK, "POST /agents/register failed");
+    assert_eq!(r.status(), StatusCode::OK, "POST /register failed");
     let body: Value = r.json().await.unwrap();
     body["token"].as_str().unwrap().to_owned()
 }
 
 /// POST /listen, read the welcome event, return (token, task_handle).
 /// The task_handle keeps the SSE connection alive — drop it when done.
-/// When existing_token is None, auto-registers via POST /agents/register first.
+/// When existing_token is None, auto-registers via POST /register first.
 async fn listen_get_token(
     server: &TestServer,
     client: &reqwest::Client,
@@ -122,7 +122,7 @@ async fn listen_get_token(
 }
 
 /// POST /listen and read the first SSE event. Drops the stream (agent goes offline after).
-/// When existing_token is None, auto-registers via POST /agents/register first.
+/// When existing_token is None, auto-registers via POST /register first.
 async fn listen_and_get_welcome(
     server: &TestServer,
     client: &reqwest::Client,
@@ -166,14 +166,14 @@ async fn listen_and_get_welcome(
     (token, welcome_json)
 }
 
-// ── AC-T1: POST /agents/register returns 8-12 digit token; welcome has no token ──
+// ── AC-T1: POST /register returns 8-12 digit token; welcome has no token ──
 
 #[tokio::test]
 async fn ac_t1_listen_returns_token_in_welcome_event() {
     let server = TestServer::spawn().await;
     let client = server.client();
 
-    // Token comes from POST /agents/register, not from the welcome event.
+    // Token comes from POST /register, not from the welcome event.
     let (token, welcome_json) = listen_and_get_welcome(&server, &client, None).await;
 
     // Registered token must be 8-12 digits.

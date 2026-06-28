@@ -33,9 +33,9 @@ connect() {
 
     # If no token, register first
     if [[ -z "$token" ]]; then
-        echo >&2 "sim: no token — registering via /agents/register"
+        echo >&2 "sim: no token — registering via /register"
         local reg_result
-        reg_result=$(curl -s -X POST "$SIM_URL/agents/register" \
+        reg_result=$(curl -s -X POST "$SIM_URL/register" \
             -H "Content-Type: application/json" 2>/dev/null)
         token=$(echo "$reg_result" | grep -o '"token":"[^"]*"' | sed 's/"token":"//;s/"//')
         if [[ -n "$token" ]]; then
@@ -67,7 +67,7 @@ connect() {
         # S-IM restart clears all tokens — an agent with a pre-restart token in TOKEN_FILE
         # will get AUTH_FAILED on the first POST /listen. Without this guard, FAIL_COUNT
         # would increment 10 times and trigger a false SIM-DOWN. Instead: clear the file
-        # and break; the outer loop's next iteration will call /agents/register for a fresh token.
+        # and break; the outer loop's next iteration will call /register for a fresh token.
         if [[ "$line" == *'"AUTH_FAILED"'* || "$line" == *'"TOKEN_REJECTED"'* ]]; then
             echo >&2 "sim: token rejected — clearing for re-registration"
             > "$TOKEN_FILE"

@@ -113,7 +113,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let max_attach = state.attachment_max_bytes;
     Router::new()
         .route("/", get(handle_discovery))
-        .route("/agents/register", post(handle_agents_register))
+        .route("/register", post(handle_agents_register))
         .route("/listen", post(handle_listen))
         .route("/listen", delete(handle_cancel_listen))
         .route("/announce", post(handle_announce))
@@ -1096,13 +1096,12 @@ async fn handle_discovery() -> Response {
         Json(json!({
             "service": "simple-im",
             "version": "2",
-            "entry": "POST /agents/register",
-            "description": "Register with POST /agents/register to receive a token, then POST /listen with that token to open your SSE stream. POST /announce to claim a name. See the participant skill for the full flow.",
+            "entry": "POST /register",
+            "description": "Register with POST /register to receive a token, then POST /listen with that token to open your SSE stream. POST /announce to claim a name. See the participant skill for the full flow.",
             "skill": "/skills/participant",
             "auth": "Bearer <listen-token> in the Authorization header. Gate on HTTP status code; errors are {\"error\":CODE,\"message\":...}.",
-            "agents_register": "POST /agents/register",
             "participant": {
-                "register": "POST /agents/register",
+                "register": "POST /register",
                 "listen": "POST /listen",
                 "cancel_listen": "DELETE /listen",
                 "announce": "POST /announce",
@@ -1253,7 +1252,7 @@ fn sanitize_filename(name: &str) -> String {
     }
 }
 
-// ── POST /agents/register ─────────────────────────────────────────────────────
+// ── POST /register ─────────────────────────────────────────────────────────────
 // Mint a new agent token for future /listen use.
 // No authentication required (anyone can register, same as anonymous /listen before).
 

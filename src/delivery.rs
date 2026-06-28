@@ -3793,7 +3793,7 @@ impl DeliveryHub {
             };
 
             // Emit service/welcome — the agent's entry point.
-            // Normal agents already know their token (from POST /agents/register) so we
+            // Normal participants already know their token (from POST /register) so we
             // do not echo it back. Exception: governor session-link path presents a governor
             // token and receives a newly minted listen token — the agent does NOT have it yet,
             // so we include it in the welcome so they can use it for announce/dequeue.
