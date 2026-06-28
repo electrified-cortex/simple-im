@@ -6674,19 +6674,11 @@ mod tests {
         let store = Arc::new(TokenStore::open(db_path).await.expect("open db"));
         let tokens = store.load_tokens().await.expect("load tokens");
         let grants = store.load_grants().await.expect("load grants");
-        let identities = store.load_identities().await.expect("load identities");
         let denial_blocks = store
             .load_denial_blocks()
             .await
             .expect("load denial blocks");
-        DeliveryHub::new_with_persisted_state(
-            lapse,
-            store,
-            tokens,
-            grants,
-            identities,
-            denial_blocks,
-        )
+        DeliveryHub::new_with_persisted_state(lapse, store, tokens, grants, denial_blocks)
     }
 
     // ── Attachments (native file/attachment send) ────────────────────────────────
