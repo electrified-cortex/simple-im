@@ -31,6 +31,22 @@ connect() {
     local token
     token="$(cat "$TOKEN_FILE" 2>/dev/null | tr -d '[:space:]')"
 
+    # If no token, register first
+    if [[ -z "$token" ]]; then
+        echo >&2 "sim: no token — registering via /agents/register"
+        local reg_result
+        reg_result=$(curl -s -X POST "$SIM_URL/agents/register" \
+            -H "Content-Type: application/json" 2>/dev/null)
+        token=$(echo "$reg_result" | grep -o '"token":"[^"]*"' | sed 's/"token":"//;s/"//')
+        if [[ -n "$token" ]]; then
+            echo "$token" > "$TOKEN_FILE"
+            echo >&2 "sim: registered — token saved"
+        else
+            echo >&2 "sim: registration failed — ${reg_result}"
+            return 1
+        fi
+    fi
+
     local auth_header=""
     if [[ -n "$token" ]]; then
         auth_header="Authorization: Bearer $token"
