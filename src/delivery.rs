@@ -464,7 +464,9 @@ impl HubInner {
         let room_peers: Vec<String> = self
             .name_to_token
             .keys()
-            .filter(|cp_name| cp_name.as_str() != name && self.room_store.shares_room(name, cp_name))
+            .filter(|cp_name| {
+                cp_name.as_str() != name && self.room_store.shares_room(name, cp_name)
+            })
             .cloned()
             .collect();
         for cp_name in room_peers {
@@ -624,7 +626,13 @@ impl HubInner {
     /// represents a token that was `!ever_listened && ever_granted` and has now been
     /// evicted.  The **caller must fire `push_presence_event(senders, &name, "offline")`
     /// for every entry after releasing the lock** (out-of-lock, silent drop). (15-0002H)
-    fn gc_tokens(&mut self) -> Vec<(Vec<mpsc::UnboundedSender<String>>, String)> {
+    fn gc_tokens(
+        &mut self,
+    ) -> Vec<(
+        String,
+        Vec<mpsc::UnboundedSender<String>>,
+        oneshot::Receiver<()>,
+    )> {
         let now = Instant::now();
         let unlisten_ttl = self.gc_ttl_unlisten;
         let no_grant_ttl = self.gc_ttl_no_grant;
@@ -4052,7 +4060,13 @@ impl DeliveryHub {
                 }
             }
 
-            (token, rx, bound_name_for_persist, gc_offline_events)
+            (
+                token,
+                rx,
+                bound_name_for_persist,
+                gc_offline_events,
+                settle_window,
+            )
         }; // lock released
 
         // Fire any Branch-3 GC offline events after the lock is released. (15-0002H)
@@ -4974,10 +4988,10 @@ impl DeliveryHub {
                     return Ok(false);
                 }
                 let in_settle = inner.is_settle_pending(target_name);
-                return Ok(
-                    ListenTokenState::is_sse_alive_in_hub(&target_tok, &inner.sse_connections)
-                        || in_settle,
-                );
+                return Ok(ListenTokenState::is_sse_alive_in_hub(
+                    &target_tok,
+                    &inner.sse_connections,
+                ) || in_settle);
             }
             // minted-agent target.
             let in_settle = inner.is_settle_pending(target_name);
@@ -5066,10 +5080,10 @@ impl DeliveryHub {
                     return Ok(false);
                 }
                 let in_settle = inner.is_settle_pending(target_name);
-                return Ok(
-                    ListenTokenState::is_sse_alive_in_hub(&target_tok, &inner.sse_connections)
-                        || in_settle,
-                );
+                return Ok(ListenTokenState::is_sse_alive_in_hub(
+                    &target_tok,
+                    &inner.sse_connections,
+                ) || in_settle);
             }
             // minted-agent target.
             let in_settle = inner.is_settle_pending(target_name);
@@ -7508,7 +7522,7 @@ mod tests {
 
         let reg_token = hub.register_participant();
         let (tok, _rx) = hub
-            .open_listen(Some(&reg_token), None, None, None, false)
+            .open_listen(Some(&reg_token), None, None, None, false, false)
             .unwrap();
         // Announce a name — sets st.name = Some("GcExempt").
         hub.announce(&tok, "GcExempt", false).unwrap();
