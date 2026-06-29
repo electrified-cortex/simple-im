@@ -7847,12 +7847,11 @@ mod tests {
     #[test]
     fn ac_listen_conflict_returns_active_subscription_error() {
         let hub = make_hub(Duration::from_secs(30));
-        let gov = hub.install_governor(None);
-        let tok = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
+        let tok = hub.register_participant();
 
         // Open first listen stream.
         let (token, _rx1) = hub
-            .open_listen(Some(&tok.0), None, None, None, false)
+            .open_listen(Some(&tok), None, None, None, false)
             .expect("first open_listen must succeed");
 
         // Second open_listen without force → should return ActiveSubscription error.
@@ -7868,12 +7867,11 @@ mod tests {
     #[test]
     fn ac_listen_force_takeover_supersedes_prior_stream() {
         let hub = make_hub(Duration::from_secs(30));
-        let gov = hub.install_governor(None);
-        let tok = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
+        let tok = hub.register_participant();
 
         // Open first listen stream.
         let (token1, mut rx1) = hub
-            .open_listen(Some(&tok.0), None, None, None, false)
+            .open_listen(Some(&tok), None, None, None, false)
             .expect("first open_listen must succeed");
 
         // Second open_listen with force=true → should succeed and return same token.
@@ -7889,14 +7887,18 @@ mod tests {
 
         // The "superseded" event is sent synchronously inside open_listen before it returns,
         // so try_recv() works here without any async runtime — event is already queued.
-        let superseded_event = rx1.try_recv().ok();
+        // Note: rx1 also holds the welcome event from the first open_listen call; drain
+        // until we find "superseded".
+        let mut superseded_event = None;
+        while let Ok(ev) = rx1.try_recv() {
+            if ev.contains("superseded") {
+                superseded_event = Some(ev);
+                break;
+            }
+        }
         assert!(
-            superseded_event
-                .as_ref()
-                .map(|e| e.contains("superseded"))
-                .unwrap_or(false),
-            "old SSE rx should receive superseded event, got: {:?}",
-            superseded_event
+            superseded_event.is_some(),
+            "old SSE rx should receive superseded event, got none"
         );
     }
 
