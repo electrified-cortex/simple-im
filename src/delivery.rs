@@ -314,8 +314,6 @@ struct HubInner {
     gc_registration_grace: Duration,
     /// Persistent denial blocks keyed on (from_identity, to_name).
     denial_blocks: HashMap<(String, String), DenialBlock>,
-    /// Guards the one-time startup announce: true after sim_online has been sent.
-    startup_announced: bool,
     /// In-memory governance claims (election / transfer); ephemeral — lost on restart.
     pending_claims: HashMap<String, GovernanceClaim>,
     /// Monotonic counter for claim IDs.
@@ -659,7 +657,6 @@ impl DeliveryHub {
                 gc_ttl_no_grant,
                 gc_registration_grace: REGISTRATION_GRACE,
                 denial_blocks: HashMap::new(),
-                startup_announced: false,
                 pending_claims: HashMap::new(),
                 claim_counter: 0,
             }),
@@ -3610,7 +3607,7 @@ impl DeliveryHub {
     ) -> Result<(String, mpsc::UnboundedReceiver<String>), Error> {
         // Token is required.
         let provided_token = token_opt.ok_or(Error::AuthFailed)?;
-        let observed_host_str = observed_host.unwrap_or_default();
+        let _observed_host_str = observed_host.unwrap_or_default();
         let (token, rx, bound_name_for_persist, gc_offline_events) = {
             let mut inner = self.lock();
             let gc_offline_events = inner.gc_tokens();
