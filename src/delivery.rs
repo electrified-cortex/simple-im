@@ -14,6 +14,7 @@ use crate::persistence::{
     PersistedDenialBlock, PersistedGrant, PersistedToken, StoredAttachment, TokenStore,
 };
 use crate::registry::{ParticipantIdentity, PresenceScope, Registry};
+use crate::rooms::RoomStore;
 use crate::trust::{ApproveGrantRequest, GrantMediation, TrustChain};
 use crate::types::{GovernorToken, ParticipantToken, Payload, QueuedMessage};
 
@@ -320,6 +321,14 @@ struct HubInner {
     pending_claims: HashMap<String, GovernanceClaim>,
     /// Monotonic counter for claim IDs.
     claim_counter: u64,
+    /// Per-name pending settle timers. Sender is stored; dropping it cancels the receiver.
+    settle_tasks: HashMap<String, oneshot::Sender<()>>,
+    /// Duration before a settle timer fires an offline event. Default 30s.
+    settle_window: Duration,
+    /// Room store shared with the HTTP layer — used for room-based presence visibility.
+    /// Presence is visible to a peer if they hold a PERMISSIVE grant OR share a room.
+    /// Deny grants override both (hard block). (15-0028)
+    room_store: Arc<RoomStore>,
 }
 
 /// Central hub coordinating message delivery, token management, grants, and presence.
@@ -402,6 +411,133 @@ impl HubInner {
             // Minted-agent counterparties have no listen_tokens entry → silently skip.
         }
         senders
+    }
+
+    /// Like grant_peer_senders but ONLY returns senders for tokens with presence_push=true.
+    ///
+    /// Visibility rule (15-0028 / operator-final-rule):
+    ///   A peer receives presence events for `name` if and only if:
+    ///   (A) the peer holds a PERMISSIVE grant with `name`, OR
+    ///   (B) the peer currently shares a room with `name`.
+    ///   DENY-GRANT OVERRIDE: if a denial block exists for (peer_identity → name), the
+    ///   peer is excluded even if condition A or B would otherwise apply.
+    fn grant_peer_presence_senders(&self, name: &str) -> Vec<mpsc::UnboundedSender<String>> {
+        let identity = self
+            .agents
+            .get(name)
+            .map(|s| s.identity.as_str())
+            .unwrap_or(name);
+        let counterparties = self.trust.grant_counterparties_for(name, identity);
+        let mut senders = Vec::new();
+        let mut seen_tokens: HashSet<String> = HashSet::new();
+
+        // ── (A) Grant-based counterparties ──────────────────────────────────────────
+        for (cp_name, cp_identity) in counterparties {
+            // Deny-grant override: if peer has a denial block against this subject, skip.
+            if self.is_denial_active(&cp_identity, name) {
+                continue;
+            }
+            let tok_opt = cp_name
+                .as_deref()
+                .and_then(|n| self.name_to_token.get(n))
+                .cloned();
+            let tok_opt = tok_opt.or_else(|| {
+                if self.listen_tokens.contains_key(cp_identity.as_str()) {
+                    Some(cp_identity)
+                } else {
+                    None
+                }
+            });
+            if let Some(tok) = tok_opt
+                && seen_tokens.insert(tok.clone())
+                && let Some(st) = self.listen_tokens.get(&tok)
+                && st.presence_push
+                && let Some(ref tx) = st.sse_sender
+                && !tx.is_closed()
+            {
+                senders.push(tx.clone());
+            }
+        }
+
+        // ── (B) Room-based counterparties (no grant required) ──────────────────────
+        // Collect room-peer names first to avoid holding room lock while iterating name_to_token.
+        let room_peers: Vec<String> = self
+            .name_to_token
+            .keys()
+            .filter(|cp_name| cp_name.as_str() != name && self.room_store.shares_room(name, cp_name))
+            .cloned()
+            .collect();
+        for cp_name in room_peers {
+            if let Some(cp_tok) = self.name_to_token.get(&cp_name) {
+                // For listen-flow agents, token == identity.
+                if self.is_denial_active(cp_tok, name) {
+                    continue;
+                }
+                if seen_tokens.insert(cp_tok.clone())
+                    && let Some(st) = self.listen_tokens.get(cp_tok)
+                    && st.presence_push
+                    && let Some(ref tx) = st.sse_sender
+                    && !tx.is_closed()
+                {
+                    senders.push(tx.clone());
+                }
+            }
+        }
+
+        senders
+    }
+
+    /// Returns true if a non-expired denial block exists for (from_identity → to_name).
+    /// Used to enforce deny-grant override in presence fanout and pull checks.
+    fn is_denial_active(&self, from_identity: &str, to_name: &str) -> bool {
+        let key = (from_identity.to_string(), to_name.to_string());
+        match self.denial_blocks.get(&key) {
+            None => false,
+            Some(block) => match block.expires_at {
+                None => true,
+                Some(exp) => {
+                    let now_secs = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    exp > now_secs
+                }
+            },
+        }
+    }
+
+    /// Start an offline settle timer for `name`. Cancels any existing timer.
+    /// Returns (senders, cancel_rx) if there are opted-in grant-peers; None otherwise.
+    fn begin_settle_offline(
+        &mut self,
+        name: &str,
+    ) -> Option<(Vec<mpsc::UnboundedSender<String>>, oneshot::Receiver<()>)> {
+        let senders = self.grant_peer_presence_senders(name);
+        if senders.is_empty() {
+            return None;
+        }
+        // Cancel any existing settle task (old sender drops → old receiver gets Err)
+        self.settle_tasks.remove(name);
+        let (tx, rx) = oneshot::channel();
+        self.settle_tasks.insert(name.to_string(), tx);
+        Some((senders, rx))
+    }
+
+    /// Cancel a pending settle timer for `name` (participant came back online).
+    fn cancel_settle_online(&mut self, name: &str) {
+        self.settle_tasks.remove(name); // drops sender → settle task sees Err and stops
+    }
+
+    /// Returns true if there is an active (not-yet-fired) offline settle timer for `name`.
+    /// Uses `Sender::is_closed()` to detect whether the spawned task's receiver has been
+    /// dropped — this happens when the timeout fires (the task exits, dropping cancel_rx).
+    /// A closed sender means the settle task has already fired; we must NOT treat the name
+    /// as "in settle" in that case. (15-0028)
+    fn is_settle_pending(&self, name: &str) -> bool {
+        self.settle_tasks
+            .get(name)
+            .map(|tx| !tx.is_closed())
+            .unwrap_or(false)
     }
 
     fn is_online_effective(&self, name: &str) -> bool {
@@ -667,9 +803,17 @@ impl DeliveryHub {
                 startup_announced: false,
                 pending_claims: HashMap::new(),
                 claim_counter: 0,
+                settle_tasks: HashMap::new(),
+                settle_window: clamp_env_secs("SIMPLE_IM_SETTLE_WINDOW_SECS", 1, 300, 30),
+                room_store: Arc::new(RoomStore::new()),
             }),
             token_store: None,
         }
+    }
+
+    /// Returns the shared room store for integration with the HTTP layer.
+    pub fn room_store(&self) -> Arc<RoomStore> {
+        Arc::clone(&self.lock().room_store)
     }
 
     /// Construct a hub pre-loaded with persisted tokens and grants, backed by `token_store`.
@@ -2200,7 +2344,8 @@ impl DeliveryHub {
 
     /// Returns true if the named agent is currently within its liveness window or holds an active SSE connection.
     pub fn presence(&self, name: &str) -> bool {
-        self.lock().is_online_effective(name)
+        let inner = self.lock();
+        inner.is_online_effective(name) || inner.is_settle_pending(name)
     }
 
     /// Validates the token and returns the registered agent name, or None.
@@ -4012,9 +4157,13 @@ impl DeliveryHub {
             // Remove SSE connection tracking.
             inner.sse_connections.remove(token);
             // Unbind name from all lookup maps.
+            // Also deregister from the liveness registry so that a subsequent announce()
+            // for the same name by a different token does not hit the minted-agent conflict
+            // check (registry.is_online && !name_to_token) and return NameInUse. (15-0028)
             if let Some(name) = inner.token_to_name.remove(token) {
                 inner.name_to_token.remove(&name);
                 inner.agents.remove(&name);
+                inner.registry.force_deregister(&name);
             }
             // Clear name and SSE sender from token state.
             let st = inner
@@ -4623,7 +4772,13 @@ impl DeliveryHub {
     }
 
     /// Presence for a listen token: online if active SSE and not hidden.
-    /// Grant-gated: querier must have an active grant with target to see their presence.
+    ///
+    /// Visibility rule (15-0028 / operator-final-rule):
+    ///   A querier sees a target's presence if and only if:
+    ///   (A) the querier holds a PERMISSIVE grant with the target, OR
+    ///   (B) the querier currently shares a room with the target.
+    ///   DENY-GRANT OVERRIDE: if a denial block exists for (querier_identity → target_name),
+    ///   returns false regardless of grant or room membership.
     pub fn presence_for_token(&self, token: &str, target_name: &str) -> Result<bool, Error> {
         let inner = self.lock();
         // Validate querier token.
@@ -4632,8 +4787,14 @@ impl DeliveryHub {
             return Err(Error::TokenRevoked);
         }
 
-        // Resolve querier name for grant check.
+        // Resolve querier name for grant/room checks.
         let querier_name = querier_state.name.clone();
+
+        // Deny-grant override: hard block regardless of grant or room.
+        // Key: (querier_identity → target_name); for listen-flow, identity == token.
+        if inner.is_denial_active(token, target_name) {
+            return Ok(false);
+        }
 
         // Resolve target identity (listen token string if they're a listen-flow agent).
         let target_tok = inner.name_to_token.get(target_name).cloned();
@@ -4690,8 +4851,15 @@ impl DeliveryHub {
             }
         };
 
-        if !has_grant {
-            // No grant → target not visible (return false, not an error).
+        // Room membership check: alternative to grant for co-present participants.
+        let shares_room = if let Some(ref qn) = querier_name {
+            inner.room_store.shares_room(qn, target_name)
+        } else {
+            false
+        };
+
+        if !has_grant && !shares_room {
+            // Neither grant nor shared room → target not visible.
             return Ok(false);
         }
 
@@ -4706,10 +4874,13 @@ impl DeliveryHub {
                 ListenTokenState::is_sse_alive_in_hub(&target_tok, &inner.sse_connections);
             // AC2 fix: also check registry liveness so presence recovers after
             // an announce following an SSE drop (transient reconnect pattern).
-            return Ok(sse_alive || inner.registry.is_online(target_name));
+            // Also consider settle window: still "present" while offline settle timer runs.
+            let in_settle = inner.is_settle_pending(target_name);
+            return Ok(sse_alive || inner.registry.is_online(target_name) || in_settle);
         }
         // Fall back to minted-agent lookup.
-        Ok(inner.is_online_effective(target_name))
+        let in_settle = inner.is_settle_pending(target_name);
+        Ok(inner.is_online_effective(target_name) || in_settle)
     }
 
     /// Check presence using any valid token.
@@ -4726,8 +4897,13 @@ impl DeliveryHub {
                 return Err(Error::TokenRevoked);
             }
 
-            // Resolve querier name for grant check.
+            // Resolve querier name for grant/room checks; identity = token for listen-flow.
             let querier_name = state.name.clone();
+
+            // Deny-grant override: hard block regardless of grant or room.
+            if inner.is_denial_active(token_str, target_name) {
+                return Ok(false);
+            }
 
             // Grant check: querier must have a grant with target.
             let has_grant = match &target_tok {
@@ -4778,7 +4954,14 @@ impl DeliveryHub {
                 }
             };
 
-            if !has_grant {
+            // Room membership: alternative to grant for co-present participants.
+            let shares_room = if let Some(ref qn) = querier_name {
+                inner.room_store.shares_room(qn, target_name)
+            } else {
+                false
+            };
+
+            if !has_grant && !shares_room {
                 return Ok(false);
             }
 
@@ -4789,13 +4972,15 @@ impl DeliveryHub {
                 if tgt.hidden {
                     return Ok(false);
                 }
-                return Ok(ListenTokenState::is_sse_alive_in_hub(
-                    &target_tok,
-                    &inner.sse_connections,
-                ));
+                let in_settle = inner.is_settle_pending(target_name);
+                return Ok(
+                    ListenTokenState::is_sse_alive_in_hub(&target_tok, &inner.sse_connections)
+                        || in_settle,
+                );
             }
             // minted-agent target.
-            return Ok(inner.is_online_effective(target_name));
+            let in_settle = inner.is_settle_pending(target_name);
+            return Ok(inner.is_online_effective(target_name) || in_settle);
         }
 
         // Try minted agent token.
@@ -4810,6 +4995,13 @@ impl DeliveryHub {
                 .trust
                 .participant_identity(&participant_token)
                 .map(|s| s.to_string());
+
+            // Deny-grant override for minted-agent querier.
+            if let Some(ref q_id) = querier_identity {
+                if inner.is_denial_active(q_id, target_name) {
+                    return Ok(false);
+                }
+            }
 
             // Grant check for minted agent querier.
             let has_grant = match (&target_tok, &querier_identity) {
@@ -4872,13 +5064,15 @@ impl DeliveryHub {
                 if tgt.hidden {
                     return Ok(false);
                 }
-                return Ok(ListenTokenState::is_sse_alive_in_hub(
-                    &target_tok,
-                    &inner.sse_connections,
-                ));
+                let in_settle = inner.is_settle_pending(target_name);
+                return Ok(
+                    ListenTokenState::is_sse_alive_in_hub(&target_tok, &inner.sse_connections)
+                        || in_settle,
+                );
             }
             // minted-agent target.
-            return Ok(inner.is_online_effective(target_name));
+            let in_settle = inner.is_settle_pending(target_name);
+            return Ok(inner.is_online_effective(target_name) || in_settle);
         }
 
         Err(Error::AuthFailed)
