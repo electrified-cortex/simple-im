@@ -314,6 +314,8 @@ struct HubInner {
     gc_registration_grace: Duration,
     /// Persistent denial blocks keyed on (from_identity, to_name).
     denial_blocks: HashMap<(String, String), DenialBlock>,
+    /// Guards the one-time startup announce: true after sim_online has been sent.
+    startup_announced: bool,
     /// In-memory governance claims (election / transfer); ephemeral — lost on restart.
     pending_claims: HashMap<String, GovernanceClaim>,
     /// Monotonic counter for claim IDs.
@@ -657,6 +659,7 @@ impl DeliveryHub {
                 gc_ttl_no_grant,
                 gc_registration_grace: REGISTRATION_GRACE,
                 denial_blocks: HashMap::new(),
+                startup_announced: false,
                 pending_claims: HashMap::new(),
                 claim_counter: 0,
             }),
@@ -3834,6 +3837,32 @@ impl DeliveryHub {
                 }
                 .to_string();
                 let _ = tx.send(welcome);
+            }
+
+            // Emit sub event: provides last_message_id for gap detection on reconnect.
+            {
+                let last_msg_id = inner
+                    .listen_tokens
+                    .get(&token)
+                    .map(|st| *st.msg_id_watch.borrow())
+                    .unwrap_or(0);
+                let sub_event = serde_json::json!({
+                    "type": "sub",
+                    "last_message_id": last_msg_id,
+                })
+                .to_string();
+                let _ = tx.send(sub_event);
+            }
+
+            // Startup announce: fire sim_online exactly once on first SSE subscription.
+            if !inner.startup_announced {
+                inner.startup_announced = true;
+                let sim_online = serde_json::json!({
+                    "type": "service",
+                    "event": "sim_online",
+                })
+                .to_string();
+                let _ = tx.send(sim_online);
             }
 
             // SIM-1: Re-arm notify on reconnect and fire a catch-up NOTIFY if messages are
