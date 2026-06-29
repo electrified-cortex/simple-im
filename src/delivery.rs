@@ -523,8 +523,11 @@ impl HubInner {
                 } else if !st.ever_listened {
                     // Branches 1 (no grant) and 3 (ever_granted): both use unlisten_ttl.
                     now.duration_since(st.issued_at) > unlisten_ttl
-                } else if !st.ever_granted {
-                    // Branch 2: ever_listened && !ever_granted.
+                } else if !st.ever_granted && st.name.is_none() {
+                    // Branch 2: ever_listened && !ever_granted && unbound.
+                    // Name-bound tokens (established identity, including governor listen tokens)
+                    // are exempt from age-GC here — they fall through to false below.
+                    // Stale named tokens are handled by the by-activity GC in 15-0029.
                     now.duration_since(st.issued_at) > no_grant_ttl
                 } else {
                     false
@@ -7290,6 +7293,49 @@ mod tests {
         assert!(
             matches!(hub.validate_token(&stale), Err(Error::TokenRejected)),
             "listened-but-never-granted token must be GC'd after no-grant TTL"
+        );
+    }
+
+    // ── P0 fix: name-bound tokens are exempt from Branch-2 (no-grant) age-GC ──
+    //
+    // Regression guard for gc-named-token-exemption (P0 hotfix).
+    // A token that has listened AND announced a name must NOT be evicted by
+    // gc_tokens even when issued_at exceeds no_grant_ttl.  The guard
+    // `!ever_granted && st.name.is_none()` ensures name-bound tokens
+    // (established identity participants, governor listen tokens) fall through
+    // to the `false` branch and are never age-evicted.
+
+    #[test]
+    fn ac_t5b_gc_named_token_exempt_from_no_grant_gc() {
+        let hub = make_hub(Duration::from_secs(30));
+
+        let reg_token = hub.register_participant();
+        let (tok, _rx) = hub
+            .open_listen(Some(&reg_token), None, None, None, false)
+            .unwrap();
+        // Announce a name — sets st.name = Some("GcExempt").
+        hub.announce(&tok, "GcExempt", false).unwrap();
+
+        {
+            let inner = hub.inner.lock().unwrap();
+            let st = &inner.listen_tokens[&tok];
+            assert!(st.ever_listened, "ever_listened must be true");
+            assert!(!st.ever_granted, "no grant issued — ever_granted must be false");
+            assert!(st.name.is_some(), "name must be bound after announce");
+        }
+
+        // Backdate issued_at well past the default no-grant TTL (1800 s).
+        {
+            let mut inner = hub.inner.lock().unwrap();
+            inner.listen_tokens.get_mut(&tok).unwrap().issued_at =
+                Instant::now() - Duration::from_secs(2000);
+        }
+
+        hub.trigger_gc_for_test();
+
+        assert!(
+            hub.validate_token(&tok).is_ok(),
+            "name-bound token must NOT be GC'd by the no-grant branch even past no_grant_ttl"
         );
     }
 
