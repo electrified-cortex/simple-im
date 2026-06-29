@@ -8,6 +8,7 @@ RUN mkdir src && echo "fn main(){}" > src/main.rs && cargo build --release --tar
 COPY src ./src
 COPY tests ./tests
 COPY skills ./skills
+COPY docs ./docs
 RUN touch src/main.rs && cargo build --release --target x86_64-unknown-linux-musl
 
 FROM alpine:3.20
