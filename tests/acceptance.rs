@@ -3293,7 +3293,7 @@ async fn ac_pp4_no_grant_no_presence_event_to_non_peer() {
     );
 }
 
-// AC5 (15-0002F): minted-agent deregisters → V2 listen-flow grant-peer receives offline event.
+// AC5 (15-0002F): minted-agent deregisters → listen-flow grant-peer receives offline event.
 //
 // This tests the identity-keyed grant path: the grant is approved using the minted agent's
 // identity string (not their token), so the FP1 name lookup in approve_grant_req sets name_a=None.

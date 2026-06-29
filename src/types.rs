@@ -6,20 +6,6 @@ use std::time::Duration;
 /// and panic. With the clamp, a too-long expiry simply becomes "very long" — never a crash.
 pub const MAX_EXPIRY: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
 
-/// DCP: per-subscription ephemeral ID (CSPRNG hex)
-pub struct SubId(pub String);
-
-/// DCP: identity credential — minted once at introduce, never rotated via welcome
-pub struct AuthToken(pub String);
-
-/// DCP breadcrumb action
-#[derive(Debug, Clone, PartialEq)]
-pub enum BreadcrumbAction {
-    Introduce,
-    Announce { handle: String },
-    ForceAnnounce { handle: String },
-}
-
 // §3.1: unique name bound to a token-identity for the lifetime of a registration
 pub struct ParticipantName(pub String);
 

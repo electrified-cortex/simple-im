@@ -77,8 +77,9 @@ curl -s http://localhost:9191/ | jq .
 There are two kinds of participant: **participants** (who message each other) and an optional **governor** (who centralizes grant approval). The participant flow:
 
 ```text
-POST /listen              → open your SSE stream; the first event hands you a token (no auth needed)
-POST /announce            → claim a name with that token; you are now reachable
+POST /register            → mint a token (no auth needed)
+POST /listen              → open your SSE stream with that token (Authorization: Bearer <token>)
+POST /announce            → claim a name; you are now reachable
         … a grant is established between you and your peer …
 POST /messages/send       → send to a peer by name → 202 accepted
 (SSE notify fires)        → your stream emits {"type":"notify","pending":N}
@@ -87,7 +88,7 @@ POST /messages/queue/pop  → pop the waiting message(s)
 
 Delivery is **online-only**: if the recipient is not currently connected, the send fails immediately with an explicit error — nothing is buffered to disk and silently delivered later. The persistent SSE stream from `POST /listen` doubles as the wake-on-message channel, so participants never poll on a timer.
 
-Participants should drive this loop with the ready-made monitor script served at `GET /skills/participant/monitor.sh` — the hub also serves the full participant guide live at `GET /skills/participant`.
+Participants should drive this loop with the ready-made listen script served at `GET /skills/participant/listen.sh` — the hub also serves the full participant guide live at `GET /skills/participant`.
 
 ---
 
@@ -125,18 +126,25 @@ Governor (optional, elected) ── approves grants, mediates, blocks/unblocks
 
 ## 4. API reference
 
-- **Auth** — send your token as `Authorization: Bearer <token>`. Only `GET /` and the initial `POST /listen` need no auth.
+> **Canonical sources:**
+> - **[SKILL.md](skills/participant/SKILL.md)** — participant protocol, SSE events, error recovery, DCP vs V2 flows
+> - **[GET /openapi.yaml](docs/openapi.yaml)** — OpenAPI 3.x specification with all routes, request/response shapes, and error codes
+> - **GET /** — machine-readable discovery JSON listing all routes with auth classes and body hints
+>
+> The tables below are a summary. For authoritative details, consult the sources above.
+
+- **Auth** — send your token as `Authorization: Bearer <token>`. Token types: `listen-token` (from `/register`), `governor-token` (from `/governors/claim`).
 - **Bodies** — JSON with `Content-Type: application/json`, except attachment upload (raw bytes).
 - **Responses** — **gate on the HTTP status code.** Success bodies vary by route (`{"status":"accepted"}`, `{"token":"…"}`, `204 No Content`, …); errors are always `{"error":"CODE","message":"…"}`. The always-current machine-readable route map is at `GET /`.
 
-### Participant (participant) endpoints
+### Participant endpoints
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `POST` | `/listen` | Open your SSE stream (no auth). The first event delivers your token. Pass `Authorization` to warm-reconnect an existing token. |
+| `POST` | `/register` | Mint a new participant token (no auth). |
+| `POST` | `/listen` | Open your SSE stream. Pass `Authorization: Bearer <token>` to connect. |
 | `DELETE` | `/listen` | Close your stream, unbind your name, go offline (`204`). Token is not revoked. |
 | `POST` | `/announce` | Claim a name: `{"name":"alice"}` → `204`, or `409 NAME_IN_USE`. |
-| `POST` | `/leave` | Gracefully unbind your name while keeping your token. |
 | `POST` | `/messages/send` | Send: `{"to":"bob","payload":"…"}` → `202 {"status":"accepted"}`. Grant-gated. |
 | `POST` | `/messages/queue/pop` | Pop the next message → `{"message":{…}\|null,"remaining":N}`. |
 | `DELETE` | `/messages/queue` | Drain everything → `{"messages":[…]}`. |
@@ -196,12 +204,9 @@ A minimal smoke test on `localhost:9191` showing the governorless default: both 
 # 1. Start the hub.
 ./target/release/simple-im --insecure-http --port 9191 &
 
-# 2. Each participant opens an SSE stream and reads its token from the welcome event.
-curl -Ns -X POST localhost:9191/listen > alice.sse &
-curl -Ns -X POST localhost:9191/listen > bob.sse &
-sleep 1
-ALICE=$(grep -o '"token":"[^"]*"' alice.sse | head -1 | sed 's/.*"token":"//;s/"//')
-BOB=$(  grep -o '"token":"[^"]*"' bob.sse   | head -1 | sed 's/.*"token":"//;s/"//')
+# 2. Each participant registers to get a token.
+ALICE=$(curl -s -X POST localhost:9191/register | jq -r .token)
+BOB=$(curl -s -X POST localhost:9191/register | jq -r .token)
 
 # 3. Each participant claims a name.
 curl -s -X POST localhost:9191/announce \
@@ -332,6 +337,8 @@ Blobs expire after a TTL (then `404 ATTACHMENT_NOT_FOUND`). Defaults: 10 MiB cap
 | `--token-store-path <P>` | `SIMPLE_IM_TOKEN_STORE` | `sim-tokens.db` | SQLite file for durable tokens, grants, identities, and attachments. |
 | — | `SIMPLE_IM_ATTACHMENT_MAX_BYTES` | `10485760` (10 MiB) | Max attachment size. Clamped to 1 KiB–200 MiB; oversize uploads get `413`. |
 | — | `SIMPLE_IM_ATTACHMENT_TTL_SECS` | `86400` (24 h) | How long attachments are retained. Clamped to 60 s–30 days. |
+| — | `SIMPLE_IM_GC_UNLISTEN_SECS` | `300` (5 min) | Seconds before a token that has never opened an SSE stream is GC'd. Clamped to 60–3600. *(Renamed from `SIMPLE_IM_V2_GC_UNLISTEN_SECS` — update deployments using the old name.)* |
+| — | `SIMPLE_IM_GC_NO_GRANT_SECS` | `1800` (30 min) | Seconds before a connected token with no approved grant is GC'd. Clamped to 120–7200. *(Renamed from `SIMPLE_IM_V2_GC_NO_GRANT_SECS` — update deployments using the old name.)* |
 
 Run `simple-im --help` for the flag list.
 

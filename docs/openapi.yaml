@@ -1,0 +1,1652 @@
+openapi: 3.1.0
+info:
+  title: Simple IM API
+  version: "2.0"
+  description: |
+    Agent-to-agent messaging hub with name registry, grant-gated 1:1 delivery,
+    optional governor trust layer, and real-time push over SSE.
+
+    **Authentication**: Most endpoints require `Authorization: Bearer <token>`.
+    Token types: `listen-token` (participant), `governor-token` (governor),
+    `transfer_token` (governor transfer), `dcp_auth_token` (DCP identity).
+
+    **Errors**: All errors return `{"error":"CODE","message":"..."}` with an
+    appropriate HTTP status code. Gate on status code, not body content.
+
+servers:
+  - url: /
+    description: Relative to the host serving this spec
+
+tags:
+  - name: discovery
+    description: Service discovery and documentation
+  - name: skill
+    description: Bundled skill files
+  - name: participant
+    description: Participant registration and presence
+  - name: message
+    description: Message sending and retrieval
+  - name: grant
+    description: Grant requests and management
+  - name: governor
+    description: Governor operations and events
+  - name: dcp
+    description: Direct Connect Protocol (advanced handle-based handshake)
+  - name: attachment
+    description: File attachments
+  - name: room
+    description: Transient rooms for co-presence discovery
+
+paths:
+  /:
+    get:
+      tags: [discovery]
+      summary: Discovery document
+      description: Returns the machine-readable discovery JSON with all routes
+      operationId: getDiscovery
+      security: []
+      responses:
+        "200":
+          description: Discovery document
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DiscoveryDocument"
+
+  /openapi.yaml:
+    get:
+      tags: [discovery]
+      summary: OpenAPI specification
+      description: Returns this OpenAPI 3.x specification (YAML format)
+      operationId: getOpenApi
+      security: []
+      responses:
+        "200":
+          description: OpenAPI specification
+          content:
+            text/yaml:
+              schema:
+                type: string
+
+  /skills/participant:
+    get:
+      tags: [skill]
+      summary: Participant skill
+      description: Returns the participant skill markdown document
+      operationId: getSkillParticipant
+      security: []
+      responses:
+        "200":
+          description: Skill markdown
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /skills/participant/listen.sh:
+    get:
+      tags: [skill]
+      summary: Participant listen script
+      description: Returns the listen.sh shell script for persistent connectivity
+      operationId: getSkillParticipantListenSh
+      security: []
+      responses:
+        "200":
+          description: Shell script
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /skills/governor:
+    get:
+      tags: [skill]
+      summary: Governor skill
+      description: Returns the governor skill markdown document
+      operationId: getSkillGovernor
+      security: []
+      responses:
+        "200":
+          description: Skill markdown
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /register:
+    post:
+      tags: [participant]
+      summary: Register a new participant
+      description: Mint a new participant token for future /listen use
+      operationId: register
+      security: []
+      responses:
+        "200":
+          description: Token minted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [token]
+                properties:
+                  token:
+                    type: string
+                    description: Participant token for subsequent calls
+
+  /listen:
+    post:
+      tags: [participant]
+      summary: Open SSE stream
+      description: |
+        Open a persistent SSE stream for real-time events. The first event
+        is a welcome. Pass a name in the body to auto-announce on connect.
+      operationId: listen
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: force
+          in: query
+          schema:
+            type: boolean
+          description: Force reclaim if name is held by stale session
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                  description: Optional name to auto-announce
+      responses:
+        "200":
+          description: SSE stream opened
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        "401":
+          $ref: "#/components/responses/AuthFailed"
+        "409":
+          $ref: "#/components/responses/Conflict"
+    delete:
+      tags: [participant]
+      summary: Cancel listen subscription
+      description: Close SSE stream, unbind name, go offline. Token is not revoked.
+      operationId: cancelListen
+      security:
+        - bearerAuth: []
+      responses:
+        "204":
+          description: Subscription cancelled
+        "404":
+          description: No active subscription
+
+  /announce:
+    post:
+      tags: [participant]
+      summary: Claim a name
+      description: Bind a name to this token. Supports the listen-flow.
+      operationId: announce
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AnnounceBody"
+      responses:
+        "204":
+          description: Name bound
+        "401":
+          $ref: "#/components/responses/AuthFailed"
+        "409":
+          description: Name in use
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NameInUseError"
+
+  /leave:
+    post:
+      tags: [participant]
+      summary: Leave (DCP)
+      description: Disconnect while preserving identity (DCP flow)
+      operationId: leave
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sub_id]
+              properties:
+                sub_id:
+                  type: string
+      responses:
+        "204":
+          description: Left
+        "401":
+          $ref: "#/components/responses/AuthFailed"
+
+  /participants:
+    get:
+      tags: [participant]
+      summary: List participants
+      description: List all announced participants (governor only)
+      operationId: listParticipants
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Participant list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [participants]
+                properties:
+                  participants:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ParticipantInfo"
+        "401":
+          $ref: "#/components/responses/AuthFailed"
+
+  /participants/{name}:
+    delete:
+      tags: [participant]
+      summary: Deregister participant
+      description: Force-revoke a participant by name (governor only)
+      operationId: deregisterParticipant
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Participant deregistered
+        "401":
+          $ref: "#/components/responses/AuthFailed"
+        "404":
+          description: Participant not found
+
+  /participants/{name}/presence:
+    get:
+      tags: [participant]
+      summary: Check presence
+      description: Check if a participant is online
+      operationId: getPresence
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Presence status
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [online, offline]
+        "401":
+          $ref: "#/components/responses/AuthFailed"
+
+  /participants/{name}/presence-scope:
+    post:
+      tags: [participant]
+      summary: Set presence scope
+      description: Set presence visibility (hidden/visible)
+      operationId: setPresenceScope
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [presence_scope]
+              properties:
+                presence_scope:
+                  type: string
+                  enum: [hidden, visible]
+      responses:
+        "204":
+          description: Presence scope set
+        "401":
+          $ref: "#/components/responses/AuthFailed"
+
+  /messages/send:
+    post:
+      tags: [message]
+      summary: Send message
+      description: Send a message to a participant by name or token
+      operationId: sendMessage
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SendMessageBody"
+      responses:
+        "202":
+          description: Message accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [accepted]
+        "200":
+          description: Pending mediation
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, mediation_id]
+                properties:
+                  status:
+                    type: string
+                    enum: [pending_mediation]
+                  mediation_id:
+                    type: string
+        "401":
+          $ref: "#/components/responses/AuthFailed"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: Recipient unknown
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /messages/queue/pop:
+    post:
+      tags: [message]
+      summary: Dequeue one message
+      description: Pop the next message from the queue
+      operationId: dequeueMessage
+      security:
+        - bearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                thread:
+                  type: string
+                  description: Optional thread filter
+      responses:
+        "200":
+          description: Message or null
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DequeueResponse"
+        "401":
+          $ref: "#/components/responses/AuthFailed"
+
+  /messages/dequeue:
+    post:
+      tags: [message]
+      summary: Dequeue one message (alias)
+      description: Alias for POST /messages/queue/pop
+      operationId: dequeueMessageAlias
+      security:
+        - bearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                thread:
+                  type: string
+      responses:
+        "200":
+          description: Message or null
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DequeueResponse"
+        "401":
+          $ref: "#/components/responses/AuthFailed"
+
+  /messages/queue:
+    delete:
+      tags: [message]
+      summary: Drain all messages
+      description: Drain all queued messages at once
+      operationId: drainMessages
+      security:
+        - bearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                thread:
+                  type: string
+      responses:
+        "200":
+          description: All messages
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [messages]
+                properties:
+                  messages:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Message"
+        "401":
+          $ref: "#/components/responses/AuthFailed"
+
+  /messages/pending:
+    get:
+      tags: [message]
+      summary: Count pending messages
+      description: Count messages waiting without consuming
+      operationId: getPendingCount
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Pending count
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [pending]
+                properties:
+                  pending:
+                    type: integer
+        "401":
+          $ref: "#/components/responses/AuthFailed"
+
+  /messages/latest/id:
+    get:
+      tags: [message]
+      summary: Peek latest message ID
+      description: |
+        Non-consuming peek at latest message ID.
+        Supports long-poll with ?since=N&wait=60
+      operationId: getLatestMessageId
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: since
+          in: query
+          schema:
+            type: integer
+          description: Wait for ID greater than this
+        - name: wait
+          in: query
+          schema:
+            type: integer
+          description: Max seconds to wait (max 300)
+      responses:
+        "200":
+          description: Latest message ID
+          content:
+            text/plain:
+              schema:
+                type: integer
+        "204":
+          description: Long-poll timeout
+        "404":
+          description: No messages
+        "401":
+          $ref: "#/components/responses/AuthFailed"
+
+  /messages/latest:
+    get:
+      tags: [message]
+      summary: Peek latest message
+      description: Non-consuming peek at full latest message
+      operationId: getLatestMessage
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Latest message
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [message]
+                properties:
+                  message:
+                    $ref: "#/components/schemas/Message"
+        "404":
+          description: No messages
+        "401":
+          $ref: "#/components/responses/AuthFailed"
+
+  /grants:
+    get:
+      tags: [grant]
+      summary: List your grants
+      description: List active grants you are party to
+      operationId: listGrants
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Grant list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [grants]
+                properties:
+                  grants:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/GrantInfo"
+        "401":
+          $ref: "#/components/responses/AuthFailed"
+
+  /grants/request:
+    post:
+      tags: [grant]
+      summary: Request a grant
+      description: Request a grant to reach a peer
+      operationId: requestGrant
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GrantRequestBody"
+      responses:
+        "200":
+          description: Request submitted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [request_id]
+                properties:
+                  request_id:
+                    type: string
+        "401":
+          $ref: "#/components/responses/AuthFailed"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /grants/requests/{id}:
+    patch:
+      tags: [grant]
+      summary: Act on grant request
+      description: Approve, deny, or hold a grant request
+      operationId: actOnGrantRequest
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GrantRequestActionBody"
+      responses:
+        "200":
+          description: Action taken
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [pending_recipient, established]
+        "204":
+          description: Denied or held
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/AuthFailed"
+
+  /grants/approve:
+    post:
+      tags: [grant]
+      summary: Approve grant directly
+      description: Governor directly approves a grant pair
+      operationId: approveGrant
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ApproveGrantBody"
+      responses:
+        "200":
+          description: Grant approved
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [grant_id]
+                properties:
+                  grant_id:
+                    type: string
+                  direction:
+                    type: string
+                  max_messages:
+                    type: integer
+                    nullable: true
+                  mediation:
+                    type: string
+                  conditions:
+                    type: string
+                    nullable: true
+        "401":
+          $ref: "#/components/responses/AuthFailed"
+
+  /grants/block:
+    post:
+      tags: [grant]
+      summary: Block a pair
+      description: Persistently block a sender-recipient pair
+      operationId: blockGrant
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GrantBlockBody"
+      responses:
+        "204":
+          description: Blocked
+        "401":
+          $ref: "#/components/responses/AuthFailed"
+
+  /grants/unblock:
+    post:
+      tags: [grant]
+      summary: Unblock a pair
+      description: Remove a persistent block
+      operationId: unblockGrant
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GrantUnblockBody"
+      responses:
+        "204":
+          description: Unblocked
+        "401":
+          $ref: "#/components/responses/AuthFailed"
+
+  /grants/{id}:
+    delete:
+      tags: [grant]
+      summary: Revoke grant
+      description: Revoke a grant by ID (governor only)
+      operationId: revokeGrant
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Revoked
+        "401":
+          $ref: "#/components/responses/AuthFailed"
+        "404":
+          description: Grant not found
+
+  /governors/claim:
+    post:
+      tags: [governor]
+      summary: Claim governorship
+      description: Claim governorship (may auto-grant, trigger election, or request transfer)
+      operationId: claimGovernorship
+      security:
+        - bearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                expiry_secs:
+                  type: integer
+      responses:
+        "200":
+          description: Granted immediately
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, governor_token]
+                properties:
+                  status:
+                    type: string
+                    enum: [granted]
+                  governor_token:
+                    type: string
+        "202":
+          description: Election or transfer pending
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [status, claim_id, voters]
+                    properties:
+                      status:
+                        type: string
+                        enum: [election]
+                      claim_id:
+                        type: string
+                      voters:
+                        type: integer
+                  - type: object
+                    required: [status, claim_id]
+                    properties:
+                      status:
+                        type: string
+                        enum: [transfer_pending]
+                      claim_id:
+                        type: string
+        "401":
+          $ref: "#/components/responses/AuthFailed"
+
+  /governors/elections/{id}:
+    post:
+      tags: [governor]
+      summary: Vote on election
+      description: Vote on a pending election or transfer
+      operationId: voteElection
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action]
+              properties:
+                action:
+                  type: string
+                  enum: [approve, reject]
+      responses:
+        "200":
+          description: Vote recorded
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [waiting, established, rejected]
+                  approved:
+                    type: integer
+                  required:
+                    type: integer
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/AuthFailed"
+
+  /governors/refresh:
+    post:
+      tags: [governor]
+      summary: Refresh governor token
+      description: Rotate the governor token
+      operationId: refreshGovernorToken
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: New token
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [token]
+                properties:
+                  token:
+                    type: string
+        "401":
+          $ref: "#/components/responses/AuthFailed"
+
+  /governors/transfer:
+    post:
+      tags: [governor]
+      summary: Initiate governor transfer
+      description: Create a transfer token for handing off governor authority
+      operationId: transferGovernor
+      security:
+        - bearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                to:
+                  type: string
+                  description: Optional target identity
+      responses:
+        "200":
+          description: Transfer token created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [transfer_token]
+                properties:
+                  transfer_token:
+                    type: string
+        "401":
+          $ref: "#/components/responses/AuthFailed"
+
+  /governors/accept-transfer:
+    post:
+      tags: [governor]
+      summary: Accept governor transfer
+      description: Accept a governor transfer using the transfer token
+      operationId: acceptGovernorTransfer
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+      responses:
+        "200":
+          description: Transfer accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [token]
+                properties:
+                  token:
+                    type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/AuthFailed"
+
+  /governors/mediate:
+    post:
+      tags: [governor]
+      summary: Resolve mediation
+      description: Resolve a mediation hold (approve, block, or modify)
+      operationId: mediate
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MediateBody"
+      responses:
+        "200":
+          description: Mediation resolved
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [delivered, blocked]
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/AuthFailed"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /governors/events:
+    get:
+      tags: [governor]
+      summary: Governor events SSE
+      description: SSE stream of governor-relevant events
+      operationId: getGovernorEvents
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: SSE stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        "401":
+          $ref: "#/components/responses/AuthFailed"
+
+  /governors/grants:
+    get:
+      tags: [governor]
+      summary: List all grants
+      description: List all active grants in the system (governor only)
+      operationId: listAllGrants
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: participant
+          in: query
+          schema:
+            type: string
+          description: Filter by participant name
+      responses:
+        "200":
+          description: All grants
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [grants]
+                properties:
+                  grants:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/FullGrantInfo"
+        "401":
+          $ref: "#/components/responses/AuthFailed"
+
+  /introduce:
+    post:
+      tags: [dcp]
+      summary: Introduce (DCP)
+      description: Mint a new DCP identity (TOFU for dogfood phase)
+      operationId: introduce
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [handle, sub_id]
+              properties:
+                handle:
+                  type: string
+                sub_id:
+                  type: string
+      responses:
+        "200":
+          description: Identity created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [auth_token, hint]
+                properties:
+                  auth_token:
+                    type: string
+                  hint:
+                    type: string
+        "409":
+          description: Handle exists
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HandleExistsError"
+
+  /connect-probe-ack:
+    post:
+      tags: [dcp]
+      summary: Acknowledge probe (DCP)
+      description: Acknowledge the DCP nonce probe to complete connection
+      operationId: probeAck
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [nonce, sub_id]
+              properties:
+                nonce:
+                  type: string
+                sub_id:
+                  type: string
+      responses:
+        "200":
+          description: Connected
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [connected]
+        "401":
+          $ref: "#/components/responses/AuthFailed"
+
+  /attachments:
+    post:
+      tags: [attachment]
+      summary: Upload attachment
+      description: Upload a file attachment (raw bytes in body)
+      operationId: uploadAttachment
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: to
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Recipient name
+        - name: filename
+          in: query
+          schema:
+            type: string
+          description: Filename
+        - name: note
+          in: query
+          schema:
+            type: string
+          description: Optional note
+      requestBody:
+        required: true
+        content:
+          "*/*":
+            schema:
+              type: string
+              format: binary
+      responses:
+        "201":
+          description: Attachment created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AttachmentMeta"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/AuthFailed"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: Recipient unknown
+        "413":
+          description: Payload too large
+
+  /attachments/{id}:
+    get:
+      tags: [attachment]
+      summary: Download attachment
+      description: Download attachment by ID (sender or recipient only)
+      operationId: downloadAttachment
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Attachment bytes
+          content:
+            "*/*":
+              schema:
+                type: string
+                format: binary
+        "401":
+          $ref: "#/components/responses/AuthFailed"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: Attachment not found
+
+  /room/create:
+    post:
+      tags: [room]
+      summary: Create room
+      description: Create a new room (caller is NOT auto-joined)
+      operationId: createRoom
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Room created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [room_id]
+                properties:
+                  room_id:
+                    type: string
+        "401":
+          $ref: "#/components/responses/AuthFailed"
+    get:
+      tags: [room]
+      summary: Reserved path
+      description: "\"create\" is reserved and cannot be used as a room_id"
+      operationId: createRoomReserved
+      security: []
+      responses:
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /room/{room_id}/join:
+    post:
+      tags: [room]
+      summary: Join room
+      description: Join a room (idempotent, re-join resets TTL)
+      operationId: joinRoom
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: room_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ttl:
+                  type: integer
+                  description: TTL in seconds
+      responses:
+        "200":
+          description: Joined
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [members]
+                properties:
+                  members:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/RoomMember"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/AuthFailed"
+        "404":
+          description: Room not found
+
+  /room/{room_id}:
+    get:
+      tags: [room]
+      summary: Get room members
+      description: Get room members (must be a member)
+      operationId: getRoomMembers
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: room_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Members
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [members]
+                properties:
+                  members:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/RoomMember"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/AuthFailed"
+        "403":
+          description: Not a member
+        "404":
+          description: Room not found
+
+  /room/{room_id}/leave:
+    post:
+      tags: [room]
+      summary: Leave room
+      description: Leave a room (idempotent)
+      operationId: leaveRoom
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: room_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Left
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [ok]
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/AuthFailed"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        Token types vary by endpoint:
+        - `listen-token`: participant operations
+        - `governor-token`: governor operations
+        - `transfer_token`: governor transfer acceptance
+        - `dcp_auth_token`: DCP connect-probe-ack
+
+  responses:
+    AuthFailed:
+      description: Authentication failed
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: AUTH_FAILED
+            message: authentication required
+    Forbidden:
+      description: Access forbidden (no grant, blocked, etc.)
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Conflict:
+      description: Conflict (name in use, request pending, etc.)
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    BadRequest:
+      description: Bad request
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: BAD_REQUEST
+            message: bad request
+
+  schemas:
+    Error:
+      type: object
+      required: [error, message]
+      properties:
+        error:
+          type: string
+          enum:
+            - AUTH_FAILED
+            - TOKEN_EXPIRED
+            - TOKEN_REVOKED
+            - TOKEN_REJECTED
+            - FORBIDDEN
+            - NAME_IN_USE
+            - NO_GRANT
+            - GRANT_EXPIRED
+            - GRANT_EXHAUSTED
+            - GRANT_BLOCKED
+            - REQUEST_PENDING
+            - RECIPIENT_OFFLINE
+            - RECIPIENT_UNKNOWN
+            - ANNOUNCE_REQUIRED
+            - BAD_REQUEST
+            - BRIEF_REQUIRED
+            - MEDIATION_UNAVAILABLE
+            - BLOCKED
+            - HANDLE_EXISTS
+            - IDENTITY_NOT_FOUND
+            - PROBE_EXPIRED
+            - PROBE_INVALID
+            - NOT_CONNECTED
+            - ATTACHMENT_NOT_FOUND
+            - ACTIVE_SUBSCRIPTION
+            - INTERNAL
+        message:
+          type: string
+        hint:
+          type: string
+        reason:
+          type: string
+
+    DiscoveryDocument:
+      type: object
+      description: Machine-readable API discovery document
+
+    AnnounceBody:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+        force:
+          type: boolean
+          default: false
+
+    DcpAnnounceBody:
+      type: object
+      required: [handle, sub_id]
+      properties:
+        handle:
+          type: string
+        sub_id:
+          type: string
+        force:
+          type: boolean
+          default: false
+
+    NameInUseError:
+      type: object
+      required: [error, message, resolution]
+      properties:
+        error:
+          type: string
+          enum: [NAME_IN_USE]
+        message:
+          type: string
+        resolution_stream:
+          type: string
+        resolution:
+          type: string
+
+    HandleExistsError:
+      type: object
+      required: [error, message, hint]
+      properties:
+        error:
+          type: string
+          enum: [HANDLE_EXISTS]
+        message:
+          type: string
+        hint:
+          type: string
+
+    ParticipantInfo:
+      type: object
+      required: [name, identity, status]
+      properties:
+        name:
+          type: string
+        identity:
+          type: string
+        status:
+          type: string
+
+    SendMessageBody:
+      type: object
+      required: [payload]
+      properties:
+        to:
+          type: string
+          description: Recipient name
+        to_token:
+          type: string
+          description: Recipient token (alternative to to)
+        payload:
+          type: string
+        reason:
+          type: string
+        thread_id:
+          type: string
+
+    Message:
+      type: object
+      required: [payload, from]
+      properties:
+        payload:
+          type: string
+        from:
+          type: string
+        reason:
+          type: string
+        event_type:
+          type: string
+        thread_id:
+          type: string
+
+    DequeueResponse:
+      type: object
+      required: [message, remaining]
+      properties:
+        message:
+          oneOf:
+            - $ref: "#/components/schemas/Message"
+            - type: "null"
+        remaining:
+          type: integer
+
+    GrantInfo:
+      type: object
+      required: [id, counterparty, direction]
+      properties:
+        id:
+          type: string
+        counterparty:
+          type: string
+        direction:
+          type: string
+          enum: [symmetric, a_to_b, b_to_a]
+        expires:
+          type: string
+          format: date-time
+          nullable: true
+
+    FullGrantInfo:
+      type: object
+      required: [id, identity_a, identity_b, direction]
+      properties:
+        id:
+          type: string
+        identity_a:
+          type: string
+        identity_b:
+          type: string
+        name_a:
+          type: string
+          nullable: true
+        name_b:
+          type: string
+          nullable: true
+        direction:
+          type: string
+          enum: [symmetric, a_to_b, b_to_a]
+        expires:
+          type: string
+          format: date-time
+          nullable: true
+
+    GrantRequestBody:
+      type: object
+      required: [to]
+      properties:
+        to:
+          type: string
+        reason:
+          type: string
+        request_id:
+          type: string
+          description: Re-use a held request
+
+    GrantRequestActionBody:
+      type: object
+      required: [action]
+      properties:
+        action:
+          type: string
+          enum: [approve, deny, hold]
+        reason:
+          type: string
+        expiry_secs:
+          type: integer
+        expires_at:
+          type: integer
+
+    ApproveGrantBody:
+      type: object
+      required: [identity_a, identity_b]
+      properties:
+        identity_a:
+          type: string
+        identity_b:
+          type: string
+        expiry_secs:
+          type: integer
+        direction:
+          type: string
+          enum: [symmetric, a_to_b, b_to_a]
+          default: symmetric
+        max_messages:
+          type: integer
+        mediation:
+          type: string
+          enum: [bypass, inspect, notify]
+          default: bypass
+        opens_reply_window:
+          type: boolean
+        conditions:
+          type: string
+
+    GrantBlockBody:
+      type: object
+      required: [from_identity, to_name]
+      properties:
+        from_identity:
+          type: string
+        to_name:
+          type: string
+        reason:
+          type: string
+          description: Optional reason for the block
+        expires_at:
+          type: integer
+
+    GrantUnblockBody:
+      type: object
+      required: [from_identity, to_name]
+      properties:
+        from_identity:
+          type: string
+        to_name:
+          type: string
+
+    MediateBody:
+      type: object
+      required: [mediation_id, decision]
+      properties:
+        mediation_id:
+          type: string
+        decision:
+          type: string
+          enum: [approve, block, modify]
+        payload:
+          type: string
+          description: Required for modify decision
+
+    AttachmentMeta:
+      type: object
+      required: [attachment_id, filename, mime, size]
+      properties:
+        attachment_id:
+          type: string
+        filename:
+          type: string
+        mime:
+          type: string
+        size:
+          type: integer
+
+    RoomMember:
+      type: object
+      required: [name, online]
+      properties:
+        name:
+          type: string
+        online:
+          type: boolean

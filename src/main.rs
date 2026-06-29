@@ -154,20 +154,15 @@ async fn main() {
                 eprintln!("WARNING: could not load grants from store: {e}");
                 vec![]
             });
-            let identities = store.load_identities().await.unwrap_or_else(|e| {
-                eprintln!("WARNING: could not load DCP identities from store: {e}");
-                vec![]
-            });
             let denial_blocks = store.load_denial_blocks().await.unwrap_or_else(|e| {
                 eprintln!("WARNING: could not load denial blocks from store: {e}");
                 vec![]
             });
             eprintln!(
-                "Token store: {} (loaded {} tokens, {} grants, {} DCP identities, {} denial blocks)",
+                "Token store: {} (loaded {} tokens, {} grants, {} denial blocks)",
                 db_path,
                 tokens.len(),
                 grants.len(),
-                identities.len(),
                 denial_blocks.len()
             );
             let hub = simple_im::delivery::DeliveryHub::new_with_persisted_state(
@@ -175,7 +170,6 @@ async fn main() {
                 store,
                 tokens,
                 grants,
-                identities,
                 denial_blocks,
             );
             let state = Arc::new(AppState::new_with_hub(hub));
@@ -193,7 +187,7 @@ async fn main() {
 async fn run(insecure_http: bool, addr: SocketAddr, state: Arc<AppState>) {
     // Debug (15-DEBUG): periodic in-memory state-size snapshot to stderr every 30s, so
     // unbounded growth (the OOM hypothesis) shows up in `docker logs` as a rising count
-    // on a specific collection (e.g. dcp_probes). Spawned before the router takes state.
+    // on a specific collection. Spawned before the router takes state.
     {
         let state_for_log = Arc::clone(&state);
         tokio::spawn(async move {

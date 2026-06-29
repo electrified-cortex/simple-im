@@ -11,8 +11,7 @@ use tokio::time::timeout;
 
 use crate::error::Error;
 use crate::persistence::{
-    PersistedDenialBlock, PersistedGrant, PersistedIdentity, PersistedToken, StoredAttachment,
-    TokenStore,
+    PersistedDenialBlock, PersistedGrant, PersistedToken, StoredAttachment, TokenStore,
 };
 use crate::registry::{ParticipantIdentity, PresenceScope, Registry};
 use crate::trust::{ApproveGrantRequest, GrantMediation, TrustChain};
@@ -198,7 +197,7 @@ pub enum AnnounceResult {
 }
 
 /// State for a self-issued listen token.
-struct V2TokenState {
+struct ListenTokenState {
     issued_at: Instant,
     ever_listened: bool,
     ever_granted: bool,
@@ -225,10 +224,10 @@ struct V2TokenState {
     pending_first_listen: bool,
 }
 
-impl V2TokenState {
+impl ListenTokenState {
     fn new() -> Self {
         let (msg_id_tx, _msg_id_rx) = watch::channel(0u64);
-        V2TokenState {
+        ListenTokenState {
             issued_at: Instant::now(),
             ever_listened: false,
             ever_granted: false,
@@ -248,36 +247,6 @@ impl V2TokenState {
     fn is_sse_alive_in_hub(token: &str, sse_connections: &HashMap<String, usize>) -> bool {
         sse_connections.get(token).copied().unwrap_or(0) > 0
     }
-}
-
-// ── DCP structs ───────────────────────────────────────────────────────────────
-
-/// DCP: durable identity entry (handle-keyed)
-struct DcpIdentity {
-    #[allow(dead_code)]
-    handle: String,
-    auth_token: String,
-}
-
-/// DCP: ephemeral subscription entry (one per /listen call)
-struct DcpSub {
-    sub_id: String,         // first event to agent: {"type":"sub","sub_id":"..."}
-    sub_token: String,      // for /listen/cancel pre-announce bail
-    handle: Option<String>, // None until introduce/announce
-    sse_sender: Option<mpsc::UnboundedSender<String>>,
-    #[allow(dead_code)]
-    created_at: std::time::Instant,
-}
-
-/// DCP: connect_probe entry (single-use, expires)
-struct DcpProbe {
-    nonce: String, // CSPRNG ≥128 bits hex
-    sub_id: String,
-    handle: String,
-    #[allow(dead_code)]
-    probe_instance: String, // unique per probe emission
-    expires_at: std::time::Instant,
-    used: bool,
 }
 
 // ── Internal structs ──────────────────────────────────────────────────────────
@@ -330,33 +299,21 @@ struct HubInner {
     req_counter: u64,
     gov_events: broadcast::Sender<String>,
     /// Self-issued listen token state (keyed by token string).
-    listen_tokens: HashMap<String, V2TokenState>,
+    listen_tokens: HashMap<String, ListenTokenState>,
     /// Maps announced name → token (for name-claim lookup).
     name_to_token: HashMap<String, String>,
     /// Active SSE connection count per token.
     sse_connections: HashMap<String, usize>,
     /// TTL for never-listened tokens.
-    v2_gc_ttl_unlisten: Duration,
+    gc_ttl_unlisten: Duration,
     /// TTL for listened-but-never-granted tokens.
-    v2_gc_ttl_no_grant: Duration,
+    gc_ttl_no_grant: Duration,
     /// Grace window for `pending_first_listen` tokens; overridable in tests.
     /// After this duration, even tokens with `pending_first_listen=true` become
     /// eligible for `unlisten_ttl` eviction. (sim-gc-registration-grace-cap)
-    v2_gc_registration_grace: Duration,
+    gc_registration_grace: Duration,
     /// Persistent denial blocks keyed on (from_identity, to_name).
     denial_blocks: HashMap<(String, String), DenialBlock>,
-    // DCP identity store: handle → DcpIdentity
-    dcp_identities: HashMap<String, DcpIdentity>,
-    // auth_token → handle (reverse lookup)
-    dcp_auth_to_handle: HashMap<String, String>,
-    // sub_id → DcpSub
-    dcp_subs: HashMap<String, DcpSub>,
-    // sub_token → sub_id
-    dcp_sub_token_to_id: HashMap<String, String>,
-    // probe key → DcpProbe (key: "{sub_id}:{probe_instance}")
-    dcp_probes: HashMap<String, DcpProbe>,
-    // grant integrity: handle → Vec<grant_id> (expected set for CONNECTED check)
-    dcp_expected_grants: HashMap<String, Vec<String>>,
     /// Guards the one-time startup announce: true after sim_online has been sent.
     startup_announced: bool,
     /// In-memory governance claims (election / transfer); ephemeral — lost on restart.
@@ -392,9 +349,9 @@ impl HubInner {
     ///
     /// Two resolution paths (15-0002F fix):
     ///   1. Name path — look up counterparty by name in `name_to_token` → `listen_tokens`.
-    ///      Covers V2 listen-flow agents and minted agents whose name was stored in the grant.
+    ///      Covers listen-flow agents and minted agents whose name was stored in the grant.
     ///   2. Identity path — try the counterparty's raw identity as a key in `listen_tokens`
-    ///      directly.  V2 listen-flow agents have identity == listen token, so this covers
+    ///      directly.  listen-flow agents have identity == listen token, so this covers
     ///      grants where only the identity (not the name) was stored at creation time.
     ///
     /// Minted-agent grant-peers (registered via /register, not /listen) have no stored SSE
@@ -424,7 +381,7 @@ impl HubInner {
                 .cloned();
 
             // Path 2: if name path finds nothing, try the counterparty's identity as a token key.
-            // V2 listen-flow agents store identity == listen token, so this covers grants
+            // listen-flow agents store identity == listen token, so this covers grants
             // where name_b (or name_a) was not set at grant-creation time.
             let tok_opt = tok_opt.or_else(|| {
                 if self.listen_tokens.contains_key(cp_identity.as_str()) {
@@ -494,7 +451,7 @@ impl HubInner {
     /// Sets notify_suppressed = true (interlock). Returns (sender, pending_count) if fired.
     fn take_notify(&mut self, name: &str) -> Option<(mpsc::UnboundedSender<String>, usize)> {
         let token = self.name_to_token.get(name)?.clone();
-        let is_alive = V2TokenState::is_sse_alive_in_hub(&token, &self.sse_connections);
+        let is_alive = ListenTokenState::is_sse_alive_in_hub(&token, &self.sse_connections);
         let state = self.listen_tokens.get_mut(&token)?;
         if state.notify_suppressed || !is_alive {
             return None;
@@ -533,9 +490,9 @@ impl HubInner {
     /// for every entry after releasing the lock** (out-of-lock, silent drop). (15-0002H)
     fn gc_tokens(&mut self) -> Vec<(Vec<mpsc::UnboundedSender<String>>, String)> {
         let now = Instant::now();
-        let unlisten_ttl = self.v2_gc_ttl_unlisten;
-        let no_grant_ttl = self.v2_gc_ttl_no_grant;
-        let registration_grace = self.v2_gc_registration_grace;
+        let unlisten_ttl = self.gc_ttl_unlisten;
+        let no_grant_ttl = self.gc_ttl_no_grant;
+        let registration_grace = self.gc_registration_grace;
 
         // Branch 1: !ever_listened && !ever_granted — never subscribed and never granted; safe to
         //   collect after unlisten_ttl. No presence event: ever_granted=false → no grant-peers.
@@ -675,8 +632,8 @@ impl DeliveryHub {
     pub fn new(lapse_after: Duration) -> Self {
         let reply_ttl = clamp_env_secs("SIMPLE_IM_REPLY_TTL_SECS", 5, 600, 120);
         let hold_ttl = clamp_env_secs("SIMPLE_IM_HOLD_TTL_SECS", 10, 300, 60);
-        let v2_gc_ttl_unlisten = clamp_env_secs("SIMPLE_IM_V2_GC_UNLISTEN_SECS", 60, 3600, 300);
-        let v2_gc_ttl_no_grant = clamp_env_secs("SIMPLE_IM_V2_GC_NO_GRANT_SECS", 120, 7200, 1800);
+        let gc_ttl_unlisten = clamp_env_secs("SIMPLE_IM_GC_UNLISTEN_SECS", 60, 3600, 300);
+        let gc_ttl_no_grant = clamp_env_secs("SIMPLE_IM_GC_NO_GRANT_SECS", 120, 7200, 1800);
         let (gov_events, _) = broadcast::channel(64);
         Self {
             inner: Mutex::new(HubInner {
@@ -698,16 +655,10 @@ impl DeliveryHub {
                 listen_tokens: HashMap::new(),
                 name_to_token: HashMap::new(),
                 sse_connections: HashMap::new(),
-                v2_gc_ttl_unlisten,
-                v2_gc_ttl_no_grant,
-                v2_gc_registration_grace: REGISTRATION_GRACE,
+                gc_ttl_unlisten,
+                gc_ttl_no_grant,
+                gc_registration_grace: REGISTRATION_GRACE,
                 denial_blocks: HashMap::new(),
-                dcp_identities: HashMap::new(),
-                dcp_auth_to_handle: HashMap::new(),
-                dcp_subs: HashMap::new(),
-                dcp_sub_token_to_id: HashMap::new(),
-                dcp_probes: HashMap::new(),
-                dcp_expected_grants: HashMap::new(),
                 startup_announced: false,
                 pending_claims: HashMap::new(),
                 claim_counter: 0,
@@ -722,7 +673,6 @@ impl DeliveryHub {
         token_store: Arc<TokenStore>,
         persisted_tokens: Vec<PersistedToken>,
         persisted_grants: Vec<PersistedGrant>,
-        persisted_identities: Vec<PersistedIdentity>,
         persisted_denial_blocks: Vec<PersistedDenialBlock>,
     ) -> Self {
         let mut hub = Self::new(lapse_after);
@@ -734,7 +684,7 @@ impl DeliveryHub {
                     .partition(|t| t.token_type == "listen");
             inner.trust.load_from_store(regular_toks, persisted_grants);
             for t in listen_toks {
-                let mut state = V2TokenState::new();
+                let mut state = ListenTokenState::new();
                 state.ever_listened = true;
                 state.ever_granted = true;
                 // Restore name bindings so the agent is reachable while offline.
@@ -752,19 +702,6 @@ impl DeliveryHub {
                     );
                 }
                 inner.listen_tokens.insert(t.token, state);
-            }
-            // DCP: restore durable identities. No active subs after restart (subs are ephemeral).
-            for pi in persisted_identities {
-                inner
-                    .dcp_auth_to_handle
-                    .insert(pi.auth_token.clone(), pi.handle.clone());
-                inner.dcp_identities.insert(
-                    pi.handle.clone(),
-                    DcpIdentity {
-                        handle: pi.handle,
-                        auth_token: pi.auth_token,
-                    },
-                );
             }
             // Load persisted denial blocks.
             for block in persisted_denial_blocks {
@@ -821,7 +758,7 @@ impl DeliveryHub {
     /// enforced by `clamp_env_secs`.  Only compiled in `#[cfg(test)]`.
     #[cfg(test)]
     fn set_gc_unlisten_ttl_for_test(&self, ttl: Duration) {
-        self.lock().v2_gc_ttl_unlisten = ttl;
+        self.lock().gc_ttl_unlisten = ttl;
     }
 
     /// Trigger GC inline (test seam).  Returns the count of tokens evicted.
@@ -844,7 +781,7 @@ impl DeliveryHub {
     /// Only compiled in `#[cfg(test)]`.  (sim-gc-registration-grace-cap)
     #[cfg(test)]
     fn set_gc_registration_grace_for_test(&self, grace: Duration) {
-        self.lock().v2_gc_registration_grace = grace;
+        self.lock().gc_registration_grace = grace;
     }
 
     /// Subscribe to the governor event broadcast channel (governance notices, concurrent-use alerts).
@@ -854,19 +791,16 @@ impl DeliveryHub {
 
     /// Debug (15-DEBUG): snapshot of in-memory collection sizes for leak/OOM diagnosis.
     /// Logged every 30s by the periodic task in `main::run`. A steadily rising count on
-    /// any one collection (notably `dcp_probes`, which is never pruned) points at the
-    /// leak; flat counts across a crash interval argue against OOM (look at panic log).
+    /// any one collection points at the leak; flat counts across a crash interval argue
+    /// against OOM (look at panic log).
     pub fn debug_state_sizes(&self) -> String {
         let inner = self.lock();
         let queued_msgs: usize = inner.message_queues.values().map(|q| q.len()).sum();
         format!(
-            "listen_tokens={} dcp_subs={} dcp_probes={} dcp_identities={} agents={} \
+            "listen_tokens={} agents={} \
              name_to_token={} token_to_name={} queues={} queued_msgs={} conn_reqs={} \
              reply_windows={} mediation_holds={} denial_blocks={} sse_conns={} active_sse={}",
             inner.listen_tokens.len(),
-            inner.dcp_subs.len(),
-            inner.dcp_probes.len(),
-            inner.dcp_identities.len(),
             inner.agents.len(),
             inner.name_to_token.len(),
             inner.token_to_name.len(),
@@ -976,7 +910,7 @@ impl DeliveryHub {
                             .name_to_token
                             .get(*n)
                             .map(|tok| {
-                                V2TokenState::is_sse_alive_in_hub(tok, &inner.sse_connections)
+                                ListenTokenState::is_sse_alive_in_hub(tok, &inner.sse_connections)
                             })
                             .unwrap_or(false)
                     })
@@ -1046,8 +980,8 @@ impl DeliveryHub {
                     inner.increment_msg_id_for_name(voter_name);
 
                     let notify = inner.agents.get(voter_name).map(|s| Arc::clone(&s.notify));
-                    let v2n = inner.take_notify(voter_name);
-                    notify_pairs.push((voter_name.clone(), msg_json, notify, v2n));
+                    let ntx = inner.take_notify(voter_name);
+                    notify_pairs.push((voter_name.clone(), msg_json, notify, ntx));
                 }
 
                 inner.pending_claims.insert(
@@ -1067,11 +1001,11 @@ impl DeliveryHub {
         }; // lock released
 
         // Fire notifies out of lock.
-        for (_, _, notify, v2n) in notify_pairs {
+        for (_, _, notify, ntx) in notify_pairs {
             if let Some(n) = notify {
                 n.notify_one();
             }
-            if let Some((sender, pending)) = v2n {
+            if let Some((sender, pending)) = ntx {
                 let _ = sender.send(format!(r#"{{"type":"notify","pending":{}}}"#, pending));
             }
         }
@@ -1161,14 +1095,14 @@ impl DeliveryHub {
                     .agents
                     .get(&candidate_name)
                     .map(|s| Arc::clone(&s.notify));
-                let v2n = inner.take_notify(&candidate_name);
+                let ntx = inner.take_notify(&candidate_name);
 
                 return {
                     drop(inner);
                     if let Some(n) = notify {
                         n.notify_one();
                     }
-                    if let Some((sender, pending)) = v2n {
+                    if let Some((sender, pending)) = ntx {
                         let _ =
                             sender.send(format!(r#"{{"type":"notify","pending":{}}}"#, pending));
                     }
@@ -1231,7 +1165,7 @@ impl DeliveryHub {
                 .agents
                 .get(&candidate_name)
                 .map(|s| Arc::clone(&s.notify));
-            let v2n = inner.take_notify(&candidate_name);
+            let ntx = inner.take_notify(&candidate_name);
             let _ = candidate_token; // used above for token resolution; captured for completeness
 
             (
@@ -1239,11 +1173,11 @@ impl DeliveryHub {
                     candidate_name: candidate_name.clone(),
                     governor_token: gov_tok_str.clone(),
                 },
-                Some((gov_tok_str, notify, v2n)),
+                Some((gov_tok_str, notify, ntx)),
             )
         }; // lock released
 
-        if let Some((tok, notify, v2n)) = post_lock {
+        if let Some((tok, notify, ntx)) = post_lock {
             // Persist the new governor token.
             if let Some(store) = self.token_store.clone() {
                 let t = tok.clone();
@@ -1256,7 +1190,7 @@ impl DeliveryHub {
             if let Some(n) = notify {
                 n.notify_one();
             }
-            if let Some((sender, pending)) = v2n {
+            if let Some((sender, pending)) = ntx {
                 let _ = sender.send(format!(r#"{{"type":"notify","pending":{}}}"#, pending));
             }
         }
@@ -1514,7 +1448,7 @@ impl DeliveryHub {
         _reason: Option<String>,
         thread_id: Option<String>,
     ) -> Result<Ack, Error> {
-        let (notify_arc, consumed_grant_id, v2_notify): (
+        let (notify_arc, consumed_grant_id, notify_val): (
             Option<Arc<tokio::sync::Notify>>,
             Option<String>,
             Option<(mpsc::UnboundedSender<String>, usize)>,
@@ -1674,11 +1608,11 @@ impl DeliveryHub {
                             });
                         }
                         let _ = inner.gov_events.send(notify_json);
-                        let v2n = inner.take_notify(to_name);
+                        let ntx = inner.take_notify(to_name);
                         (
                             inner.agents.get(to_name).map(|s| Arc::clone(&s.notify)),
                             Some(gid),
-                            v2n,
+                            ntx,
                         )
                     }
                     GrantMediation::Bypass => {
@@ -1707,11 +1641,11 @@ impl DeliveryHub {
                                 used: false,
                             });
                         }
-                        let v2n = inner.take_notify(to_name);
+                        let ntx = inner.take_notify(to_name);
                         (
                             inner.agents.get(to_name).map(|s| Arc::clone(&s.notify)),
                             Some(gid),
-                            v2n,
+                            ntx,
                         )
                     }
                 },
@@ -1748,11 +1682,11 @@ impl DeliveryHub {
                             expires,
                             used: false,
                         });
-                        let v2n = inner.take_notify(to_name);
+                        let ntx = inner.take_notify(to_name);
                         (
                             inner.agents.get(to_name).map(|s| Arc::clone(&s.notify)),
                             None,
-                            v2n,
+                            ntx,
                         )
                     } else {
                         // No window — propagate the error. NoGrant: push a one-time hint
@@ -1764,7 +1698,7 @@ impl DeliveryHub {
                                     .connection_requests
                                     .values()
                                     .any(|r| r.from_name == from_name && r.to_name == to_name);
-                                let sender_v2_notify = if !already_pending {
+                                let sender_notify_val = if !already_pending {
                                     let hint = serde_json::json!({
                                         "type": "system",
                                         "event": "no_grant",
@@ -1791,7 +1725,7 @@ impl DeliveryHub {
                                     None
                                 };
                                 drop(inner);
-                                if let Some((sender, pending)) = sender_v2_notify {
+                                if let Some((sender, pending)) = sender_notify_val {
                                     let _ = sender.send(format!(
                                         r#"{{"type":"notify","pending":{}}}"#,
                                         pending
@@ -1821,7 +1755,7 @@ impl DeliveryHub {
         }
 
         // Fire SSE NOTIFY event if recipient is a listen-flow agent.
-        if let Some((sender, pending)) = v2_notify {
+        if let Some((sender, pending)) = notify_val {
             let event = format!(r#"{{"type":"notify","pending":{}}}"#, pending);
             let _ = sender.send(event);
         }
@@ -1925,7 +1859,7 @@ impl DeliveryHub {
             .map_err(|_| Error::Internal)?;
 
         // Phase 3 — queue the metadata-only notify to the recipient (sync lock).
-        let (notify_arc, v2_notify) = {
+        let (notify_arc, notify_val) = {
             let mut inner = self.lock();
             let payload_json = serde_json::json!({
                 "type": "attachment",
@@ -1951,16 +1885,16 @@ impl DeliveryHub {
                 });
             inner.kick_pending.insert(to_name.to_string());
             inner.increment_msg_id_for_name(to_name);
-            let v2 = inner.take_notify(to_name);
+            let ntx_result = inner.take_notify(to_name);
             let arc = inner.agents.get(to_name).map(|s| Arc::clone(&s.notify));
-            (arc, v2)
+            (arc, ntx_result)
         };
 
         // Phase 4 — fire wakeups out of lock.
         if let Some(n) = notify_arc {
             n.notify_one();
         }
-        if let Some((sender, pending)) = v2_notify {
+        if let Some((sender, pending)) = notify_val {
             let _ = sender.send(format!(r#"{{"type":"notify","pending":{}}}"#, pending));
         }
 
@@ -2032,7 +1966,7 @@ impl DeliveryHub {
         mediation_id: &str,
         decision: MediationDecision,
     ) -> Result<MediationResult, Error> {
-        let (to_name, notify, consumed_grant_id, v2n) = {
+        let (to_name, notify, consumed_grant_id, ntx) = {
             let mut inner = self.lock();
             inner.prune_expired();
             inner.trust.validate_governor_token(gov_token)?;
@@ -2121,8 +2055,8 @@ impl DeliveryHub {
                 .agents
                 .get(&to_name_clone)
                 .map(|s| Arc::clone(&s.notify));
-            let v2n = inner.take_notify(&to_name_clone);
-            (to_name_clone, notify, consumed_grant_id, v2n)
+            let ntx = inner.take_notify(&to_name_clone);
+            (to_name_clone, notify, consumed_grant_id, ntx)
         }; // lock released
 
         // Persist grant usage increment after successful queue delivery.
@@ -2138,7 +2072,7 @@ impl DeliveryHub {
             n.notify_one();
         }
 
-        if let Some((sender, pending)) = v2n {
+        if let Some((sender, pending)) = ntx {
             let event = format!(r#"{{"type":"notify","pending":{}}}"#, pending);
             let _ = sender.send(event);
         }
@@ -2218,8 +2152,8 @@ impl DeliveryHub {
                 .connection_requests
                 .retain(|_, r| r.from_name != name && r.to_name != name);
             // listen-token revoke
-            let sse_sender = if let Some(v2_tok) = inner.name_to_token.remove(name) {
-                if let Some(state) = inner.listen_tokens.get_mut(&v2_tok) {
+            let sse_sender = if let Some(listen_tok) = inner.name_to_token.remove(name) {
+                if let Some(state) = inner.listen_tokens.get_mut(&listen_tok) {
                     state.revoked = true;
                     state.sse_sender.take()
                 } else {
@@ -2323,13 +2257,13 @@ impl DeliveryHub {
                 // Fix 3: listen-flow agents track SSE by token, not by name — check sse_connections first.
                 // AC2 fix: also check registry liveness so roster shows online after announce+SSE-drop.
                 let is_online = if let Some(tok) = inner.name_to_token.get(name) {
-                    let v2_hidden = inner
+                    let listen_hidden = inner
                         .listen_tokens
                         .get(tok)
                         .map(|s| s.hidden)
                         .unwrap_or(false);
-                    !v2_hidden
-                        && (V2TokenState::is_sse_alive_in_hub(tok, &inner.sse_connections)
+                    !listen_hidden
+                        && (ListenTokenState::is_sse_alive_in_hub(tok, &inner.sse_connections)
                             || inner.registry.is_online(name))
                 } else {
                     let scope = inner.presence_scope_effective(name);
@@ -2504,7 +2438,7 @@ impl DeliveryHub {
         request_id: &str,
         approve: bool,
     ) -> Result<RespondStatus, Error> {
-        let (status, notify_opt, persist_grant, identity_senders, v2_to_persist): (
+        let (status, notify_opt, persist_grant, identity_senders, listen_to_persist): (
             RespondStatus,
             Option<Arc<tokio::sync::Notify>>,
             Option<(String, String, String, String, String, String)>,
@@ -2670,10 +2604,10 @@ impl DeliveryHub {
 
                 // AC-T3: collect token strings for both agents (by name) so we can
                 // persist them to DB after the lock releases.
-                let mut v2_to_persist: Vec<String> = Vec::new();
+                let mut listen_to_persist: Vec<String> = Vec::new();
                 for name in [&from_name, &to_name] {
                     if let Some(tok) = inner.name_to_token.get(name.as_str()).cloned() {
-                        v2_to_persist.push(tok);
+                        listen_to_persist.push(tok);
                     }
                 }
 
@@ -2693,7 +2627,7 @@ impl DeliveryHub {
                         to_name_for_grant,
                     )),
                     identity_senders,
-                    v2_to_persist,
+                    listen_to_persist,
                 )
             }
         }; // lock released
@@ -2739,10 +2673,10 @@ impl DeliveryHub {
         }
 
         // AC-T3: persist listen tokens that gained their first grant.
-        if !v2_to_persist.is_empty()
+        if !listen_to_persist.is_empty()
             && let Some(store) = self.token_store.clone()
         {
-            for tok in v2_to_persist {
+            for tok in listen_to_persist {
                 let store2 = store.clone();
                 self.db_write(async move {
                     if let Err(e) = store2.upsert_token(&tok, &tok, "listen", None, None).await {
@@ -2927,9 +2861,9 @@ impl DeliveryHub {
                     });
                 inner.kick_pending.insert(to_name.to_string());
                 inner.increment_msg_id_for_name(to_name);
-                let v2n = inner.take_notify(to_name);
+                let ntx = inner.take_notify(to_name);
                 let notify = inner.agents.get(to_name).map(|s| Arc::clone(&s.notify));
-                (request_id, Some((notify, v2n)))
+                (request_id, Some((notify, ntx)))
             } else {
                 let event = serde_json::json!({
                     "type": "grant_request",
@@ -2949,11 +2883,11 @@ impl DeliveryHub {
 
         // Governorless: fire the recipient notify out-of-lock (mirrors the governor-approval
         // recipient notification in approve_grant_request).
-        if let Some((notify, v2n)) = recipient_notify {
+        if let Some((notify, ntx)) = recipient_notify {
             if let Some(n) = notify {
                 n.notify_one();
             }
-            if let Some((sender, _pending)) = v2n {
+            if let Some((sender, _pending)) = ntx {
                 let _ =
                     sender.send(r#"{"type":"service","event":"identity_persisted"}"#.to_string());
             }
@@ -2970,7 +2904,7 @@ impl DeliveryHub {
         request_id: &str,
         expiry: Option<Duration>,
     ) -> Result<ApproveStatus, Error> {
-        let (status, notify_opt, v2_to_persist, identity_senders, persist_grant) = {
+        let (status, notify_opt, listen_to_persist, identity_senders, persist_grant) = {
             let mut inner = self.lock();
             let req = inner
                 .connection_requests
@@ -3049,13 +2983,13 @@ impl DeliveryHub {
                         });
                     inner.kick_pending.insert(to_name.clone());
                     inner.increment_msg_id_for_name(&to_name);
-                    let v2n = inner.take_notify(&to_name);
+                    let ntx = inner.take_notify(&to_name);
                     let notify = inner.agents.get(&to_name).map(|s| Arc::clone(&s.notify));
                     (
                         ApproveStatus::PendingRecipient,
                         notify,
                         vec![],
-                        v2n.into_iter().map(|(s, _)| s).collect::<Vec<_>>(),
+                        ntx.into_iter().map(|(s, _)| s).collect::<Vec<_>>(),
                         None,
                     )
                 }
@@ -3136,7 +3070,7 @@ impl DeliveryHub {
 
                     // Mark ever_granted on listen tokens and collect SSE senders.
                     let mut identity_senders: Vec<mpsc::UnboundedSender<String>> = Vec::new();
-                    let mut v2_to_persist: Vec<String> = Vec::new();
+                    let mut listen_to_persist: Vec<String> = Vec::new();
                     for identity in [&from_identity, &to_identity] {
                         if let Some(st) = inner.listen_tokens.get_mut(identity.as_str()) {
                             st.ever_granted = true;
@@ -3147,7 +3081,7 @@ impl DeliveryHub {
                     }
                     for name in [&from_name, &to_name] {
                         if let Some(tok) = inner.name_to_token.get(name.as_str()).cloned() {
-                            v2_to_persist.push(tok);
+                            listen_to_persist.push(tok);
                         }
                     }
 
@@ -3164,7 +3098,7 @@ impl DeliveryHub {
                     (
                         ApproveStatus::Established,
                         notify,
-                        v2_to_persist,
+                        listen_to_persist,
                         all_notify_senders,
                         Some((
                             grant_id,
@@ -3213,10 +3147,10 @@ impl DeliveryHub {
                 }
             });
         }
-        if !v2_to_persist.is_empty()
+        if !listen_to_persist.is_empty()
             && let Some(store) = self.token_store.clone()
         {
-            for tok in v2_to_persist {
+            for tok in listen_to_persist {
                 let store2 = store.clone();
                 self.db_write(async move {
                     if let Err(e) = store2.upsert_token(&tok, &tok, "listen", None, None).await {
@@ -3237,7 +3171,7 @@ impl DeliveryHub {
         reason: &str,
         expires_at: Option<u64>,
     ) -> Result<(), Error> {
-        let (from_name, from_identity, to_name, v2n, notify) = {
+        let (from_name, from_identity, to_name, ntx, notify) = {
             let mut inner = self.lock();
             let req = inner
                 .connection_requests
@@ -3301,15 +3235,15 @@ impl DeliveryHub {
                 });
             inner.kick_pending.insert(from_name.clone());
             inner.increment_msg_id_for_name(&from_name);
-            let v2n = inner.take_notify(&from_name);
+            let ntx = inner.take_notify(&from_name);
             let notify = inner.agents.get(&from_name).map(|s| Arc::clone(&s.notify));
-            (from_name, from_identity, to_name, v2n, notify)
+            (from_name, from_identity, to_name, ntx, notify)
         };
         let _ = from_name;
         if let Some(n) = notify {
             n.notify_one();
         }
-        if let Some((sender, pending)) = v2n {
+        if let Some((sender, pending)) = ntx {
             let _ = sender.send(format!(r#"{{"type":"notify","pending":{}}}"#, pending));
         }
         if let Some(store) = self.token_store.clone() {
@@ -3467,7 +3401,7 @@ impl DeliveryHub {
         request_id: &str,
         reason: &str,
     ) -> Result<(), Error> {
-        let (v2n, notify) = {
+        let (ntx, notify) = {
             let mut inner = self.lock();
             let req = inner
                 .connection_requests
@@ -3525,14 +3459,14 @@ impl DeliveryHub {
                 });
             inner.kick_pending.insert(from_name.clone());
             inner.increment_msg_id_for_name(&from_name);
-            let v2n = inner.take_notify(&from_name);
+            let ntx = inner.take_notify(&from_name);
             let notify = inner.agents.get(&from_name).map(|s| Arc::clone(&s.notify));
-            (v2n, notify)
+            (ntx, notify)
         };
         if let Some(n) = notify {
             n.notify_one();
         }
-        if let Some((sender, pending)) = v2n {
+        if let Some((sender, pending)) = ntx {
             let _ = sender.send(format!(r#"{{"type":"notify","pending":{}}}"#, pending));
         }
         Ok(())
@@ -3619,7 +3553,9 @@ impl DeliveryHub {
                 let digits: u64 = rng.gen_range(10_000_000..=999_999_999_999);
                 let tok = digits.to_string();
                 if !inner.listen_tokens.contains_key(&tok) {
-                    inner.listen_tokens.insert(tok.clone(), V2TokenState::new());
+                    inner
+                        .listen_tokens
+                        .insert(tok.clone(), ListenTokenState::new());
                     break tok;
                 }
             };
@@ -3646,7 +3582,7 @@ impl DeliveryHub {
             let digits: u64 = rng.gen_range(10_000_000..=999_999_999_999);
             let tok = digits.to_string();
             if !inner.listen_tokens.contains_key(&tok) {
-                let mut state = V2TokenState::new();
+                let mut state = ListenTokenState::new();
                 state.pending_first_listen = true;
                 inner.listen_tokens.insert(tok.clone(), state);
                 return tok;
@@ -3674,10 +3610,6 @@ impl DeliveryHub {
     ) -> Result<(String, mpsc::UnboundedReceiver<String>), Error> {
         // Token is required.
         let provided_token = token_opt.ok_or(Error::AuthFailed)?;
-
-        // Capture auth-token hint BEFORE locking for DCP breadcrumb generation.
-        // In DCP flow, the agent presents their auth-token as Bearer on /listen.
-        let dcp_auth_hint: Option<String> = Some(provided_token.to_string());
         let observed_host_str = observed_host.unwrap_or_default();
         let (token, rx, bound_name_for_persist, gc_offline_events) = {
             let mut inner = self.lock();
@@ -3701,7 +3633,7 @@ impl DeliveryHub {
 
                 // Single-subscription enforcement: check if already has active SSE.
                 let has_active_sse =
-                    V2TokenState::is_sse_alive_in_hub(provided_token, &inner.sse_connections);
+                    ListenTokenState::is_sse_alive_in_hub(provided_token, &inner.sse_connections);
                 if has_active_sse && !force {
                     drop(inner);
                     for (senders, name) in gc_offline_events {
@@ -3728,7 +3660,7 @@ impl DeliveryHub {
                     };
                     inner
                         .listen_tokens
-                        .insert(new_tok.clone(), V2TokenState::new());
+                        .insert(new_tok.clone(), ListenTokenState::new());
                     new_tok
                 } else {
                     // Not a listen token or governor token — auth failed.
@@ -3761,7 +3693,10 @@ impl DeliveryHub {
             // Concurrent-use detection: if new IP differs from last IP within window.
             {
                 let alert_opt: Option<String> = {
-                    let state = inner.listen_tokens.get_mut(&token).unwrap();
+                    let state = inner
+                        .listen_tokens
+                        .get_mut(&token)
+                        .expect("listen_token entry must exist during open_listen");
                     if let Some(ip) = &peer_ip {
                         let concurrent_window = Duration::from_secs(60);
                         let alert = if let (Some(last_ip), Some(last_at)) =
@@ -3833,50 +3768,52 @@ impl DeliveryHub {
             }
 
             // Fix 2: attempt inline name binding if requested.
-            let (_name_in_use, _holder_identity, bound_name_for_persist) = if let Some(name) =
-                name_to_bind
-            {
-                if inner.name_to_token.get(name).map(|t| t.as_str()) == Some(token.as_str()) {
-                    // Already bound to this token — idempotent.
-                    (false, None::<String>, None::<String>)
-                } else if let Some(existing_token) = inner.name_to_token.get(name).cloned() {
-                    let holder_alive =
-                        V2TokenState::is_sse_alive_in_hub(&existing_token, &inner.sse_connections);
-                    if holder_alive {
+            let (_name_in_use, _holder_identity, bound_name_for_persist) =
+                if let Some(name) = name_to_bind {
+                    if inner.name_to_token.get(name).map(|t| t.as_str()) == Some(token.as_str()) {
+                        // Already bound to this token — idempotent.
+                        (false, None::<String>, None::<String>)
+                    } else if let Some(existing_token) = inner.name_to_token.get(name).cloned() {
+                        let holder_alive = ListenTokenState::is_sse_alive_in_hub(
+                            &existing_token,
+                            &inner.sse_connections,
+                        );
+                        if holder_alive {
+                            (true, Some(name.to_string()), None)
+                        } else {
+                            // Stale holder — evict and bind.
+                            let old_name = inner
+                                .listen_tokens
+                                .get(&existing_token)
+                                .and_then(|h| h.name.clone());
+                            if let Some(ref n) = old_name {
+                                inner.name_to_token.remove(n.as_str());
+                                inner.agents.remove(n.as_str());
+                                inner.token_to_name.remove(&existing_token);
+                            }
+                            if let Some(holder_mut) = inner.listen_tokens.get_mut(&existing_token) {
+                                holder_mut.name = None;
+                            }
+                            inner.bind_name(&token, name);
+                            (false, None, Some(name.to_string()))
+                        }
+                    } else if inner.registry.is_online(name) {
+                        // A minted agent holds this name.
                         (true, Some(name.to_string()), None)
                     } else {
-                        // Stale holder — evict and bind.
-                        let old_name = inner
-                            .listen_tokens
-                            .get(&existing_token)
-                            .and_then(|h| h.name.clone());
-                        if let Some(ref n) = old_name {
-                            inner.name_to_token.remove(n.as_str());
-                            inner.agents.remove(n.as_str());
-                            inner.token_to_name.remove(&existing_token);
-                        }
-                        if let Some(holder_mut) = inner.listen_tokens.get_mut(&existing_token) {
-                            holder_mut.name = None;
-                        }
                         inner.bind_name(&token, name);
                         (false, None, Some(name.to_string()))
                     }
-                } else if inner.registry.is_online(name) {
-                    // A minted agent holds this name.
-                    (true, Some(name.to_string()), None)
                 } else {
-                    inner.bind_name(&token, name);
-                    (false, None, Some(name.to_string()))
-                }
-            } else {
-                (false, None, None)
-            };
+                    (false, None, None)
+                };
 
             // Emit service/welcome — the agent's entry point.
             // Normal participants already know their token (from POST /register) so we
             // do not echo it back. Exception: governor session-link path presents a governor
             // token and receives a newly minted listen token — the agent does NOT have it yet,
             // so we include it in the welcome so they can use it for announce/dequeue.
+            // AC8: Both paths now include subscription_id for unambiguous subscription identity.
             {
                 let name_opt = inner.listen_tokens.get(&token).and_then(|s| s.name.clone());
                 let governor_minted = token.as_str() != provided_token;
@@ -3884,6 +3821,7 @@ impl DeliveryHub {
                     serde_json::json!({
                         "type": "service",
                         "event": "welcome",
+                        "subscription_id": &token,
                         "token": &token,
                         "name": name_opt,
                         "instructions": "Call POST /announce to register your name. You will receive notify events when messages arrive — call POST /messages/dequeue to retrieve them.",
@@ -3892,6 +3830,7 @@ impl DeliveryHub {
                     serde_json::json!({
                         "type": "service",
                         "event": "welcome",
+                        "subscription_id": &token,
                         "name": name_opt,
                         "instructions": "Call POST /announce to register your name. You will receive notify events when messages arrive — call POST /messages/dequeue to retrieve them.",
                     })
@@ -3899,100 +3838,6 @@ impl DeliveryHub {
                 .to_string();
                 let _ = tx.send(welcome);
             }
-
-            // DCP Step 1: mint sub_id and sub_token for this subscription.
-            let sub_id = format!("sub-{}", rand_hex(8));
-            let sub_token = rand_hex(16);
-            inner.dcp_subs.insert(
-                sub_id.clone(),
-                DcpSub {
-                    sub_id: sub_id.clone(),
-                    sub_token: sub_token.clone(),
-                    handle: None,
-                    sse_sender: Some(tx.clone()),
-                    created_at: std::time::Instant::now(),
-                },
-            );
-            inner
-                .dcp_sub_token_to_id
-                .insert(sub_token.clone(), sub_id.clone());
-
-            // DCP Step 2a: emit sub event with last_message_id for gap detection on reconnect.
-            let last_msg_id = inner
-                .listen_tokens
-                .get(&token)
-                .map(|st| *st.msg_id_watch.borrow())
-                .unwrap_or(0);
-            let sub_event = serde_json::json!({
-                "type": "sub",
-                "sub_id": &sub_id,
-                "sub_token": &sub_token,
-                "last_message_id": last_msg_id,
-            })
-            .to_string();
-            let _ = tx.send(sub_event);
-
-            // DCP startup announce: fire exactly once on first SSE subscription after server start.
-            if !inner.startup_announced {
-                inner.startup_announced = true;
-                let sim_online = serde_json::json!({
-                    "type": "service",
-                    "event": "sim_online",
-                })
-                .to_string();
-                let _ = tx.send(sim_online);
-            }
-
-            // DCP Step 2b: emit breadcrumb.
-            // Look up the auth_token from the Authorization header — resolved from dcp_auth_to_handle.
-            let breadcrumb = if let Some(ref auth_tok) = dcp_auth_hint {
-                if let Some(handle) = inner.dcp_auth_to_handle.get(auth_tok.as_str()).cloned() {
-                    // Returning agent — check if another sub is live for this handle
-                    let other_sub_live = inner.dcp_subs.values().any(|s| {
-                        s.handle.as_deref() == Some(&handle)
-                            && s.sub_id != sub_id
-                            && s.sse_sender
-                                .as_ref()
-                                .map(|tx2| !tx2.is_closed())
-                                .unwrap_or(false)
-                    });
-                    if other_sub_live {
-                        serde_json::json!({
-                            "type": "breadcrumb",
-                            "action": "force-announce",
-                            "handle": &handle,
-                            "host": &observed_host_str,
-                            "hint": "POST /announce with force:true",
-                        })
-                        .to_string()
-                    } else {
-                        serde_json::json!({
-                            "type": "breadcrumb",
-                            "action": "announce",
-                            "handle": &handle,
-                            "host": &observed_host_str,
-                            "hint": "POST /announce to reclaim your identity",
-                        })
-                        .to_string()
-                    }
-                } else {
-                    // Unknown auth-token or no token
-                    serde_json::json!({
-                        "type": "breadcrumb",
-                        "action": "introduce",
-                        "host": &observed_host_str,
-                        "hint": format!("POST /introduce {{\"handle\":\"<your-handle>\",\"sub_id\":\"{}\"}}",  &sub_id),
-                    }).to_string()
-                }
-            } else {
-                serde_json::json!({
-                    "type": "breadcrumb",
-                    "action": "introduce",
-                    "host": &observed_host_str,
-                    "hint": format!("POST /introduce {{\"handle\":\"<your-handle>\",\"sub_id\":\"{}\"}}", &sub_id),
-                }).to_string()
-            };
-            let _ = tx.send(breadcrumb);
 
             // SIM-1: Re-arm notify on reconnect and fire a catch-up NOTIFY if messages are
             // already queued.  This closes two bugs:
@@ -4104,26 +3949,6 @@ impl DeliveryHub {
                 state.sse_sender = None;
             }
 
-            // Reap DCP subscriptions whose SSE sender has closed. Every POST /listen mints a
-            // dcp_subs entry (open_listen); without this they leak one entry per reconnect.
-            // Safe: every live DCP path (resume at dcp_announce, probe, deliver) already
-            // ignores subs with a closed/absent sender, so a closed-sender sub is dead weight.
-            let dead_subs: Vec<(String, String)> = inner
-                .dcp_subs
-                .iter()
-                .filter(|(_, s)| {
-                    s.sse_sender
-                        .as_ref()
-                        .map(|tx| tx.is_closed())
-                        .unwrap_or(true)
-                })
-                .map(|(sid, s)| (sid.clone(), s.sub_token.clone()))
-                .collect();
-            for (sub_id, sub_token) in dead_subs {
-                inner.dcp_subs.remove(&sub_id);
-                inner.dcp_sub_token_to_id.remove(&sub_token);
-            }
-
             (offline_senders, dropped_name)
         };
 
@@ -4143,7 +3968,7 @@ impl DeliveryHub {
             if state.revoked {
                 return Err(Error::TokenRevoked);
             }
-            if !V2TokenState::is_sse_alive_in_hub(token, &inner.sse_connections) {
+            if !ListenTokenState::is_sse_alive_in_hub(token, &inner.sse_connections) {
                 return Err(Error::RecipientOffline);
             }
             // Collect peer senders and name BEFORE unbinding (presence push TR2).
@@ -4161,7 +3986,10 @@ impl DeliveryHub {
                 inner.agents.remove(&name);
             }
             // Clear name and SSE sender from token state.
-            let st = inner.listen_tokens.get_mut(token).unwrap();
+            let st = inner
+                .listen_tokens
+                .get_mut(token)
+                .expect("listen_token state must exist during close_listen");
             st.name = None;
             let sender_opt = st.sse_sender.take();
             (sender_opt, offline_senders, cancelled_name)
@@ -4238,7 +4066,7 @@ impl DeliveryHub {
         // Check if name is claimed by another listen token.
         if let Some(existing_token) = inner.name_to_token.get(name).cloned() {
             let holder_alive =
-                V2TokenState::is_sse_alive_in_hub(&existing_token, &inner.sse_connections);
+                ListenTokenState::is_sse_alive_in_hub(&existing_token, &inner.sse_connections);
             if inner.listen_tokens.contains_key(&existing_token) {
                 if holder_alive {
                     if !force {
@@ -4351,7 +4179,7 @@ impl DeliveryHub {
 
         // Governor breadcrumb: if this session was opened with a governor token as bearer,
         // enqueue the role breadcrumb once so the governor knows its responsibilities.
-        let gov_v2_notify = {
+        let gov_notify_val = {
             let gov_id_opt = inner
                 .listen_tokens
                 .get(token)
@@ -4396,7 +4224,7 @@ impl DeliveryHub {
         }
 
         // Fire SSE NOTIFY for breadcrumb outside the lock.
-        if let Some((sender, pending)) = gov_v2_notify {
+        if let Some((sender, pending)) = gov_notify_val {
             let event = format!(r#"{{"type":"notify","pending":{}}}"#, pending);
             let _ = sender.send(event);
         }
@@ -4666,11 +4494,11 @@ impl DeliveryHub {
 
     /// Resolve a bearer token to the agent's announced name.
     ///
-    /// Works for both V2 listen tokens and minted agent tokens.
+    /// Works for both listen tokens and minted agent tokens.
     /// Returns `None` if the token is unknown, revoked, or has no announced name.
     pub fn name_for_bearer_token(&self, token: &str) -> Option<String> {
         let inner = self.lock();
-        // V2 listen token path — check revocation explicitly.
+        // listen token path — check revocation explicitly.
         if let Some(state) = inner.listen_tokens.get(token) {
             return if state.revoked {
                 None
@@ -4703,7 +4531,7 @@ impl DeliveryHub {
             };
 
         // Resolve target: prefer the listen-token identity (which == token) if
-        // the agent is a V2 listen-flow agent; fall back to the minted identity.
+        // the agent is a listen-flow agent; fall back to the minted identity.
         let (to_id, to_tok): (String, Option<String>) =
             if let Some(t_tok) = inner.name_to_token.get(to_name).cloned() {
                 (t_tok.clone(), Some(t_tok))
@@ -4843,7 +4671,8 @@ impl DeliveryHub {
             if target_state.hidden {
                 return Ok(false);
             }
-            let sse_alive = V2TokenState::is_sse_alive_in_hub(&target_tok, &inner.sse_connections);
+            let sse_alive =
+                ListenTokenState::is_sse_alive_in_hub(&target_tok, &inner.sse_connections);
             // AC2 fix: also check registry liveness so presence recovers after
             // an announce following an SSE drop (transient reconnect pattern).
             return Ok(sse_alive || inner.registry.is_online(target_name));
@@ -4929,7 +4758,7 @@ impl DeliveryHub {
                 if tgt.hidden {
                     return Ok(false);
                 }
-                return Ok(V2TokenState::is_sse_alive_in_hub(
+                return Ok(ListenTokenState::is_sse_alive_in_hub(
                     &target_tok,
                     &inner.sse_connections,
                 ));
@@ -5012,7 +4841,7 @@ impl DeliveryHub {
                 if tgt.hidden {
                     return Ok(false);
                 }
-                return Ok(V2TokenState::is_sse_alive_in_hub(
+                return Ok(ListenTokenState::is_sse_alive_in_hub(
                     &target_tok,
                     &inner.sse_connections,
                 ));
@@ -5022,356 +4851,6 @@ impl DeliveryHub {
         }
 
         Err(Error::AuthFailed)
-    }
-
-    // ── DCP methods ───────────────────────────────────────────────────────────
-
-    /// DCP: introduce a new identity (handle → auth_token). TOFU — fails if handle exists.
-    /// Returns (auth_token) on success.
-    pub fn dcp_introduce(&self, handle: &str, sub_id: &str) -> Result<String, Error> {
-        let probe_json = {
-            let mut inner = self.lock();
-            if inner.dcp_identities.contains_key(handle) {
-                return Err(Error::HandleExists);
-            }
-            let auth_token = rand_hex(32);
-            inner.dcp_identities.insert(
-                handle.to_string(),
-                DcpIdentity {
-                    handle: handle.to_string(),
-                    auth_token: auth_token.clone(),
-                },
-            );
-            inner
-                .dcp_auth_to_handle
-                .insert(auth_token.clone(), handle.to_string());
-            // Bind this sub to the handle
-            if let Some(sub) = inner.dcp_subs.get_mut(sub_id) {
-                sub.handle = Some(handle.to_string());
-            }
-            // Explicit empty grant baseline for new identity
-            inner.dcp_expected_grants.insert(handle.to_string(), vec![]);
-            // Emit probe
-            let probe_json = Self::emit_probe_locked(&mut inner, sub_id, handle);
-            drop(inner);
-            // Persist identity outside lock
-            if let Some(store) = self.token_store.clone() {
-                let h = handle.to_string();
-                let at = {
-                    // re-lock briefly to get the token
-                    let inner2 = self.lock();
-                    inner2
-                        .dcp_identities
-                        .get(&h)
-                        .map(|i| i.auth_token.clone())
-                        .unwrap_or_default()
-                };
-                self.db_write(async move {
-                    if let Err(e) = store.upsert_identity(&h, &at).await {
-                        eprintln!("WARNING: dcp identity store write failed: {e}");
-                    }
-                });
-            }
-            probe_json
-        };
-        let _ = probe_json; // probe already emitted to SSE inside lock
-        // Return auth_token
-        let inner = self.lock();
-        inner
-            .dcp_identities
-            .get(handle)
-            .map(|i| i.auth_token.clone())
-            .ok_or(Error::IdentityNotFound)
-    }
-
-    /// DCP: announce (re-claim) an existing identity onto a new subscription.
-    pub fn dcp_announce(
-        &self,
-        auth_token: &str,
-        handle: &str,
-        force: bool,
-        sub_id: &str,
-    ) -> Result<(), Error> {
-        let mut inner = self.lock();
-        // Validate auth_token → handle
-        let stored_handle = inner
-            .dcp_auth_to_handle
-            .get(auth_token)
-            .cloned()
-            .ok_or(Error::AuthFailed)?;
-        if stored_handle != handle {
-            return Err(Error::AuthFailed);
-        }
-        if !inner.dcp_identities.contains_key(handle) {
-            return Err(Error::IdentityNotFound);
-        }
-        // Check if another sub is live for this handle
-        let other_sub_id: Option<String> = inner
-            .dcp_subs
-            .iter()
-            .find(|(sid, s)| {
-                s.handle.as_deref() == Some(handle)
-                    && sid.as_str() != sub_id
-                    && s.sse_sender
-                        .as_ref()
-                        .map(|tx| !tx.is_closed())
-                        .unwrap_or(false)
-            })
-            .map(|(sid, _)| sid.clone());
-        if let Some(old_sub_id) = other_sub_id {
-            if !force {
-                return Err(Error::NameInUse);
-            }
-            // force=true: fence the old sub
-            if let Some(old_sub) = inner.dcp_subs.get_mut(&old_sub_id) {
-                if let Some(ref tx) = old_sub.sse_sender {
-                    let _ = tx.send(
-                        r#"{"type":"service","event":"superseded","reason":"name_reclaimed"}"#
-                            .to_string(),
-                    );
-                }
-                old_sub.sse_sender = None;
-                old_sub.handle = None;
-                let old_token = old_sub.sub_token.clone();
-                inner.dcp_sub_token_to_id.remove(&old_token);
-            }
-            inner.dcp_subs.remove(&old_sub_id);
-            // Also unbind from V2 routing maps
-            inner.name_to_token.remove(handle);
-            inner.agents.remove(handle);
-            if let Some(old_tok) = inner
-                .token_to_name
-                .iter()
-                .find(|(_, n)| n.as_str() == handle)
-                .map(|(k, _)| k.clone())
-            {
-                inner.token_to_name.remove(&old_tok);
-            }
-        }
-        // Bind this identity to sub_id
-        if let Some(sub) = inner.dcp_subs.get_mut(sub_id) {
-            sub.handle = Some(handle.to_string());
-        }
-        // Re-use sub_id as the "token" for V2 routing so message delivery works
-        inner
-            .name_to_token
-            .insert(handle.to_string(), sub_id.to_string());
-        inner
-            .token_to_name
-            .insert(sub_id.to_string(), handle.to_string());
-        inner
-            .agents
-            .entry(handle.to_string())
-            .or_insert_with(|| ParticipantState {
-                identity: auth_token.to_string(),
-                notify: Arc::new(tokio::sync::Notify::new()),
-            });
-        // Emit connect_probe
-        Self::emit_probe_locked(&mut inner, sub_id, handle);
-        Ok(())
-    }
-
-    /// DCP: emit a connect_probe event to the sub's SSE channel.
-    fn emit_probe_locked(inner: &mut HubInner, sub_id: &str, handle: &str) -> Option<String> {
-        // Opportunistic GC: drop probes that are spent (acked) or past their 120s TTL so the
-        // map stays bounded by in-flight probes. Probes are keyed `{sub_id}:{probe_instance}`
-        // with a randomized instance, so without this re-probes accumulate forever (the
-        // long-standing dcp_probes growth the [state] log was added to catch).
-        let now_probe = std::time::Instant::now();
-        inner
-            .dcp_probes
-            .retain(|_, p| !p.used && p.expires_at > now_probe);
-
-        let nonce = rand_hex(16);
-        let probe_instance = format!("pi-{}", rand_hex(4));
-        let expires_at = std::time::Instant::now() + Duration::from_secs(120);
-        let expires_at_secs = {
-            let now_sys = SystemTime::now();
-            let dur_to_expiry = expires_at.duration_since(std::time::Instant::now());
-            now_sys
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs()
-                + dur_to_expiry.as_secs()
-        };
-        let key = format!("{}:{}", sub_id, probe_instance);
-        inner.dcp_probes.insert(
-            key.clone(),
-            DcpProbe {
-                nonce: nonce.clone(),
-                sub_id: sub_id.to_string(),
-                handle: handle.to_string(),
-                probe_instance: probe_instance.clone(),
-                expires_at,
-                used: false,
-            },
-        );
-        let probe_json = serde_json::json!({
-            "type": "connect_probe",
-            "nonce": &nonce,
-            "sub_id": sub_id,
-            "probe_instance": &probe_instance,
-            "expires_at_secs": expires_at_secs,
-        })
-        .to_string();
-        if let Some(sub) = inner.dcp_subs.get(sub_id)
-            && let Some(ref tx) = sub.sse_sender
-        {
-            let _ = tx.send(probe_json.clone());
-        }
-        Some(probe_json)
-    }
-
-    /// DCP: acknowledge a connect_probe. Validates nonce, marks CONNECTED.
-    pub fn dcp_probe_ack(&self, auth_token: &str, nonce: &str, sub_id: &str) -> Result<(), Error> {
-        let mut inner = self.lock();
-        let handle = inner
-            .dcp_auth_to_handle
-            .get(auth_token)
-            .cloned()
-            .ok_or(Error::AuthFailed)?;
-        let now = std::time::Instant::now();
-        // Find matching probe
-        let probe_key = inner
-            .dcp_probes
-            .iter()
-            .find(|(_, p)| {
-                p.sub_id == sub_id
-                    && p.nonce == nonce
-                    && p.handle == handle
-                    && !p.used
-                    && p.expires_at > now
-            })
-            .map(|(k, _)| k.clone());
-        let probe_key = match probe_key {
-            Some(k) => k,
-            None => {
-                // Check if expired (nonce exists but expired) vs totally missing
-                let exists_expired = inner
-                    .dcp_probes
-                    .values()
-                    .any(|p| p.sub_id == sub_id && p.nonce == nonce && p.handle == handle);
-                return Err(if exists_expired {
-                    Error::ProbeExpired
-                } else {
-                    Error::ProbeInvalid
-                });
-            }
-        };
-        inner.dcp_probes.get_mut(&probe_key).unwrap().used = true;
-        // Grant integrity check
-        let expected = inner.dcp_expected_grants.get(&handle).cloned();
-        match expected {
-            None => {
-                // No record at all — this shouldn't happen after introduce/announce
-                return Err(Error::ProbeInvalid);
-            }
-            Some(expected_ids) => {
-                let current_grants: Vec<String> = inner.trust.grant_ids_for_handle(&handle);
-                // New identity: expected is empty — explicit assertion, not vacuous
-                // Existing identity: must match current grant set
-                if expected_ids.is_empty() {
-                    // new identity baseline — OK
-                } else {
-                    let mut exp_sorted = expected_ids.clone();
-                    let mut cur_sorted = current_grants.clone();
-                    exp_sorted.sort();
-                    cur_sorted.sort();
-                    if exp_sorted != cur_sorted {
-                        return Err(Error::ProbeInvalid);
-                    }
-                }
-                // Update expected grants to current snapshot
-                inner
-                    .dcp_expected_grants
-                    .insert(handle.clone(), current_grants);
-            }
-        }
-        // Emit CONNECTED breadcrumb
-        let connected_json = serde_json::json!({
-            "type": "connected",
-            "handle": &handle,
-            "sub_id": sub_id,
-        })
-        .to_string();
-        if let Some(sub) = inner.dcp_subs.get(sub_id)
-            && let Some(ref tx) = sub.sse_sender
-        {
-            let _ = tx.send(connected_json);
-        }
-        Ok(())
-    }
-
-    /// DCP: leave — cancel sub while preserving identity.
-    pub fn dcp_leave(&self, auth_token: &str, sub_id: &str) -> Result<(), Error> {
-        // Collect grant-peer senders inside the lock (before handle is unbound from maps),
-        // then fire the offline presence event after the lock releases. (15-0002D)
-        let (offline_senders, handle) = {
-            let mut inner = self.lock();
-            let handle = inner
-                .dcp_auth_to_handle
-                .get(auth_token)
-                .cloned()
-                .ok_or(Error::AuthFailed)?;
-            let sub_handle_matches = inner
-                .dcp_subs
-                .get(sub_id)
-                .map(|s| s.handle.as_deref() == Some(&handle))
-                .unwrap_or(false);
-            if !sub_handle_matches {
-                return Err(Error::Forbidden);
-            }
-            let leave_json = serde_json::json!({
-                "type": "service",
-                "event": "leave",
-                "handle": &handle,
-                "reason": "participant_requested",
-            })
-            .to_string();
-            if let Some(sub) = inner.dcp_subs.get_mut(sub_id) {
-                if let Some(ref tx) = sub.sse_sender {
-                    let _ = tx.send(leave_json);
-                }
-                sub.sse_sender = None;
-            }
-            // Collect grant-peer senders BEFORE unbinding name routing.
-            let offline_senders = inner.grant_peer_senders(&handle);
-            // Unbind name routing
-            inner.name_to_token.remove(&handle);
-            inner.agents.remove(&handle);
-            inner.token_to_name.remove(sub_id);
-            // Remove sub
-            let sub_token = inner.dcp_subs.get(sub_id).map(|s| s.sub_token.clone());
-            inner.dcp_subs.remove(sub_id);
-            if let Some(tok) = sub_token {
-                inner.dcp_sub_token_to_id.remove(&tok);
-            }
-            // Identity persists in dcp_identities — leave != destroy identity
-            (offline_senders, handle)
-        }; // lock released
-        push_presence_event(offline_senders, &handle, "offline");
-        Ok(())
-    }
-
-    /// DCP: cancel a subscription pre-announce using the sub_token.
-    /// No presence event: this path is pre-announce so the handle is not yet bound to
-    /// the name routing maps and no grant-peers exist to notify. (15-0002D)
-    pub fn dcp_cancel_sub_by_token(&self, sub_token: &str) -> Result<(), Error> {
-        let mut inner = self.lock();
-        let sub_id = inner
-            .dcp_sub_token_to_id
-            .get(sub_token)
-            .cloned()
-            .ok_or(Error::TokenRejected)?;
-        if let Some(sub) = inner.dcp_subs.get_mut(&sub_id) {
-            if let Some(ref tx) = sub.sse_sender {
-                let _ = tx.send(r#"{"type":"service","event":"cancelled"}"#.to_string());
-            }
-            sub.sse_sender = None;
-        }
-        inner.dcp_subs.remove(&sub_id);
-        inner.dcp_sub_token_to_id.remove(sub_token);
-        Ok(())
     }
 }
 
@@ -7273,19 +6752,11 @@ mod tests {
         let store = Arc::new(TokenStore::open(db_path).await.expect("open db"));
         let tokens = store.load_tokens().await.expect("load tokens");
         let grants = store.load_grants().await.expect("load grants");
-        let identities = store.load_identities().await.expect("load identities");
         let denial_blocks = store
             .load_denial_blocks()
             .await
             .expect("load denial blocks");
-        DeliveryHub::new_with_persisted_state(
-            lapse,
-            store,
-            tokens,
-            grants,
-            identities,
-            denial_blocks,
-        )
+        DeliveryHub::new_with_persisted_state(lapse, store, tokens, grants, denial_blocks)
     }
 
     // ── Attachments (native file/attachment send) ────────────────────────────────
@@ -7867,17 +7338,17 @@ mod tests {
     async fn ac_t3_token_persists_after_first_grant_survives_restart() {
         let db = unique_test_db();
 
-        let v2_tok = {
+        let listen_tok = {
             let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
             let gov = hub.install_governor(None);
             let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
 
             // Issue token for bob and announce its name.
             let reg_bob = hub.register_participant();
-            let (v2_tok, _rx) = hub
+            let (listen_tok, _rx) = hub
                 .open_listen(Some(&reg_bob), None, None, None, false)
                 .unwrap();
-            hub.announce(&v2_tok, "bob", false).unwrap();
+            hub.announce(&listen_tok, "bob", false).unwrap();
 
             // Register alice so request_grant() can route by name.
             hub.register("alice", &tok_a, PresenceScope::GrantScoped)
@@ -7894,25 +7365,25 @@ mod tests {
                 .expect("governor approve must succeed");
 
             // Drain the grant_request event from bob's queue.
-            let _ = hub.dequeue(&v2_tok, None).unwrap();
+            let _ = hub.dequeue(&listen_tok, None).unwrap();
 
             // Bob approves (PendingRecipient → Established; grant created + token persisted).
             assert!(
                 matches!(
-                    hub.approve_grant_request(&v2_tok, &request_id, None),
+                    hub.approve_grant_request(&listen_tok, &request_id, None),
                     Ok(ApproveStatus::Established)
                 ),
                 "both-approved path must return Established"
             );
 
-            v2_tok
+            listen_tok
         }; // hub drops; DB write already completed (block_in_place in multi-thread runtime)
 
         // Simulate restart: rebuild hub from the same DB file.
         let hub2 = make_persisted_hub(&db, Duration::from_secs(30)).await;
 
         assert!(
-            hub2.validate_token(&v2_tok).is_ok(),
+            hub2.validate_token(&listen_tok).is_ok(),
             "AC-T3: token must be valid on a new hub rebuilt from the same DB after first grant"
         );
 
@@ -7927,14 +7398,14 @@ mod tests {
     async fn ac_persist_announce_send_by_name_not_unknown_after_restart() {
         let db = unique_test_db();
 
-        let v2_tok = {
+        let listen_tok = {
             let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
             let reg_bob = hub.register_participant();
-            let (v2_tok, _rx) = hub
+            let (listen_tok, _rx) = hub
                 .open_listen(Some(&reg_bob), None, None, None, false)
                 .unwrap();
-            hub.announce(&v2_tok, "bob", false).unwrap();
-            v2_tok
+            hub.announce(&listen_tok, "bob", false).unwrap();
+            listen_tok
         };
 
         // Restart: new hub from same DB.
@@ -7957,7 +7428,7 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&db);
-        drop(v2_tok);
+        drop(listen_tok);
     }
 
     /// AC2: announce token (no grant) → restart → validate_token returns Ok.
@@ -7966,21 +7437,21 @@ mod tests {
     async fn ac_persist_announce_token_valid_after_restart() {
         let db = unique_test_db();
 
-        let v2_tok = {
+        let listen_tok = {
             let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
             let reg_bob = hub.register_participant();
-            let (v2_tok, _rx) = hub
+            let (listen_tok, _rx) = hub
                 .open_listen(Some(&reg_bob), None, None, None, false)
                 .unwrap();
-            hub.announce(&v2_tok, "bob", false).unwrap();
-            v2_tok
+            hub.announce(&listen_tok, "bob", false).unwrap();
+            listen_tok
         };
 
         // Restart: new hub from same DB.
         let hub2 = make_persisted_hub(&db, Duration::from_secs(30)).await;
 
         assert!(
-            hub2.validate_token(&v2_tok).is_ok(),
+            hub2.validate_token(&listen_tok).is_ok(),
             "AC2: token announced (never granted) must be valid after announce-time persist + restart"
         );
 
@@ -7994,14 +7465,14 @@ mod tests {
         let db = unique_test_db();
         let name = "charlie";
 
-        let v2_tok = {
+        let listen_tok = {
             let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
             let reg_charlie = hub.register_participant();
-            let (v2_tok, _rx) = hub
+            let (listen_tok, _rx) = hub
                 .open_listen(Some(&reg_charlie), None, None, None, false)
                 .unwrap();
-            hub.announce(&v2_tok, name, false).unwrap();
-            v2_tok
+            hub.announce(&listen_tok, name, false).unwrap();
+            listen_tok
         };
 
         // Reload.
@@ -8010,12 +7481,12 @@ mod tests {
         let inner = hub2.inner.lock().unwrap();
         assert_eq!(
             inner.name_to_token.get(name).map(String::as_str),
-            Some(v2_tok.as_str()),
+            Some(listen_tok.as_str()),
             "AC3: name_to_token[name] must equal the announced token after reload"
         );
         let state = inner
             .listen_tokens
-            .get(&v2_tok)
+            .get(&listen_tok)
             .expect("AC3: token must exist in listen_tokens after reload");
         assert_eq!(
             state.name.as_deref(),
@@ -8372,6 +7843,63 @@ mod tests {
         assert!(
             matches!(result, Ok(true)),
             "Minted agent with grant should see target's real status"
+        );
+    }
+
+    /// AC9: Second open_listen without force=true returns Error::ActiveSubscription.
+    #[test]
+    fn ac_listen_conflict_returns_active_subscription_error() {
+        let hub = make_hub(Duration::from_secs(30));
+        let gov = hub.install_governor(None);
+        let tok = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
+
+        // Open first listen stream.
+        let (token, _rx1) = hub
+            .open_listen(Some(&tok.0), None, None, None, false)
+            .expect("first open_listen must succeed");
+
+        // Second open_listen without force → should return ActiveSubscription error.
+        let result = hub.open_listen(Some(&token), None, None, None, false);
+        assert!(
+            matches!(result, Err(Error::ActiveSubscription)),
+            "second open_listen without force must return ActiveSubscription error, got: {:?}",
+            result
+        );
+    }
+
+    /// AC9: Second open_listen with force=true supersedes prior stream and returns same token.
+    #[test]
+    fn ac_listen_force_takeover_supersedes_prior_stream() {
+        let hub = make_hub(Duration::from_secs(30));
+        let gov = hub.install_governor(None);
+        let tok = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
+
+        // Open first listen stream.
+        let (token1, mut rx1) = hub
+            .open_listen(Some(&tok.0), None, None, None, false)
+            .expect("first open_listen must succeed");
+
+        // Second open_listen with force=true → should succeed and return same token.
+        let (token2, _rx2) = hub
+            .open_listen(Some(&token1), None, None, None, true)
+            .expect("force takeover open_listen must succeed");
+
+        assert_eq!(
+            token1, token2,
+            "force takeover must return same token, got token1={}, token2={}",
+            token1, token2
+        );
+
+        // The "superseded" event is sent synchronously inside open_listen before it returns,
+        // so try_recv() works here without any async runtime — event is already queued.
+        let superseded_event = rx1.try_recv().ok();
+        assert!(
+            superseded_event
+                .as_ref()
+                .map(|e| e.contains("superseded"))
+                .unwrap_or(false),
+            "old SSE rx should receive superseded event, got: {:?}",
+            superseded_event
         );
     }
 

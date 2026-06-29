@@ -12,11 +12,6 @@ pub struct PersistedToken {
     pub name: Option<String>, // announce name for listen tokens; None for governor/agent tokens
 }
 
-pub struct PersistedIdentity {
-    pub handle: String,
-    pub auth_token: String,
-}
-
 pub struct PersistedDenialBlock {
     pub from_identity: String,
     pub to_name: String,
@@ -114,7 +109,7 @@ impl TokenStore {
             return Err(e);
         }
 
-        // Idempotent: rename legacy token_type "v2" -> "listen" for any pre-existing rows.
+        // Idempotent: migrate pre-listen token_type values to 'listen'.
         sqlx::query("UPDATE tokens SET token_type='listen' WHERE token_type='v2'")
             .execute(&self.pool)
             .await?;
@@ -148,17 +143,6 @@ impl TokenStore {
                 return Err(e);
             }
         }
-
-        // DCP: durable identity store (handle → auth_token)
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS dcp_identities (
-                handle      TEXT PRIMARY KEY,
-                auth_token  TEXT NOT NULL UNIQUE,
-                created_at  TEXT NOT NULL
-            )",
-        )
-        .execute(&self.pool)
-        .await?;
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS denial_blocks (
@@ -422,37 +406,6 @@ impl TokenStore {
                     reason: r.get("reason"),
                     expires_at: exp_str.as_deref().and_then(|s| s.parse::<u64>().ok()),
                 }
-            })
-            .collect())
-    }
-
-    // ── DCP identity persistence ──────────────────────────────────────────────
-
-    /// Persist a new DCP identity (handle → auth_token). Idempotent on conflict.
-    pub async fn upsert_identity(&self, handle: &str, auth_token: &str) -> Result<(), sqlx::Error> {
-        let now = system_time_to_secs_str(std::time::SystemTime::now());
-        sqlx::query(
-            "INSERT INTO dcp_identities (handle, auth_token, created_at) VALUES (?, ?, ?)
-             ON CONFLICT(handle) DO NOTHING",
-        )
-        .bind(handle)
-        .bind(auth_token)
-        .bind(now)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    pub async fn load_identities(&self) -> Result<Vec<PersistedIdentity>, sqlx::Error> {
-        let rows = sqlx::query("SELECT handle, auth_token FROM dcp_identities")
-            .fetch_all(&self.pool)
-            .await?;
-        use sqlx::Row;
-        Ok(rows
-            .into_iter()
-            .map(|r| PersistedIdentity {
-                handle: r.get("handle"),
-                auth_token: r.get("auth_token"),
             })
             .collect())
     }

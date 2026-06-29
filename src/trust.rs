@@ -461,7 +461,7 @@ impl<F: Fn() -> Instant> TrustChain<F> {
         }
     }
 
-    /// Returns all grant IDs where this handle appears as name_a or name_b (DCP grant integrity).
+    /// Returns all grant IDs where this handle appears as name_a or name_b.
     pub fn grant_ids_for_handle(&self, handle: &str) -> Vec<String> {
         self.grants
             .iter()
