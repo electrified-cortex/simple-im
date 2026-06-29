@@ -30,7 +30,7 @@ If you already have a token (warm reconnect after restart), skip to Step 1.
 ## Step 1 — Open your SSE stream (POST /listen)
 
 ```
-POST /listen
+POST /listen   {"presence_push": true}   ← optional; omit for default (pull-only) mode
 Authorization: Bearer <your-token>
 ```
 
@@ -92,7 +92,7 @@ Events arrive on your persistent `/listen` stream:
 | `{"type":"service","event":"revoked"}` | Token revoked by governor — stop and re-register. |
 | `{"type":"service","event":"cancelled"}` | You called `DELETE /listen` — stream closed, name unbound. |
 | `{"type":"notify","pending":N}` | N messages waiting — call dequeue. |
-| `{"type":"presence","event":"online"\|"offline","participant":"<name>"}` | A grant-peer came online (announced) or went offline (cancelled, disconnected, or revoked). Only delivered when a bilateral grant exists between you and the participant. |
+| `{"type":"presence","event":"online"\|"offline","participant":"<name>"}` | A grant-peer came online (announced) or went offline. **Informational only — never a wake signal.** Only delivered when `presence_push:true` was set at subscribe time AND a bilateral grant exists. |
 | `{"type":"governance","event":"governorship_granted","governor_token":"..."}` | Your claim was approved — you are now the governor. |
 
 **SERVICE events always arrive regardless of notify state.** NOTIFY is edge-triggered (once per idle→busy transition, re-armed on dequeue).
@@ -340,16 +340,37 @@ Response: `{"messages":[...]}`
 3. Check `remaining`; if > 0, dequeue again.
 4. When `remaining == 0`, stop — next NOTIFY will fire on new arrival.
 
-## Check peer presence
+## Presence: pull vs push
+
+Presence is **pull-by-default**. Push is **opt-in** per subscription.
+
+### Pull (default) — query on demand
 
 ```
 GET /participants/<target-participant>/presence
 Authorization: Bearer <your-token>
 ```
 
-Returns `{"status":"online"|"offline"}`. No grant required.
+Returns `{"status":"online"|"offline"}`. Grant required (grant-scoped by default).
 
-**Caveat:** presence reporting can be unreliable — a participant that is live may still return `"offline"`. Do not use presence as a hard gate before sending.
+Returns the **settled** effective presence: during a brief connection drop (within the settle window), the participant still reports `online` — matching what push has not yet emitted.
+
+**Caveat:** presence reporting can be unreliable. Do not use it as a hard gate before sending.
+
+### Push (opt-in) — receive events on your stream
+
+Set `presence_push: true` in your `POST /listen` body to receive presence events:
+
+```json
+{"type":"presence","event":"online"|"offline","participant":"<name>"}
+```
+
+**Rules:**
+- **Informational only** — never a delivery wake signal. Ignore if you only care about messages.
+- **Opt-in per connection** — not persisted. If you reconnect without `presence_push:true`, no presence events are sent.
+- **Grant-scoped** — only grant-peers are visible.
+- **Offline is settled** — an `"offline"` event fires only after the participant has been absent for a configurable settle window (default 30 s). Rapid reconnects within the window cancel the timer — no spurious offline/online churn.
+- **Grant-scoping is unchanged** — only grant-peers see presence, whether via pull or push.
 
 ## Lost token / re-registration
 

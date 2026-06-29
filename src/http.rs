@@ -1307,6 +1307,10 @@ async fn handle_register(State(state): State<Arc<AppState>>) -> Response {
 #[derive(Deserialize, Default)]
 struct ListenBody {
     name: Option<String>,
+    /// Opt-in for push presence events (online/offline) from grant-peers.
+    /// When absent or false (the default), no presence events are delivered.
+    /// Must be set per subscription — not persisted across reconnects.
+    presence_push: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -1340,11 +1344,12 @@ async fn handle_listen(
         .map(|s| s.to_string());
 
     let name_to_bind = body.as_ref().and_then(|b| b.0.name.as_deref());
+    let presence_push = body.as_ref().and_then(|b| b.0.presence_push).unwrap_or(false);
 
     let (token, rx) =
         match state
             .hub
-            .open_listen(Some(&token), peer_ip, name_to_bind, observed_host, force)
+            .open_listen(Some(&token), peer_ip, name_to_bind, observed_host, force, presence_push)
         {
             Ok(pair) => pair,
             Err(e) => return err_response(e),
