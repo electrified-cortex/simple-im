@@ -3610,7 +3610,7 @@ impl DeliveryHub {
     ) -> Result<(String, mpsc::UnboundedReceiver<String>), Error> {
         // Token is required.
         let provided_token = token_opt.ok_or(Error::AuthFailed)?;
-        let observed_host_str = observed_host.unwrap_or_default();
+        let _observed_host_str = observed_host.unwrap_or_default();
         let (token, rx, bound_name_for_persist, gc_offline_events) = {
             let mut inner = self.lock();
             let gc_offline_events = inner.gc_tokens();
@@ -3837,6 +3837,32 @@ impl DeliveryHub {
                 }
                 .to_string();
                 let _ = tx.send(welcome);
+            }
+
+            // Emit sub event: provides last_message_id for gap detection on reconnect.
+            {
+                let last_msg_id = inner
+                    .listen_tokens
+                    .get(&token)
+                    .map(|st| *st.msg_id_watch.borrow())
+                    .unwrap_or(0);
+                let sub_event = serde_json::json!({
+                    "type": "sub",
+                    "last_message_id": last_msg_id,
+                })
+                .to_string();
+                let _ = tx.send(sub_event);
+            }
+
+            // Startup announce: fire sim_online exactly once on first SSE subscription.
+            if !inner.startup_announced {
+                inner.startup_announced = true;
+                let sim_online = serde_json::json!({
+                    "type": "service",
+                    "event": "sim_online",
+                })
+                .to_string();
+                let _ = tx.send(sim_online);
             }
 
             // SIM-1: Re-arm notify on reconnect and fire a catch-up NOTIFY if messages are
@@ -7850,12 +7876,11 @@ mod tests {
     #[test]
     fn ac_listen_conflict_returns_active_subscription_error() {
         let hub = make_hub(Duration::from_secs(30));
-        let gov = hub.install_governor(None);
-        let tok = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
+        let tok = hub.register_participant();
 
         // Open first listen stream.
         let (token, _rx1) = hub
-            .open_listen(Some(&tok.0), None, None, None, false)
+            .open_listen(Some(&tok), None, None, None, false)
             .expect("first open_listen must succeed");
 
         // Second open_listen without force → should return ActiveSubscription error.
@@ -7871,12 +7896,11 @@ mod tests {
     #[test]
     fn ac_listen_force_takeover_supersedes_prior_stream() {
         let hub = make_hub(Duration::from_secs(30));
-        let gov = hub.install_governor(None);
-        let tok = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
+        let tok = hub.register_participant();
 
         // Open first listen stream.
         let (token1, mut rx1) = hub
-            .open_listen(Some(&tok.0), None, None, None, false)
+            .open_listen(Some(&tok), None, None, None, false)
             .expect("first open_listen must succeed");
 
         // Second open_listen with force=true → should succeed and return same token.
@@ -7892,14 +7916,18 @@ mod tests {
 
         // The "superseded" event is sent synchronously inside open_listen before it returns,
         // so try_recv() works here without any async runtime — event is already queued.
-        let superseded_event = rx1.try_recv().ok();
+        // Note: rx1 also holds the welcome event from the first open_listen call; drain
+        // until we find "superseded".
+        let mut superseded_event = None;
+        while let Ok(ev) = rx1.try_recv() {
+            if ev.contains("superseded") {
+                superseded_event = Some(ev);
+                break;
+            }
+        }
         assert!(
-            superseded_event
-                .as_ref()
-                .map(|e| e.contains("superseded"))
-                .unwrap_or(false),
-            "old SSE rx should receive superseded event, got: {:?}",
-            superseded_event
+            superseded_event.is_some(),
+            "old SSE rx should receive superseded event, got none"
         );
     }
 
