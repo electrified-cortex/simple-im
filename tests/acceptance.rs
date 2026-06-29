@@ -3592,9 +3592,12 @@ async fn ac_pp_timer_cancellation() {
 
     // Online event delivered (B is back).
     let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
-    let online_ev =
-        wait_for_event_containing(&mut rx_a, &["\"presence\"", "\"online\"", "\"PpTcB\""], deadline)
-            .await;
+    let online_ev = wait_for_event_containing(
+        &mut rx_a,
+        &["\"presence\"", "\"online\"", "\"PpTcB\""],
+        deadline,
+    )
+    .await;
     assert!(
         online_ev.is_some(),
         "A must receive online event when B reconnects; got nothing"
@@ -3663,12 +3666,8 @@ async fn ac_pp_flap_collapse() {
         cur_tok_b = tok_bx;
         // Drain the online event fired by the reconnect announce.
         let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
-        let _ = wait_for_event_containing(
-            &mut rx_a,
-            &["\"presence\"", "\"online\""],
-            deadline,
-        )
-        .await;
+        let _ =
+            wait_for_event_containing(&mut rx_a, &["\"presence\"", "\"online\""], deadline).await;
     }
     drain_receiver(&mut rx_a);
 
@@ -3855,15 +3854,19 @@ async fn ac_ppv1_permissive_grant_sees_presence() {
     // B re-announces (triggers online push to grant-peers).
     hub.cancel_listen(&tok_b).unwrap();
     let tok_b2 = hub.register_participant();
-    let (_, _rx_b2) = hub.open_listen(Some(&tok_b2), None, None, None, false, false)
+    let (_, _rx_b2) = hub
+        .open_listen(Some(&tok_b2), None, None, None, false, false)
         .unwrap();
     hub.announce(&tok_b2, "PpB7a", false).unwrap();
 
     // Push: A should receive online event.
     let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
-    let ev =
-        wait_for_event_containing(&mut rx_a, &["\"presence\"", "\"online\"", "\"PpB7a\""], deadline)
-            .await;
+    let ev = wait_for_event_containing(
+        &mut rx_a,
+        &["\"presence\"", "\"online\"", "\"PpB7a\""],
+        deadline,
+    )
+    .await;
     assert!(
         ev.is_some(),
         "A must receive online event for B via grant-based presence; got nothing"
@@ -3938,9 +3941,12 @@ async fn ac_ppv3_shared_room_no_grant_sees_presence() {
 
     // Push: A must receive online event for B.
     let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
-    let ev =
-        wait_for_event_containing(&mut rx_a, &["\"presence\"", "\"online\"", "\"PpB7c\""], deadline)
-            .await;
+    let ev = wait_for_event_containing(
+        &mut rx_a,
+        &["\"presence\"", "\"online\"", "\"PpB7c\""],
+        deadline,
+    )
+    .await;
     assert!(
         ev.is_some(),
         "A must receive online event for B via room-based presence (no grant); got nothing"
