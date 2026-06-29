@@ -524,10 +524,12 @@ impl HubInner {
                     // Branches 1 (no grant) and 3 (ever_granted): both use unlisten_ttl.
                     now.duration_since(st.issued_at) > unlisten_ttl
                 } else if !st.ever_granted && st.name.is_none() {
-                    // Branch 2: ever_listened && !ever_granted && unbound.
-                    // Name-bound tokens (established identity, including governor listen tokens)
-                    // are exempt from age-GC here — they fall through to false below.
-                    // Stale named tokens are handled by the by-activity GC in 15-0029.
+                    // Branch 2: ever_listened && !ever_granted && name-unbound.
+                    // Tokens with an announced name (st.name.is_some()) fall through to false
+                    // and are never age-evicted — name binding is the exemption signal.
+                    // NOTE: only *named* governor sessions are exempt; a governor that has not
+                    // yet called announce() (name=None) remains eligible for Branch-2 GC.
+                    // Stale named token GC via last_active timestamp lands in 15-0029.
                     now.duration_since(st.issued_at) > no_grant_ttl
                 } else {
                     false
