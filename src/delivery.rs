@@ -7322,7 +7322,10 @@ mod tests {
             let inner = hub.inner.lock().unwrap();
             let st = &inner.listen_tokens[&tok];
             assert!(st.ever_listened, "ever_listened must be true");
-            assert!(!st.ever_granted, "no grant issued — ever_granted must be false");
+            assert!(
+                !st.ever_granted,
+                "no grant issued — ever_granted must be false"
+            );
             assert!(st.name.is_some(), "name must be bound after announce");
         }
 
