@@ -3486,6 +3486,517 @@ async fn ac_pp6b_stale_holder_reclaim_sends_offline_to_grant_peer_sse() {
     );
 }
 
+// AC-OPT1: Default listener (presence_push=false, has grant) receives ZERO presence events.
+// Verifies that presence push is truly opt-in even when a grant exists.
+#[tokio::test]
+async fn ac_pp_default_listener_no_events() {
+    use simple_im::trust::ApproveGrantRequest;
+    let (hub, gov) = make_presence_hub();
+
+    // A: open with presence_push=false (default, opt-out).
+    let tok_a = hub.register_participant();
+    let (_, mut rx_a) = hub
+        .open_listen(Some(&tok_a), None, None, None, false, false)
+        .unwrap();
+    hub.announce(&tok_a, "PpOptA", false).unwrap();
+
+    // B: open and announce.
+    let tok_b = hub.register_participant();
+    let (_, _rx_b) = hub
+        .open_listen(Some(&tok_b), None, None, None, false, false)
+        .unwrap();
+    hub.announce(&tok_b, "PpOptB", false).unwrap();
+
+    // Establish grant between A and B.
+    hub.approve_grant_req(
+        &gov,
+        &tok_a,
+        &tok_b,
+        None,
+        ApproveGrantRequest {
+            name_a: Some("PpOptA".to_string()),
+            name_b: Some("PpOptB".to_string()),
+            ..ApproveGrantRequest::default()
+        },
+    )
+    .unwrap();
+    drain_receiver(&mut rx_a);
+
+    // B goes offline then comes back online.
+    hub.cancel_listen(&tok_b).unwrap();
+    let tok_b2 = hub.register_participant();
+    let (_, _rx_b2) = hub
+        .open_listen(Some(&tok_b2), None, None, None, false, false)
+        .unwrap();
+    hub.announce(&tok_b2, "PpOptB", false).unwrap();
+
+    // Wait past the settle window for the offline event too.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // A must receive ZERO presence events (opted out).
+    let events = drain_receiver(&mut rx_a);
+    let has_presence = events.iter().any(|ev| ev.contains("\"presence\""));
+    assert!(
+        !has_presence,
+        "A (presence_push=false) must receive ZERO presence events even with a grant; got: {:?}",
+        events
+    );
+}
+
+// AC-OPT4a: Settle timer cancellation — participant reconnects before window expires → no offline.
+// Uses start_paused + time::advance so we can precisely control timing.
+#[tokio::test(start_paused = true)]
+async fn ac_pp_timer_cancellation() {
+    use simple_im::trust::ApproveGrantRequest;
+    let (hub, gov) = make_presence_hub();
+    // 50 ms settle window (set by make_presence_hub).
+
+    let tok_a = hub.register_participant();
+    let (_, mut rx_a) = hub
+        .open_listen(Some(&tok_a), None, None, None, false, true)
+        .unwrap();
+    hub.announce(&tok_a, "PpTcA", false).unwrap();
+
+    let tok_b = hub.register_participant();
+    let (_, _rx_b) = hub
+        .open_listen(Some(&tok_b), None, None, None, false, false)
+        .unwrap();
+    hub.announce(&tok_b, "PpTcB", false).unwrap();
+
+    hub.approve_grant_req(
+        &gov,
+        &tok_a,
+        &tok_b,
+        None,
+        ApproveGrantRequest {
+            name_a: Some("PpTcA".to_string()),
+            name_b: Some("PpTcB".to_string()),
+            ..ApproveGrantRequest::default()
+        },
+    )
+    .unwrap();
+    drain_receiver(&mut rx_a);
+
+    // B drops (settle timer starts, time is paused so timer doesn't fire).
+    hub.cancel_listen(&tok_b).unwrap();
+
+    // Advance 20 ms — still inside the 50 ms window.
+    tokio::time::advance(Duration::from_millis(20)).await;
+
+    // B reconnects before the window expires — this must cancel the settle timer.
+    let tok_b2 = hub.register_participant();
+    let (_, _rx_b2) = hub
+        .open_listen(Some(&tok_b2), None, None, None, false, false)
+        .unwrap();
+    hub.announce(&tok_b2, "PpTcB", false).unwrap();
+
+    // Online event delivered (B is back).
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+    let online_ev =
+        wait_for_event_containing(&mut rx_a, &["\"presence\"", "\"online\"", "\"PpTcB\""], deadline)
+            .await;
+    assert!(
+        online_ev.is_some(),
+        "A must receive online event when B reconnects; got nothing"
+    );
+    drain_receiver(&mut rx_a);
+
+    // Advance well past the settle window — offline must NOT fire (timer was cancelled).
+    tokio::time::advance(Duration::from_millis(200)).await;
+
+    let events = drain_receiver(&mut rx_a);
+    let has_offline = events
+        .iter()
+        .any(|ev| ev.contains("\"offline\"") && ev.contains("\"PpTcB\""));
+    assert!(
+        !has_offline,
+        "No offline event must arrive when reconnect happens before settle window; got: {:?}",
+        events
+    );
+}
+
+// AC-OPT4b: Flap collapse — multiple drops within the settle window yield at most one offline.
+// Each reconnect happens synchronously (well within the 50ms settle window), cancelling the
+// pending settle timer. Only the final drop (no reconnect) should fire exactly one offline.
+#[tokio::test]
+async fn ac_pp_flap_collapse() {
+    use simple_im::trust::ApproveGrantRequest;
+    let (hub, gov) = make_presence_hub();
+
+    let tok_a = hub.register_participant();
+    let (_, mut rx_a) = hub
+        .open_listen(Some(&tok_a), None, None, None, false, true)
+        .unwrap();
+    hub.announce(&tok_a, "PpFlA", false).unwrap();
+
+    let tok_b = hub.register_participant();
+    let (_, _rx_b) = hub
+        .open_listen(Some(&tok_b), None, None, None, false, false)
+        .unwrap();
+    hub.announce(&tok_b, "PpFlB", false).unwrap();
+
+    hub.approve_grant_req(
+        &gov,
+        &tok_a,
+        &tok_b,
+        None,
+        ApproveGrantRequest {
+            name_a: Some("PpFlA".to_string()),
+            name_b: Some("PpFlB".to_string()),
+            ..ApproveGrantRequest::default()
+        },
+    )
+    .unwrap();
+    drain_receiver(&mut rx_a);
+
+    // Flap B online→offline×3 synchronously (all within the 50 ms settle window).
+    // Each reconnect cancels the pending settle timer so no offline is emitted mid-flap.
+    let mut cur_tok_b = tok_b.clone();
+    for _ in 0u32..3 {
+        hub.cancel_listen(&cur_tok_b).unwrap();
+        // Reconnect immediately — well within the 50 ms window.
+        let tok_bx = hub.register_participant();
+        let (_, _rx_bx) = hub
+            .open_listen(Some(&tok_bx), None, None, None, false, false)
+            .unwrap();
+        hub.announce(&tok_bx, "PpFlB", false).unwrap();
+        cur_tok_b = tok_bx;
+        // Drain the online event fired by the reconnect announce.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+        let _ = wait_for_event_containing(
+            &mut rx_a,
+            &["\"presence\"", "\"online\""],
+            deadline,
+        )
+        .await;
+    }
+    drain_receiver(&mut rx_a);
+
+    // Final drop — settle timer starts; this time no reconnect, so it fires.
+    hub.cancel_listen(&cur_tok_b).unwrap();
+
+    // Wait past the settle window for the offline event.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+    let offline_ev = wait_for_event_containing(
+        &mut rx_a,
+        &["\"presence\"", "\"offline\"", "\"PpFlB\""],
+        deadline,
+    )
+    .await;
+    assert!(
+        offline_ev.is_some(),
+        "Exactly one offline event expected after flap + final drop; got nothing"
+    );
+
+    // No additional offline events — the flaps were collapsed.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let extra = drain_receiver(&mut rx_a);
+    let extra_offline = extra
+        .iter()
+        .filter(|ev| ev.contains("\"offline\"") && ev.contains("\"PpFlB\""))
+        .count();
+    assert_eq!(
+        extra_offline, 0,
+        "No additional offline events expected after the settle fires; got {extra_offline}: {:?}",
+        extra
+    );
+}
+
+// AC-OPT5: Pull presence during settle window reports "online" (pre-settle state).
+// Uses close_listen (unexpected drop) so the name binding stays; settle window is paused.
+// Note: this test only verifies the "during settle = online" half of the invariant.
+// The "after settle = offline" is only detectable once the liveness registry window also
+// expires (30 s default), which cannot be observed within a fast unit test.
+#[tokio::test(start_paused = true)]
+async fn ac_pp_pull_during_settle() {
+    use simple_im::trust::ApproveGrantRequest;
+    let (hub, gov) = make_presence_hub();
+
+    let tok_a = hub.register_participant();
+    let (_, _rx_a) = hub
+        .open_listen(Some(&tok_a), None, None, None, false, true)
+        .unwrap();
+    hub.announce(&tok_a, "PpPsA", false).unwrap();
+
+    let tok_b = hub.register_participant();
+    let (_, _rx_b) = hub
+        .open_listen(Some(&tok_b), None, None, None, false, false)
+        .unwrap();
+    hub.announce(&tok_b, "PpPsB", false).unwrap();
+
+    hub.approve_grant_req(
+        &gov,
+        &tok_a,
+        &tok_b,
+        None,
+        ApproveGrantRequest {
+            name_a: Some("PpPsA".to_string()),
+            name_b: Some("PpPsB".to_string()),
+            ..ApproveGrantRequest::default()
+        },
+    )
+    .unwrap();
+
+    // Simulate unexpected SSE drop for B (name binding stays, settle timer starts, time paused).
+    hub.close_listen(&tok_b);
+
+    // Advance 10 ms — inside the 50 ms window.
+    tokio::time::advance(Duration::from_millis(10)).await;
+
+    // Pull from A's perspective: B should still appear online during the settle window.
+    let result = hub.presence_for_token(&tok_a, "PpPsB");
+    assert!(
+        result.unwrap_or(false),
+        "Presence pull must report 'online' for B while settle timer has not yet fired"
+    );
+}
+
+// AC-OPT6: Opt-in flag (presence_push) is NOT persisted across re-listen sessions.
+// Listener opens with presence_push=true, disconnects, reconnects WITHOUT the flag → zero events.
+#[tokio::test]
+async fn ac_pp_opt_in_not_persisted() {
+    use simple_im::trust::ApproveGrantRequest;
+    let (hub, gov) = make_presence_hub();
+
+    let tok_a = hub.register_participant();
+    // First session: opt-in.
+    let (_, _rx_a1) = hub
+        .open_listen(Some(&tok_a), None, None, None, false, true)
+        .unwrap();
+    hub.announce(&tok_a, "PpNpA", false).unwrap();
+
+    let tok_b = hub.register_participant();
+    let (_, _rx_b) = hub
+        .open_listen(Some(&tok_b), None, None, None, false, false)
+        .unwrap();
+    hub.announce(&tok_b, "PpNpB", false).unwrap();
+
+    hub.approve_grant_req(
+        &gov,
+        &tok_a,
+        &tok_b,
+        None,
+        ApproveGrantRequest {
+            name_a: Some("PpNpA".to_string()),
+            name_b: Some("PpNpB".to_string()),
+            ..ApproveGrantRequest::default()
+        },
+    )
+    .unwrap();
+
+    // A's SSE drops (unexpected — but A re-listens immediately with presence_push=false).
+    hub.close_listen(&tok_a);
+
+    // Re-open A's listen WITHOUT presence_push (opt-out for the new session).
+    let (_, mut rx_a2) = hub
+        .open_listen(Some(&tok_a), None, None, None, false, false)
+        .unwrap();
+
+    drain_receiver(&mut rx_a2);
+
+    // B goes offline and comes back — both events should NOT reach A.
+    hub.cancel_listen(&tok_b).unwrap();
+    let tok_b2 = hub.register_participant();
+    let (_, _rx_b2) = hub
+        .open_listen(Some(&tok_b2), None, None, None, false, false)
+        .unwrap();
+    hub.announce(&tok_b2, "PpNpB", false).unwrap();
+
+    // Wait past the settle window.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let events = drain_receiver(&mut rx_a2);
+    let has_presence = events.iter().any(|ev| ev.contains("\"presence\""));
+    assert!(
+        !has_presence,
+        "A must NOT receive presence events in the reconnect session where presence_push=false; got: {:?}",
+        events
+    );
+}
+
+// ── Visibility rule tests (operator-final-rule, 15-0028) ──────────────────────
+//
+// These four binary tests verify the complete presence-visibility rule:
+//   Visible IFF (permissive grant) OR (shared room), UNLESS (deny grant).
+
+// AC-VIS1: participant with a permissive grant receives presence event for peer (push + pull).
+#[tokio::test]
+async fn ac_ppv1_permissive_grant_sees_presence() {
+    use simple_im::trust::ApproveGrantRequest;
+    let (hub, gov) = make_presence_hub();
+
+    let tok_a = hub.register_participant();
+    let (_, mut rx_a) = hub
+        .open_listen(Some(&tok_a), None, None, None, false, true)
+        .unwrap();
+    hub.announce(&tok_a, "PpA7a", false).unwrap();
+
+    let tok_b = hub.register_participant();
+    let (_, _rx_b) = hub
+        .open_listen(Some(&tok_b), None, None, None, false, false)
+        .unwrap();
+    hub.announce(&tok_b, "PpB7a", false).unwrap();
+
+    // Establish permissive grant.
+    hub.approve_grant_req(
+        &gov,
+        &tok_a,
+        &tok_b,
+        None,
+        ApproveGrantRequest {
+            name_a: Some("PpA7a".to_string()),
+            name_b: Some("PpB7a".to_string()),
+            ..ApproveGrantRequest::default()
+        },
+    )
+    .unwrap();
+    drain_receiver(&mut rx_a);
+
+    // B re-announces (triggers online push to grant-peers).
+    hub.cancel_listen(&tok_b).unwrap();
+    let tok_b2 = hub.register_participant();
+    let (_, _rx_b2) = hub.open_listen(Some(&tok_b2), None, None, None, false, false)
+        .unwrap();
+    hub.announce(&tok_b2, "PpB7a", false).unwrap();
+
+    // Push: A should receive online event.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+    let ev =
+        wait_for_event_containing(&mut rx_a, &["\"presence\"", "\"online\"", "\"PpB7a\""], deadline)
+            .await;
+    assert!(
+        ev.is_some(),
+        "A must receive online event for B via grant-based presence; got nothing"
+    );
+
+    // Pull: A should see B as online.
+    assert!(
+        hub.presence_for_token(&tok_b2, "PpB7a").unwrap_or(false)
+            || hub.presence_for_token(&tok_a, "PpB7a").unwrap_or(false),
+        "Presence pull must return true for grant-peer"
+    );
+}
+
+// AC-VIS2: no grant AND no shared room → ZERO presence visibility (push + pull).
+#[tokio::test]
+async fn ac_ppv2_no_grant_no_room_zero_visibility() {
+    let (hub, _gov) = make_presence_hub();
+
+    let tok_a = hub.register_participant();
+    let (_, mut rx_a) = hub
+        .open_listen(Some(&tok_a), None, None, None, false, true)
+        .unwrap();
+    hub.announce(&tok_a, "PpA7b", false).unwrap();
+
+    let tok_b = hub.register_participant();
+    let (_, _rx_b) = hub
+        .open_listen(Some(&tok_b), None, None, None, false, false)
+        .unwrap();
+    // No grant, no shared room.
+    drain_receiver(&mut rx_a);
+
+    hub.announce(&tok_b, "PpB7b", false).unwrap();
+
+    // Push: A must NOT receive any event (no grant, no room).
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        rx_a.try_recv().is_err(),
+        "A must NOT receive push events for B without grant or shared room"
+    );
+
+    // Pull: A must NOT see B's presence.
+    assert!(
+        !hub.presence_for_token(&tok_a, "PpB7b").unwrap(),
+        "A must NOT see B's presence via pull without grant or shared room"
+    );
+}
+
+// AC-VIS3: shared room but NO grant → receives presence event for room-peer (push + pull).
+#[tokio::test]
+async fn ac_ppv3_shared_room_no_grant_sees_presence() {
+    let (hub, _gov) = make_presence_hub();
+
+    let tok_a = hub.register_participant();
+    let (_, mut rx_a) = hub
+        .open_listen(Some(&tok_a), None, None, None, false, true)
+        .unwrap();
+    hub.announce(&tok_a, "PpA7c", false).unwrap();
+
+    // Both A and B join the same room BEFORE B announces (no grant between them).
+    let rs = hub.room_store();
+    let room_id = rs.create();
+    rs.join(&room_id, "PpA7c", None).unwrap();
+    rs.join(&room_id, "PpB7c", None).unwrap();
+
+    drain_receiver(&mut rx_a);
+
+    // B announces — should push online event to A via room membership.
+    let tok_b = hub.register_participant();
+    hub.open_listen(Some(&tok_b), None, None, None, false, false)
+        .unwrap();
+    hub.announce(&tok_b, "PpB7c", false).unwrap();
+
+    // Push: A must receive online event for B.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+    let ev =
+        wait_for_event_containing(&mut rx_a, &["\"presence\"", "\"online\"", "\"PpB7c\""], deadline)
+            .await;
+    assert!(
+        ev.is_some(),
+        "A must receive online event for B via room-based presence (no grant); got nothing"
+    );
+
+    // Pull: A must see B as online.
+    assert!(
+        hub.presence_for_token(&tok_a, "PpB7c").unwrap(),
+        "A must see B's presence via pull when they share a room (no grant)"
+    );
+}
+
+// AC-VIS4: deny/negative grant → ZERO presence even when sharing a room (push + pull).
+#[tokio::test]
+async fn ac_ppv4_deny_grant_zero_visibility_even_in_room() {
+    let (hub, gov) = make_presence_hub();
+
+    let tok_a = hub.register_participant();
+    let (_, mut rx_a) = hub
+        .open_listen(Some(&tok_a), None, None, None, false, true)
+        .unwrap();
+    hub.announce(&tok_a, "PpA7d", false).unwrap();
+
+    // Place a denial block: A (tok_a) is blocked from seeing B ("PpB7d").
+    // Key: (from_identity=tok_a, to_name="PpB7d") — mirrors the messaging deny-grant model.
+    hub.block_direct(&gov, &tok_a, "PpB7d", "test block", None)
+        .unwrap();
+
+    // Both A and B join the same room.
+    let rs = hub.room_store();
+    let room_id = rs.create();
+    rs.join(&room_id, "PpA7d", None).unwrap();
+    rs.join(&room_id, "PpB7d", None).unwrap();
+
+    drain_receiver(&mut rx_a);
+
+    // B announces — deny block must prevent A from receiving the event.
+    let tok_b = hub.register_participant();
+    hub.open_listen(Some(&tok_b), None, None, None, false, false)
+        .unwrap();
+    hub.announce(&tok_b, "PpB7d", false).unwrap();
+
+    // Push: A must NOT receive any event (deny grant overrides room).
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        rx_a.try_recv().is_err(),
+        "A must NOT receive push events for B when a deny grant is active"
+    );
+
+    // Pull: A must NOT see B's presence (deny overrides room).
+    assert!(
+        !hub.presence_for_token(&tok_a, "PpB7d").unwrap(),
+        "A must NOT see B's presence via pull when a deny grant is active"
+    );
+}
+
 // ── End of presence push tests ─────────────────────────────────────────────────
 
 // ── Startup announce tests ─────────────────────────────────────────────────────

@@ -41,8 +41,9 @@ const OPENAPI_YAML: &str = include_str!("../docs/openapi.yaml");
 /// Shared Axum application state holding the delivery hub and attachment configuration.
 pub struct AppState {
     pub hub: DeliveryHub,
-    /// In-memory room store — does not persist across server restarts.
-    pub rooms: RoomStore,
+    /// In-memory room store — shared with the hub for room-based presence visibility.
+    /// Does not persist across server restarts.
+    pub rooms: Arc<RoomStore>,
     pub attachment_ttl: Duration,
     pub attachment_max_bytes: usize,
 }
@@ -51,9 +52,12 @@ impl AppState {
     /// Creates `AppState` with an in-memory hub; used in tests and default startup.
     pub fn new(liveness_window: Duration) -> Self {
         let (attachment_ttl, attachment_max_bytes) = attachment_config();
+        let hub = DeliveryHub::new(liveness_window);
+        // Share the room store between hub (for presence fanout) and HTTP handlers.
+        let rooms = hub.room_store();
         Self {
-            hub: DeliveryHub::new(liveness_window),
-            rooms: RoomStore::new(),
+            hub,
+            rooms,
             attachment_ttl,
             attachment_max_bytes,
         }
@@ -62,9 +66,10 @@ impl AppState {
     /// Creates `AppState` wrapping an existing hub; used when restoring persisted state.
     pub fn new_with_hub(hub: DeliveryHub) -> Self {
         let (attachment_ttl, attachment_max_bytes) = attachment_config();
+        let rooms = hub.room_store();
         Self {
             hub,
-            rooms: RoomStore::new(),
+            rooms,
             attachment_ttl,
             attachment_max_bytes,
         }
