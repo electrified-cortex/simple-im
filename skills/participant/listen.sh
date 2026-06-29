@@ -26,8 +26,12 @@ FAIL_COUNT=0
 FAIL_LIMIT=10   # consecutive fast-failed reconnects → fail-hard: unravel + alert.
                # ~5 min with capped backoff: rides through a routine redeploy/bounce
                # (auto-reconnect), only unravels on a genuine prolonged outage.
+FORCE_LISTEN=""  # Set to "--force" when ACTIVE_SUBSCRIPTION flag fires; cleared after each connect()
 
 connect() {
+    local listen_extra=""
+    [[ "${1:-}" == "--force" ]] && listen_extra="?force=true"
+
     local token
     token="$(cat "$TOKEN_FILE" 2>/dev/null | tr -d '[:space:]')"
 
@@ -55,13 +59,7 @@ connect() {
     local connect_start
     connect_start=$(date +%s)
 
-    # Self-heal: cancel any prior orphaned subscription before (re)connecting.
-    # DELETE /listen unbinds name + marks offline — prevents 409 on POST /listen
-    # and 409 NAME_IN_USE on announce after restarts. 404 = no prior sub (safe).
-    curl -s -o /dev/null -m 5 -X DELETE "$SIM_URL/listen" \
-        ${auth_header:+-H "$auth_header"} 2>/dev/null || true
-
-    curl -s -N -X POST "$SIM_URL/listen" \
+    curl -s -N -X POST "$SIM_URL/listen${listen_extra}" \
         -H "Content-Type: application/json" \
         ${auth_header:+-H "$auth_header"} \
         -d '{}' 2>/dev/null | while IFS= read -r line; do
@@ -77,6 +75,12 @@ connect() {
         if [[ "$line" == *'"AUTH_FAILED"'* || "$line" == *'"TOKEN_REJECTED"'* ]]; then
             echo >&2 "sim: token rejected — clearing for re-registration"
             > "$TOKEN_FILE"
+            break
+        fi
+
+        if [[ "$line" == *'"ACTIVE_SUBSCRIPTION"'* ]]; then
+            echo >&2 "sim: orphaned subscription detected — will force-reclaim on next connect"
+            echo "FORCE_RECLAIM" > "$SCRIPT_DIR/.sim_force_reclaim_flag"
             break
         fi
 
@@ -136,7 +140,8 @@ connect() {
 
 while true; do
     connect_start=$(date +%s)
-    connect
+    connect "$FORCE_LISTEN"
+    FORCE_LISTEN=""  # reset after each connect() call
     connect_end=$(date +%s)
     elapsed=$((connect_end - connect_start))
 
@@ -147,6 +152,16 @@ while true; do
     if [[ -f "$SCRIPT_DIR/.sim_revoke_flag" ]] || [[ ! -s "$TOKEN_FILE" ]]; then
         rm -f "$SCRIPT_DIR/.sim_revoke_flag"
         BACKOFF=2
+        continue
+    fi
+
+    # Orphaned subscription recovery (ACTIVE_SUBSCRIPTION 409).
+    # Use ?force=true on the NEXT connect() call — no DELETE, no FAIL_COUNT increment.
+    if [[ -f "$SCRIPT_DIR/.sim_force_reclaim_flag" ]]; then
+        rm -f "$SCRIPT_DIR/.sim_force_reclaim_flag"
+        FORCE_LISTEN="--force"
+        BACKOFF=2
+        echo >&2 "sim: orphaned subscription — next connect will use force-reclaim"
         continue
     fi
 
