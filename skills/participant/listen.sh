@@ -55,6 +55,12 @@ connect() {
     local connect_start
     connect_start=$(date +%s)
 
+    # Self-heal: cancel any prior orphaned subscription before (re)connecting.
+    # DELETE /listen unbinds name + marks offline — prevents 409 on POST /listen
+    # and 409 NAME_IN_USE on announce after restarts. 404 = no prior sub (safe).
+    curl -s -o /dev/null -m 5 -X DELETE "$SIM_URL/listen" \
+        ${auth_header:+-H "$auth_header"} 2>/dev/null || true
+
     curl -s -N -X POST "$SIM_URL/listen" \
         -H "Content-Type: application/json" \
         ${auth_header:+-H "$auth_header"} \
@@ -86,7 +92,7 @@ connect() {
                     announce_result=$(curl -s -w "\n%{http_code}" -X POST "$SIM_URL/announce" \
                         -H "Content-Type: application/json" \
                         -H "Authorization: Bearer $token" \
-                        -d "{\"name\":\"$HANDLE\"}" 2>/dev/null)
+                        -d "{\"name\":\"$HANDLE\",\"force\":true}" 2>/dev/null)
                     announce_code="${announce_result##*$'\n'}"
                     echo >&2 "sim: announce HTTP $announce_code"
                     if [[ "$announce_code" != "204" ]]; then
@@ -111,7 +117,14 @@ connect() {
                     ;;
                 notify/*)
                     pending=$(echo "$data" | grep -o '"pending":[0-9]*' | grep -o '[0-9]*')
-                    echo "sim: notify pending=${pending:-?}"
+                    if [[ "${pending:-0}" -gt 0 ]]; then
+                        echo "sim: notify pending=${pending}"
+                    else
+                        echo >&2 "sim: notify pending=0 (no wake)"
+                    fi
+                    ;;
+                presence/*)
+                    echo >&2 "sim: presence event=${event} participant=$(echo "$data" | grep -o '"participant":"[^"]*"' | sed 's/"participant":"//;s/"//')"
                     ;;
                 *)
                     echo >&2 "sim: event type=$type event=$event"
