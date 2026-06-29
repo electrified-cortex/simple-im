@@ -663,9 +663,10 @@ impl HubInner {
                     // Branch 2: ever_listened && !ever_granted && name-unbound.
                     // Tokens with an announced name (st.name.is_some()) fall through to false
                     // and are never age-evicted — name binding is the exemption signal.
-                    // NOTE: only *named* governor sessions are exempt; a governor that has not
-                    // yet called announce() (name=None) remains eligible for Branch-2 GC.
+                    // NOTE: only named sessions are exempt; a session that has not called
+                    // announce() (name=None) remains eligible for Branch-2 GC.
                     // Stale named token GC via last_active timestamp lands in 15-0029.
+                    // (P0 fix: gc-named-token-exemption — preserved from hotfix/dbcb351)
                     now.duration_since(st.issued_at) > no_grant_ttl
                 } else {
                     false
