@@ -1344,16 +1344,22 @@ async fn handle_listen(
         .map(|s| s.to_string());
 
     let name_to_bind = body.as_ref().and_then(|b| b.0.name.as_deref());
-    let presence_push = body.as_ref().and_then(|b| b.0.presence_push).unwrap_or(false);
+    let presence_push = body
+        .as_ref()
+        .and_then(|b| b.0.presence_push)
+        .unwrap_or(false);
 
-    let (token, rx) =
-        match state
-            .hub
-            .open_listen(Some(&token), peer_ip, name_to_bind, observed_host, force, presence_push)
-        {
-            Ok(pair) => pair,
-            Err(e) => return err_response(e),
-        };
+    let (token, rx) = match state.hub.open_listen(
+        Some(&token),
+        peer_ip,
+        name_to_bind,
+        observed_host,
+        force,
+        presence_push,
+    ) {
+        Ok(pair) => pair,
+        Err(e) => return err_response(e),
+    };
 
     let token_for_drop = token.clone();
     let state_for_drop = Arc::clone(&state);
