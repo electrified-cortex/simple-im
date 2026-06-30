@@ -6,6 +6,7 @@ use std::time::{Duration, Instant, SystemTime};
 use rand::Rng;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio::time::timeout;
 
@@ -223,6 +224,9 @@ struct ListenTokenState {
     /// This eliminates the TOCTOU window where GC evicts a freshly minted token before
     /// the client can call `open_listen()`.  See: sim-gc-race-register-open-listen.
     pending_first_listen: bool,
+    /// Whether this subscription opted-in to push presence events.
+    /// Set at open_listen time; not persisted.
+    presence_push: bool,
 }
 
 impl ListenTokenState {
@@ -242,6 +246,7 @@ impl ListenTokenState {
             governor_id: None,
             msg_id_watch: msg_id_tx,
             pending_first_listen: false,
+            presence_push: false,
         }
     }
 
@@ -353,7 +358,8 @@ impl HubInner {
             .retain(|h| !h.resolved && h.expires > now);
     }
 
-    /// Collect active SSE senders for all grant-peers of `name`.
+    /// Collect active SSE senders for all grant-peers of `name` (unfiltered).
+    /// Used for non-presence broadcast; grant-presence delivery uses grant_peer_presence_senders.
     /// Used to push presence events (online/offline) after a name is bound or unbound.
     ///
     /// Two resolution paths (15-0002F fix):
@@ -366,6 +372,7 @@ impl HubInner {
     /// Minted-agent grant-peers (registered via /register, not /listen) have no stored SSE
     /// sender in HubInner and fall through both paths silently.
     /// TODO(15-0002F): pushing to minted-agent grant-peers requires a separate sender registry.
+    #[allow(dead_code)]
     fn grant_peer_senders(&self, name: &str) -> Vec<mpsc::UnboundedSender<String>> {
         // Resolve the identity for this named agent.
         // INVARIANT: grant_peer_senders is always called before removing the agent from
@@ -622,9 +629,9 @@ impl HubInner {
 
     /// GC expired tokens inline. Called on listen/announce/dequeue operations.
     ///
-    /// Returns a list of `(senders, name)` pairs for Branch-3 evictions.  Each entry
+    /// Returns a list of `(name, senders, cancel_rx)` tuples for Branch-3 evictions.  Each entry
     /// represents a token that was `!ever_listened && ever_granted` and has now been
-    /// evicted.  The **caller must fire `push_presence_event(senders, &name, "offline")`
+    /// evicted.  The **caller must call `spawn_settle_task(name, senders, settle_window, cancel_rx)`
     /// for every entry after releasing the lock** (out-of-lock, silent drop). (15-0002H)
     fn gc_tokens(
         &mut self,
@@ -683,21 +690,24 @@ impl HubInner {
             .map(|(tok, _)| tok.clone())
             .collect();
 
-        let mut offline_events: Vec<(Vec<mpsc::UnboundedSender<String>>, String)> = Vec::new();
+        let mut offline_events: Vec<(
+            String,
+            Vec<mpsc::UnboundedSender<String>>,
+            oneshot::Receiver<()>,
+        )> = Vec::new();
 
         for tok in to_remove {
             self.sse_connections.remove(&tok);
             if let Some(st) = self.listen_tokens.remove(&tok)
                 && let Some(ref name) = st.name
             {
-                // Branch 3: collect grant-peer senders BEFORE removing from agents map.
-                // INVARIANT: grant_peer_senders() must be called while agents[name] still
-                // exists (see grant_peer_senders() doc). (15-0002H)
-                if st.ever_granted {
-                    let senders = self.grant_peer_senders(name);
-                    if !senders.is_empty() {
-                        offline_events.push((senders, name.clone()));
-                    }
+                // Branch 3: begin settle BEFORE removing from agents map.
+                // INVARIANT: grant_peer_presence_senders() must be called while agents[name]
+                // still exists (see grant_peer_senders() doc). (15-0002H)
+                if st.ever_granted
+                    && let Some((senders, cancel_rx)) = self.begin_settle_offline(name.as_str())
+                {
+                    offline_events.push((name.clone(), senders, cancel_rx));
                 }
                 self.name_to_token.remove(name.as_str());
                 self.agents.remove(name.as_str());
@@ -766,6 +776,29 @@ fn push_presence_event(senders: Vec<mpsc::UnboundedSender<String>>, name: &str, 
     for tx in senders {
         let _ = tx.send(ev.clone());
     }
+}
+
+/// Spawn an async settle task that fires an offline presence event after `settle_window`,
+/// unless cancelled first via the `cancel_rx` oneshot.
+/// Uses try_current() so sync test contexts silently skip the spawn.
+fn spawn_settle_task(
+    name: String,
+    senders: Vec<mpsc::UnboundedSender<String>>,
+    settle_window: Duration,
+    cancel_rx: oneshot::Receiver<()>,
+) {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            tokio::select! {
+                _ = tokio::time::sleep(settle_window) => {
+                    push_presence_event(senders, &name, "offline");
+                }
+                _ = cancel_rx => {}
+            }
+        });
+    }
+    // No runtime (sync test context): drop cancel_rx, settle never fires.
+    // settle_tasks already holds the sender which will be cleaned up on next online.
 }
 
 fn clamp_env_secs(var: &str, min: u64, max: u64, default: u64) -> Duration {
@@ -940,6 +973,11 @@ impl DeliveryHub {
     #[cfg(test)]
     fn set_gc_registration_grace_for_test(&self, grace: Duration) {
         self.lock().gc_registration_grace = grace;
+    }
+
+    /// Override the settle window for testing purposes.
+    pub fn set_settle_window_for_test(&self, window: Duration) {
+        self.lock().settle_window = window;
     }
 
     /// Subscribe to the governor event broadcast channel (governance notices, concurrent-use alerts).
@@ -2240,9 +2278,9 @@ impl DeliveryHub {
 
     /// Deregister an agent by name, removing it from the roster and notifying grant-peers of its offline status.
     pub fn deregister(&self, name: &str, token: &ParticipantToken) -> Result<(), Error> {
-        // Collect grant-peer senders inside the lock (before name is removed from maps),
-        // then fire the offline presence event after the lock releases. (15-0002D)
-        let offline_senders = {
+        // Begin settle inside the lock (before name is removed from maps),
+        // then spawn settle task after the lock releases. (15-0002D)
+        let (settle_opt, settle_window) = {
             let mut inner = self.lock();
             inner.trust.validate_participant_token(token)?;
             let identity = inner
@@ -2253,7 +2291,8 @@ impl DeliveryHub {
             inner
                 .registry
                 .deregister(name, ParticipantIdentity::valid(&identity))?;
-            let offline_senders = inner.grant_peer_senders(name);
+            let settle_opt = inner.begin_settle_offline(name);
+            let settle_window = inner.settle_window;
             inner.agents.remove(name);
             inner.token_to_name.remove(&token.0);
             inner.active_sse_connections.remove(name);
@@ -2262,20 +2301,23 @@ impl DeliveryHub {
             inner
                 .connection_requests
                 .retain(|_, r| r.from_name != name && r.to_name != name);
-            offline_senders
+            (settle_opt, settle_window)
         }; // lock released
-        push_presence_event(offline_senders, name, "offline");
+        if let Some((senders, cancel_rx)) = settle_opt {
+            spawn_settle_task(name.to_string(), senders, settle_window, cancel_rx);
+        }
         Ok(())
     }
 
     /// Governor force-deregister: removes any registered agent by name, bypassing identity check.
     pub fn governor_deregister(&self, name: &str, gov: &GovernorToken) -> Result<(), Error> {
-        // Collect grant-peer senders inside the lock (before name is removed from maps),
-        // then fire the offline presence event after the lock releases. (15-0002D)
-        let offline_senders = {
+        // Begin settle inside the lock (before name is removed from maps),
+        // then spawn settle task after the lock releases. (15-0002D)
+        let (settle_opt, settle_window) = {
             let mut inner = self.lock();
             inner.trust.validate_governor_token(gov)?;
-            let offline_senders = inner.grant_peer_senders(name);
+            let settle_opt = inner.begin_settle_offline(name);
+            let settle_window = inner.settle_window;
             inner.registry.force_deregister(name);
             inner.agents.remove(name);
             inner.token_to_name.retain(|_, n| n != name);
@@ -2285,20 +2327,23 @@ impl DeliveryHub {
             inner
                 .connection_requests
                 .retain(|_, r| r.from_name != name && r.to_name != name);
-            offline_senders
+            (settle_opt, settle_window)
         }; // lock released
-        push_presence_event(offline_senders, name, "offline");
+        if let Some((senders, cancel_rx)) = settle_opt {
+            spawn_settle_task(name.to_string(), senders, settle_window, cancel_rx);
+        }
         Ok(())
     }
 
     /// Governor-deregisters a minted agent AND revokes their listen token (if any), atomically.
-    /// The SSE revocation event and presence "offline" event are sent after the lock releases.
+    /// The SSE revocation event and presence settle task are started after the lock releases.
     pub fn revoke_by_name(&self, name: &str, gov: &GovernorToken) -> Result<(), Error> {
-        let (sse_sender, offline_senders) = {
+        let (sse_sender, settle_opt, settle_window) = {
             let mut inner = self.lock();
             inner.trust.validate_governor_token(gov)?;
-            // Collect grant-peer senders BEFORE removing name from maps (presence push AC4 / TR4).
-            let offline_senders = inner.grant_peer_senders(name);
+            // Begin settle BEFORE removing name from maps (presence push AC4 / TR4).
+            let settle_opt = inner.begin_settle_offline(name);
+            let settle_window = inner.settle_window;
             // minted-agent deregister
             inner.registry.force_deregister(name);
             inner.agents.remove(name);
@@ -2320,14 +2365,16 @@ impl DeliveryHub {
             } else {
                 None
             };
-            (sse_sender, offline_senders)
+            (sse_sender, settle_opt, settle_window)
         }; // lock released
 
         if let Some(tx) = sse_sender {
             let _ = tx.send(r#"{"type":"service","event":"revoked"}"#.to_string());
         }
-        // Fire presence "offline" event to all grant-peers with active SSE streams.
-        push_presence_event(offline_senders, name, "offline");
+        // Spawn settle task for opted-in grant-peers with active SSE streams.
+        if let Some((senders, cancel_rx)) = settle_opt {
+            spawn_settle_task(name.to_string(), senders, settle_window, cancel_rx);
+        }
         Ok(())
     }
 
@@ -2351,7 +2398,8 @@ impl DeliveryHub {
         }
     }
 
-    /// Returns true if the named agent is currently within its liveness window or holds an active SSE connection.
+    /// Returns true if the named agent is currently within its liveness window, holds an active SSE
+    /// connection, or is within the offline settle window after a recent disconnect.
     pub fn presence(&self, name: &str) -> bool {
         let inner = self.lock();
         inner.is_online_effective(name) || inner.is_settle_pending(name)
@@ -3704,9 +3752,10 @@ impl DeliveryHub {
 
     /// Issue a new listen token (random 8-12 digit numeric string).
     pub fn issue_token(&self) -> String {
-        let (tok, gc_offline_events) = {
+        let (tok, gc_offline_events, settle_window) = {
             let mut inner = self.lock();
             let gc_offline_events = inner.gc_tokens();
+            let settle_window = inner.settle_window;
             let mut rng = rand::thread_rng();
             let tok = loop {
                 let digits: u64 = rng.gen_range(10_000_000..=999_999_999_999);
@@ -3718,11 +3767,11 @@ impl DeliveryHub {
                     break tok;
                 }
             };
-            (tok, gc_offline_events)
+            (tok, gc_offline_events, settle_window)
         }; // lock released
-        // Fire any Branch-3 GC offline events after the lock is released. (15-0002H)
-        for (senders, name) in gc_offline_events {
-            push_presence_event(senders, &name, "offline");
+        // Spawn settle tasks for Branch-3 GC evictions after the lock is released. (15-0002H)
+        for (name, senders, cancel_rx) in gc_offline_events {
+            spawn_settle_task(name, senders, settle_window, cancel_rx);
         }
         tok
     }
@@ -3766,13 +3815,15 @@ impl DeliveryHub {
         name_to_bind: Option<&str>,
         observed_host: Option<String>,
         force: bool,
+        presence_push: bool,
     ) -> Result<(String, mpsc::UnboundedReceiver<String>), Error> {
         // Token is required.
         let provided_token = token_opt.ok_or(Error::AuthFailed)?;
         let _observed_host_str = observed_host.unwrap_or_default();
-        let (token, rx, bound_name_for_persist, gc_offline_events) = {
+        let (token, rx, bound_name_for_persist, gc_offline_events, settle_window) = {
             let mut inner = self.lock();
             let gc_offline_events = inner.gc_tokens();
+            let settle_window = inner.settle_window;
 
             // Token must exist in listen_tokens (pre-registered via register_participant).
             let token = if inner.listen_tokens.contains_key(provided_token) {
@@ -3783,9 +3834,9 @@ impl DeliveryHub {
                     .unwrap_or(false)
                 {
                     drop(inner);
-                    // Fire any Branch-3 GC offline events before returning. (15-0002H)
-                    for (senders, name) in gc_offline_events {
-                        push_presence_event(senders, &name, "offline");
+                    // Spawn settle tasks for Branch-3 GC evictions before returning. (15-0002H)
+                    for (name, senders, cancel_rx) in gc_offline_events {
+                        spawn_settle_task(name, senders, settle_window, cancel_rx);
                     }
                     return Err(Error::TokenRevoked);
                 }
@@ -3795,8 +3846,8 @@ impl DeliveryHub {
                     ListenTokenState::is_sse_alive_in_hub(provided_token, &inner.sse_connections);
                 if has_active_sse && !force {
                     drop(inner);
-                    for (senders, name) in gc_offline_events {
-                        push_presence_event(senders, &name, "offline");
+                    for (name, senders, cancel_rx) in gc_offline_events {
+                        spawn_settle_task(name, senders, settle_window, cancel_rx);
                     }
                     return Err(Error::ActiveSubscription);
                 }
@@ -3824,8 +3875,8 @@ impl DeliveryHub {
                 } else {
                     // Not a listen token or governor token — auth failed.
                     drop(inner);
-                    for (senders, name) in gc_offline_events {
-                        push_presence_event(senders, &name, "offline");
+                    for (name, senders, cancel_rx) in gc_offline_events {
+                        spawn_settle_task(name, senders, settle_window, cancel_rx);
                     }
                     return Err(Error::AuthFailed);
                 }
@@ -3905,9 +3956,11 @@ impl DeliveryHub {
             // Mark as ever-listened and increment SSE connection count.
             // Also clear pending_first_listen: the GC-race guard is no longer needed once
             // the stream is open.  (sim-gc-race-register-open-listen)
+            // Store the presence_push opt-in flag for this subscription.
             if let Some(state) = inner.listen_tokens.get_mut(&token) {
                 state.ever_listened = true;
                 state.pending_first_listen = false;
+                state.presence_push = presence_push;
             }
             *inner.sse_connections.entry(token.clone()).or_insert(0) += 1;
 
@@ -3931,6 +3984,8 @@ impl DeliveryHub {
                 if let Some(name) = name_to_bind {
                     if inner.name_to_token.get(name).map(|t| t.as_str()) == Some(token.as_str()) {
                         // Already bound to this token — idempotent.
+                        // Cancel any pending settle task (participant reconnected).
+                        inner.cancel_settle_online(name);
                         (false, None::<String>, None::<String>)
                     } else if let Some(existing_token) = inner.name_to_token.get(name).cloned() {
                         let holder_alive = ListenTokenState::is_sse_alive_in_hub(
@@ -3954,6 +4009,8 @@ impl DeliveryHub {
                                 holder_mut.name = None;
                             }
                             inner.bind_name(&token, name);
+                            // Cancel any pending settle task (name is being reclaimed).
+                            inner.cancel_settle_online(name);
                             (false, None, Some(name.to_string()))
                         }
                     } else if inner.registry.is_online(name) {
@@ -3961,6 +4018,8 @@ impl DeliveryHub {
                         (true, Some(name.to_string()), None)
                     } else {
                         inner.bind_name(&token, name);
+                        // Cancel any pending settle task (name is being freshly bound).
+                        inner.cancel_settle_online(name);
                         (false, None, Some(name.to_string()))
                     }
                 } else {
@@ -4069,9 +4128,9 @@ impl DeliveryHub {
             )
         }; // lock released
 
-        // Fire any Branch-3 GC offline events after the lock is released. (15-0002H)
-        for (senders, name) in gc_offline_events {
-            push_presence_event(senders, &name, "offline");
+        // Spawn settle tasks for Branch-3 GC evictions after the lock is released. (15-0002H)
+        for (name, senders, cancel_rx) in gc_offline_events {
+            spawn_settle_task(name, senders, settle_window, cancel_rx);
         }
 
         // Persist the newly bound name outside the lock (mirrors announce pattern).
@@ -4094,12 +4153,12 @@ impl DeliveryHub {
 
     /// Signal that a listen SSE stream has closed (client disconnected).
     /// When this is the last connection and the name is still bound, it means an unexpected
-    /// drop (AC3 / TR3) — fire offline presence events to grant-peers.
+    /// drop (AC3 / TR3) — start a settle timer for grant-peers.
     pub fn close_listen(&self, token: &str) {
-        let (offline_senders, dropped_name) = {
+        let (settle_opt, settle_window, dropped_name) = {
             let mut inner = self.lock();
 
-            // Determine whether this close triggers an offline presence event.
+            // Determine whether this close triggers a settle timer.
             // Conditions for firing:
             //   1. Token is NOT revoked (revoke_token/revoke_by_name fire their own events).
             //   2. This is the last (or only) SSE connection for the token.
@@ -4117,11 +4176,12 @@ impl DeliveryHub {
             } else {
                 None
             };
-            let offline_senders = if let Some(ref name) = dropped_name {
-                inner.grant_peer_senders(name)
+            let settle_opt = if let Some(ref name) = dropped_name {
+                inner.begin_settle_offline(name)
             } else {
-                vec![]
+                None
             };
+            let settle_window = inner.settle_window;
 
             if let Some(count) = inner.sse_connections.get_mut(token) {
                 *count = count.saturating_sub(1);
@@ -4140,12 +4200,14 @@ impl DeliveryHub {
                 state.sse_sender = None;
             }
 
-            (offline_senders, dropped_name)
+            (settle_opt, settle_window, dropped_name)
         };
 
-        // Fire presence "offline" event to grant-peers on unexpected connection drop.
-        if let Some(ref name) = dropped_name {
-            push_presence_event(offline_senders, name, "offline");
+        // Start settle timer for grant-peers on unexpected connection drop.
+        if let Some(ref name) = dropped_name
+            && let Some((senders, cancel_rx)) = settle_opt
+        {
+            spawn_settle_task(name.clone(), senders, settle_window, cancel_rx);
         }
     }
 
@@ -4153,7 +4215,7 @@ impl DeliveryHub {
     /// Closes the SSE stream, unbinds the name, and marks the agent offline.
     /// Returns Ok(()) on success, Err if the token is unknown/revoked or has no active subscription.
     pub fn cancel_listen(&self, token: &str) -> Result<(), Error> {
-        let (sender_opt, offline_senders, cancelled_name) = {
+        let (sender_opt, settle_opt, settle_window, cancelled_name) = {
             let mut inner = self.lock();
             let state = inner.listen_tokens.get(token).ok_or(Error::TokenRejected)?;
             if state.revoked {
@@ -4162,13 +4224,14 @@ impl DeliveryHub {
             if !ListenTokenState::is_sse_alive_in_hub(token, &inner.sse_connections) {
                 return Err(Error::RecipientOffline);
             }
-            // Collect peer senders and name BEFORE unbinding (presence push TR2).
+            // Begin settle BEFORE unbinding (presence push TR2).
             let cancelled_name = inner.token_to_name.get(token).cloned();
-            let offline_senders = if let Some(ref name) = cancelled_name {
-                inner.grant_peer_senders(name)
+            let settle_opt = if let Some(ref name) = cancelled_name {
+                inner.begin_settle_offline(name)
             } else {
-                vec![]
+                None
             };
+            let settle_window = inner.settle_window;
             // Remove SSE connection tracking.
             inner.sse_connections.remove(token);
             // Unbind name from all lookup maps.
@@ -4187,14 +4250,16 @@ impl DeliveryHub {
                 .expect("listen_token state must exist during close_listen");
             st.name = None;
             let sender_opt = st.sse_sender.take();
-            (sender_opt, offline_senders, cancelled_name)
+            (sender_opt, settle_opt, settle_window, cancelled_name)
         };
         if let Some(tx) = sender_opt {
             let _ = tx.send(r#"{"type":"service","event":"cancelled"}"#.to_string());
         }
-        // Fire presence "offline" event to all grant-peers with active SSE streams.
-        if let Some(ref name) = cancelled_name {
-            push_presence_event(offline_senders, name, "offline");
+        // Spawn settle task for all opted-in grant-peers with active SSE streams.
+        if let Some(ref name) = cancelled_name
+            && let Some((senders, cancel_rx)) = settle_opt
+        {
+            spawn_settle_task(name.clone(), senders, settle_window, cancel_rx);
         }
         Ok(())
     }
@@ -4207,20 +4272,24 @@ impl DeliveryHub {
     /// "reason":"name_reclaimed"}` event on their SSE stream.
     pub fn announce(&self, token: &str, name: &str, force: bool) -> Result<AnnounceResult, Error> {
         let mut inner = self.lock();
-        // gc_tokens() returns Branch-3 offline events that must be fired after the lock
+        // gc_tokens() returns Branch-3 settle tasks that must be spawned after the lock
         // releases.  We use std::mem::take at each early-return path to fire any pending
-        // events before returning, even if announce itself fails. (15-0002H)
+        // settle tasks before returning, even if announce itself fails. (15-0002H)
         let mut gc_offline_events = inner.gc_tokens();
-        // Collects (senders, name) for any token evicted by this announce call (listen-flow
-        // force-eviction, stale-holder reclaim, or minted-agent force-eviction). Fired
-        // out-of-lock after drop(inner), following the 15-0002C pattern. (15-0002G)
-        let mut eviction_offline: Vec<(Vec<mpsc::UnboundedSender<String>>, String)> = Vec::new();
+        let settle_window = inner.settle_window;
+        // Collects immediate offline events for tokens evicted by this announce call
+        // (force-eviction, stale-holder reclaim, minted-agent force-eviction). These
+        // fire immediately — NOT via settle window — because a deliberate eviction is
+        // not a "brief reconnect" scenario. Fired out-of-lock, before the online event,
+        // to preserve offline-before-online ordering. (15-0002G, 15-0028)
+        let mut eviction_immediate_offline: Vec<(String, Vec<mpsc::UnboundedSender<String>>)> =
+            Vec::new();
 
         // Validate token.
         if !inner.listen_tokens.contains_key(token) {
             drop(inner);
-            for (senders, n) in gc_offline_events {
-                push_presence_event(senders, &n, "offline");
+            for (n, senders, cancel_rx) in gc_offline_events {
+                spawn_settle_task(n, senders, settle_window, cancel_rx);
             }
             return Err(Error::TokenRejected);
         }
@@ -4231,8 +4300,8 @@ impl DeliveryHub {
             .unwrap_or(false)
         {
             drop(inner);
-            for (senders, n) in gc_offline_events {
-                push_presence_event(senders, &n, "offline");
+            for (n, senders, cancel_rx) in gc_offline_events {
+                spawn_settle_task(n, senders, settle_window, cancel_rx);
             }
             return Err(Error::TokenRevoked);
         }
@@ -4251,9 +4320,11 @@ impl DeliveryHub {
                 ParticipantIdentity::valid(token),
                 PresenceScope::GrantScoped,
             );
+            // Cancel any pending settle task (participant re-announced while settling).
+            inner.cancel_settle_online(name);
             drop(inner);
-            for (senders, n) in std::mem::take(&mut gc_offline_events) {
-                push_presence_event(senders, &n, "offline");
+            for (n, senders, cancel_rx) in std::mem::take(&mut gc_offline_events) {
+                spawn_settle_task(n, senders, settle_window, cancel_rx);
             }
             return Ok(AnnounceResult::Bound);
         }
@@ -4268,8 +4339,8 @@ impl DeliveryHub {
                         // Live SSE holder — return NAME_IN_USE.
                         let resolution_stream = format!("/sessions/{}/events", name);
                         drop(inner);
-                        for (senders, n) in std::mem::take(&mut gc_offline_events) {
-                            push_presence_event(senders, &n, "offline");
+                        for (n, senders, cancel_rx) in std::mem::take(&mut gc_offline_events) {
+                            spawn_settle_task(n, senders, settle_window, cancel_rx);
                         }
                         return Ok(AnnounceResult::NameInUse { resolution_stream });
                     }
@@ -4293,13 +4364,17 @@ impl DeliveryHub {
                     .get(&existing_token)
                     .and_then(|h| h.name.clone());
                 if let Some(ref n) = old_name {
-                    // Collect grant-peer senders BEFORE removing from agents map.
-                    // INVARIANT: grant_peer_senders() must be called while agents[name] still
-                    // exists. Covers both force=true eviction of a live holder and stale-holder
-                    // reclaim paths — grant-peers deserve sim_offline in both cases. (15-0002G)
-                    let eviction_senders = inner.grant_peer_senders(n.as_str());
+                    // Collect offline senders BEFORE removing from agents map.
+                    // INVARIANT: grant_peer_presence_senders() must be called while agents[name]
+                    // still exists. Covers both force=true eviction of a live holder and stale-
+                    // holder reclaim paths — opted-in grant-peers deserve sim_offline. (15-0002G)
+                    // Cancel any pending close_listen settle task for the old name, then collect
+                    // senders for an immediate offline (no settle window — this is a deliberate
+                    // eviction, not a brief reconnect). (15-0028)
+                    inner.settle_tasks.remove(n.as_str());
+                    let eviction_senders = inner.grant_peer_presence_senders(n.as_str());
                     if !eviction_senders.is_empty() {
-                        eviction_offline.push((eviction_senders, n.to_string()));
+                        eviction_immediate_offline.push((n.to_string(), eviction_senders));
                     }
                     inner.name_to_token.remove(n.as_str());
                     inner.agents.remove(n.as_str());
@@ -4323,18 +4398,19 @@ impl DeliveryHub {
                 // A minted agent holds this name.
                 let resolution_stream = format!("/sessions/{}/events", name);
                 drop(inner);
-                for (senders, n) in std::mem::take(&mut gc_offline_events) {
-                    push_presence_event(senders, &n, "offline");
+                for (n, senders, cancel_rx) in std::mem::take(&mut gc_offline_events) {
+                    spawn_settle_task(n, senders, settle_window, cancel_rx);
                 }
                 return Ok(AnnounceResult::NameInUse { resolution_stream });
             }
-            // force=true: deregister the minted agent and fire sim_offline to grant-peers.
-            // INVARIANT: grant_peer_senders() must be called while agents[name] still exists.
-            // Already past the `if !force { return }` guard above — force is always true here.
-            // (15-0002G)
-            let eviction_senders = inner.grant_peer_senders(name);
+            // force=true: deregister the minted agent and fire offline immediately to opted-in
+            // grant-peers. INVARIANT: grant_peer_presence_senders() must be called while
+            // agents[name] still exists. Immediate fire (no settle) — deliberate eviction.
+            // (15-0002G, 15-0028)
+            inner.settle_tasks.remove(name);
+            let eviction_senders = inner.grant_peer_presence_senders(name);
             if !eviction_senders.is_empty() {
-                eviction_offline.push((eviction_senders, name.to_string()));
+                eviction_immediate_offline.push((name.to_string(), eviction_senders));
             }
             inner.registry.force_deregister(name);
             inner.agents.remove(name);
@@ -4388,18 +4464,28 @@ impl DeliveryHub {
             }
         };
 
-        // Presence push (AC1 / TR1): collect grant-peer SSE senders before releasing the lock.
-        let online_senders = inner.grant_peer_senders(name);
+        // Presence push (AC1 / TR1): cancel any pending settle task and collect opted-in
+        // grant-peer SSE senders before releasing the lock.
+        //
+        // Only cancel a pending settle if no eviction offline was just collected.
+        // The eviction paths remove the name from settle_tasks themselves; calling
+        // cancel_settle_online here would be a no-op for evictions but is still
+        // guarded in case the background task races in a stale entry. (15-0002G)
+        if eviction_immediate_offline.is_empty() {
+            inner.cancel_settle_online(name);
+        }
+        let online_senders = inner.grant_peer_presence_senders(name);
 
         drop(inner);
 
-        // Fire any Branch-3 GC offline events after the lock is released. (15-0002H)
-        for (senders, n) in gc_offline_events {
-            push_presence_event(senders, &n, "offline");
+        // Spawn settle tasks for Branch-3 GC evictions after the lock is released. (15-0002H)
+        for (n, senders, cancel_rx) in gc_offline_events {
+            spawn_settle_task(n, senders, settle_window, cancel_rx);
         }
 
-        // Fire force-eviction / stale-holder-reclaim offline events out-of-lock. (15-0002G)
-        for (senders, n) in eviction_offline {
+        // Fire immediate offline events for force-evicted / stale-reclaimed holders BEFORE
+        // the online event, so grant-peers observe offline → online ordering. (15-0002G, 15-0028)
+        for (n, senders) in eviction_immediate_offline {
             push_presence_event(senders, &n, "offline");
         }
 
@@ -4424,7 +4510,7 @@ impl DeliveryHub {
             let _ = sender.send(event);
         }
 
-        // Fire presence "online" event to all grant-peers with active SSE streams.
+        // Fire presence "online" event immediately to opted-in grant-peers.
         push_presence_event(online_senders, name, "online");
 
         Ok(AnnounceResult::Bound)
@@ -4612,18 +4698,19 @@ impl DeliveryHub {
     }
 
     /// Revoke a listen token atomically. Sends SERVICE revoked event on SSE then closes it.
-    /// Also pushes a presence "offline" event to all grant-peers (AC4 / TR4).
+    /// Also starts a settle task for opted-in grant-peers (AC4 / TR4).
     pub fn revoke_token(&self, token: &str, gov: &GovernorToken) -> Result<(), Error> {
-        let (sender, offline_senders, revoked_name) = {
+        let (sender, settle_opt, settle_window, revoked_name) = {
             let mut inner = self.lock();
             inner.trust.validate_governor_token(gov)?;
-            // Collect the bound name and peer senders BEFORE marking revoked.
+            // Collect the bound name and begin settle BEFORE marking revoked.
             let revoked_name = inner.token_to_name.get(token).cloned();
-            let offline_senders = if let Some(ref name) = revoked_name {
-                inner.grant_peer_senders(name)
+            let settle_opt = if let Some(ref name) = revoked_name {
+                inner.begin_settle_offline(name)
             } else {
-                vec![]
+                None
             };
+            let settle_window = inner.settle_window;
             let state = inner
                 .listen_tokens
                 .get_mut(token)
@@ -4634,7 +4721,7 @@ impl DeliveryHub {
             state.revoked = true;
             // Take the SSE sender — dropping it closes the channel after we send the event.
             let sender = state.sse_sender.take();
-            (sender, offline_senders, revoked_name)
+            (sender, settle_opt, settle_window, revoked_name)
         };
 
         if let Some(tx) = sender {
@@ -4642,9 +4729,11 @@ impl DeliveryHub {
             let _ = tx.send(event);
             // tx dropped here → receiver sees None → SSE stream ends.
         }
-        // Fire presence "offline" event to grant-peers.
-        if let Some(ref name) = revoked_name {
-            push_presence_event(offline_senders, name, "offline");
+        // Spawn settle task for opted-in grant-peers.
+        if let Some(ref name) = revoked_name
+            && let Some((senders, cancel_rx)) = settle_opt
+        {
+            spawn_settle_task(name.clone(), senders, settle_window, cancel_rx);
         }
         Ok(())
     }
@@ -5012,10 +5101,10 @@ impl DeliveryHub {
                 .map(|s| s.to_string());
 
             // Deny-grant override for minted-agent querier.
-            if let Some(ref q_id) = querier_identity {
-                if inner.is_denial_active(q_id, target_name) {
-                    return Ok(false);
-                }
+            if let Some(ref q_id) = querier_identity
+                && inner.is_denial_active(q_id, target_name)
+            {
+                return Ok(false);
             }
 
             // Grant check for minted agent querier.
@@ -6214,7 +6303,7 @@ mod tests {
         // Bob is a listen-flow client — register first, then open_listen.
         let bob_token = hub.register_participant();
         let (bob_token, rx1) = hub
-            .open_listen(Some(&bob_token), None, Some("bob"), None, false)
+            .open_listen(Some(&bob_token), None, Some("bob"), None, false, false)
             .unwrap();
         // Alice is a regular agent with a Notify grant to Bob.
         hub.register("alice", &tok_a, PresenceScope::Public)
@@ -6243,7 +6332,7 @@ mod tests {
         // Simulate reconnect: open_listen with the same token (force=true to supersede).
         // SIM-1 fix: open_listen must reset notify_suppressed and emit a catch-up NOTIFY.
         let (returned_token, mut rx2) = hub
-            .open_listen(Some(&bob_token), None, None, None, true)
+            .open_listen(Some(&bob_token), None, None, None, true, false)
             .unwrap();
         assert_eq!(
             returned_token, bob_token,
@@ -7384,7 +7473,7 @@ mod tests {
 
         let reg_token = hub.register_participant();
         let (token, _rx) = hub
-            .open_listen(Some(&reg_token), None, None, None, false)
+            .open_listen(Some(&reg_token), None, None, None, false, false)
             .unwrap();
 
         // ever_granted = false means the token would NOT be persisted to DB yet.
@@ -7482,7 +7571,7 @@ mod tests {
 
         let reg_token = hub.register_participant();
         let (stale, _rx) = hub
-            .open_listen(Some(&reg_token), None, None, None, false)
+            .open_listen(Some(&reg_token), None, None, None, false, false)
             .unwrap();
 
         {
@@ -7556,18 +7645,21 @@ mod tests {
     // ── AC-T6: GC Branch 3 fires sim_offline to grant-peer SSE. (15-0002H) ────
     //
     // When gc_tokens() evicts a !ever_listened && ever_granted token (Branch 3),
-    // the grant-peer with an active SSE stream must receive a sim_offline presence
-    // event fired out-of-lock after the eviction (silent drop pattern).
+    // the opted-in grant-peer with an active SSE stream must receive a sim_offline
+    // presence event after the settle window expires. (15-0028)
 
-    #[test]
-    fn ac_t6_gc_branch3_sends_offline_to_grant_peer_sse() {
+    #[tokio::test(start_paused = true)]
+    async fn ac_t6_gc_branch3_sends_offline_to_grant_peer_sse() {
         let hub = make_hub(Duration::from_secs(30));
         let gov = hub.install_governor(None);
 
-        // Agent A: full listen-flow session (the observer — will receive presence events).
+        // Set settle window to 1s so the settle task fires after a 1s time advance.
+        hub.set_settle_window_for_test(Duration::from_secs(1));
+
+        // Agent A: full listen-flow session (the observer — opted in to push presence events).
         let reg_a = hub.register_participant();
         let (tok_a, mut rx_a) = hub
-            .open_listen(Some(&reg_a), None, None, None, false)
+            .open_listen(Some(&reg_a), None, None, None, false, true) // presence_push=true
             .unwrap();
         hub.announce(&tok_a, "GcA6", false).unwrap();
 
@@ -7577,7 +7669,7 @@ mod tests {
 
         // Establish a grant between B (identity=tok_b) and A (identity=tok_a).
         // FP1 in approve_grant_req() fills in name_a="GcB6" and name_b="GcA6" from
-        // token_to_name, so grant_peer_senders("GcB6") resolves A's SSE sender.
+        // token_to_name, so grant_peer_presence_senders("GcB6") resolves A's SSE sender.
         hub.approve_grant(&gov, &tok_b, &tok_a, None).unwrap();
 
         // Set ever_granted=true on B and backdate past unlisten_ttl.
@@ -7593,7 +7685,7 @@ mod tests {
         // Drain any setup events from A's stream.
         while rx_a.try_recv().is_ok() {}
 
-        // Trigger inline GC via issue_token().
+        // Trigger inline GC via issue_token() — spawns a settle task with 1s window.
         let _trigger = hub.issue_token();
 
         // B must be evicted.
@@ -7602,8 +7694,22 @@ mod tests {
             "Branch 3: !ever_listened && ever_granted token past TTL must be GC'd"
         );
 
-        // A must receive a sim_offline presence event for "GcB6".
-        // push_presence_event sends to an unbounded channel — available immediately.
+        // Yield to let the spawned settle task be scheduled and register its sleep(1s)
+        // with the tokio timer infrastructure.
+        tokio::task::yield_now().await;
+
+        // Before advancing time, the offline event must NOT yet be in the channel.
+        assert!(
+            rx_a.try_recv().is_err(),
+            "offline event must not fire before settle window expires"
+        );
+
+        // Advance tokio time past the settle window (1s) to fire the settle task.
+        tokio::time::advance(Duration::from_secs(2)).await;
+        // Yield to let the woken settle task run its push_presence_event code.
+        tokio::task::yield_now().await;
+
+        // A must now receive a sim_offline presence event for "GcB6".
         let ev = rx_a.try_recv().ok();
         let has_offline = ev
             .as_deref()
@@ -7632,7 +7738,7 @@ mod tests {
             // Issue token for bob and announce its name.
             let reg_bob = hub.register_participant();
             let (listen_tok, _rx) = hub
-                .open_listen(Some(&reg_bob), None, None, None, false)
+                .open_listen(Some(&reg_bob), None, None, None, false, false)
                 .unwrap();
             hub.announce(&listen_tok, "bob", false).unwrap();
 
@@ -7688,7 +7794,7 @@ mod tests {
             let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
             let reg_bob = hub.register_participant();
             let (listen_tok, _rx) = hub
-                .open_listen(Some(&reg_bob), None, None, None, false)
+                .open_listen(Some(&reg_bob), None, None, None, false, false)
                 .unwrap();
             hub.announce(&listen_tok, "bob", false).unwrap();
             listen_tok
@@ -7727,7 +7833,7 @@ mod tests {
             let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
             let reg_bob = hub.register_participant();
             let (listen_tok, _rx) = hub
-                .open_listen(Some(&reg_bob), None, None, None, false)
+                .open_listen(Some(&reg_bob), None, None, None, false, false)
                 .unwrap();
             hub.announce(&listen_tok, "bob", false).unwrap();
             listen_tok
@@ -7755,7 +7861,7 @@ mod tests {
             let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
             let reg_charlie = hub.register_participant();
             let (listen_tok, _rx) = hub
-                .open_listen(Some(&reg_charlie), None, None, None, false)
+                .open_listen(Some(&reg_charlie), None, None, None, false, false)
                 .unwrap();
             hub.announce(&listen_tok, name, false).unwrap();
             listen_tok
@@ -7995,10 +8101,10 @@ mod tests {
 
         // Open listen for both.
         let (listen_a, _rx_a) = hub
-            .open_listen(Some(&reg_a), None, None, None, false)
+            .open_listen(Some(&reg_a), None, None, None, false, false)
             .unwrap();
         let (listen_b, _rx_b) = hub
-            .open_listen(Some(&reg_b), None, None, None, false)
+            .open_listen(Some(&reg_b), None, None, None, false, false)
             .unwrap();
 
         // Announce both.
@@ -8025,10 +8131,10 @@ mod tests {
 
         // Open listen for both.
         let (listen_a, _rx_a) = hub
-            .open_listen(Some(&reg_a), None, None, None, false)
+            .open_listen(Some(&reg_a), None, None, None, false, false)
             .unwrap();
         let (listen_b, _rx_b) = hub
-            .open_listen(Some(&reg_b), None, None, None, false)
+            .open_listen(Some(&reg_b), None, None, None, false, false)
             .unwrap();
 
         // Announce both (this updates name_to_token mappings).
@@ -8058,10 +8164,10 @@ mod tests {
 
         // Open listen for both.
         let (listen_a, _rx_a) = hub
-            .open_listen(Some(&reg_a), None, None, None, false)
+            .open_listen(Some(&reg_a), None, None, None, false, false)
             .unwrap();
         let (listen_b, _rx_b) = hub
-            .open_listen(Some(&reg_b), None, None, None, false)
+            .open_listen(Some(&reg_b), None, None, None, false, false)
             .unwrap();
 
         // Announce both.
@@ -8140,11 +8246,11 @@ mod tests {
 
         // Open first listen stream.
         let (token, _rx1) = hub
-            .open_listen(Some(&tok), None, None, None, false)
+            .open_listen(Some(&tok), None, None, None, false, false)
             .expect("first open_listen must succeed");
 
         // Second open_listen without force → should return ActiveSubscription error.
-        let result = hub.open_listen(Some(&token), None, None, None, false);
+        let result = hub.open_listen(Some(&token), None, None, None, false, false);
         assert!(
             matches!(result, Err(Error::ActiveSubscription)),
             "second open_listen without force must return ActiveSubscription error, got: {:?}",
@@ -8160,12 +8266,12 @@ mod tests {
 
         // Open first listen stream.
         let (token1, mut rx1) = hub
-            .open_listen(Some(&tok), None, None, None, false)
+            .open_listen(Some(&tok), None, None, None, false, false)
             .expect("first open_listen must succeed");
 
         // Second open_listen with force=true → should succeed and return same token.
         let (token2, _rx2) = hub
-            .open_listen(Some(&token1), None, None, None, true)
+            .open_listen(Some(&token1), None, None, None, true, false)
             .expect("force takeover open_listen must succeed");
 
         assert_eq!(
@@ -8229,7 +8335,7 @@ mod tests {
         );
 
         // Token must still exist: open_listen() must succeed (not AuthFailed).
-        let result = hub.open_listen(Some(&token), None, None, None, false);
+        let result = hub.open_listen(Some(&token), None, None, None, false, false);
         assert!(
             result.is_ok(),
             "open_listen() must succeed for a registered token that survived GC: {result:?}"
@@ -8238,7 +8344,7 @@ mod tests {
         // AC3 regression: confirm normal lifecycle still works — a second token registered,
         // then immediately listened, must also succeed.
         let token2 = hub.register_participant();
-        let result2 = hub.open_listen(Some(&token2), None, None, None, false);
+        let result2 = hub.open_listen(Some(&token2), None, None, None, false, false);
         assert!(
             result2.is_ok(),
             "Normal register → open_listen flow must still succeed: {result2:?}"
@@ -8274,7 +8380,7 @@ mod tests {
         );
 
         // open_listen() must now fail — the token no longer exists.
-        let result = hub.open_listen(Some(&token), None, None, None, false);
+        let result = hub.open_listen(Some(&token), None, None, None, false, false);
         assert!(
             matches!(result, Err(Error::AuthFailed)),
             "open_listen() must return AuthFailed for an evicted token, got: {result:?}"
