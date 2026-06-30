@@ -200,7 +200,10 @@ pub enum AnnounceResult {
 
 /// State for a self-issued listen token.
 struct ListenTokenState {
-    issued_at: Instant,
+    /// Last time this token was actively used (POST /listen, /announce, or a dequeue). Age-GC is
+    /// measured from `last_active` (not creation time), so an actively-used token never expires by
+    /// age alone. (15-0029 addenda / GC bug fix)
+    last_active: Instant,
     ever_listened: bool,
     ever_granted: bool,
     name: Option<String>,
@@ -233,7 +236,7 @@ impl ListenTokenState {
     fn new() -> Self {
         let (msg_id_tx, _msg_id_rx) = watch::channel(0u64);
         ListenTokenState {
-            issued_at: Instant::now(),
+            last_active: Instant::now(),
             ever_listened: false,
             ever_granted: false,
             name: None,
@@ -612,6 +615,13 @@ impl HubInner {
         Some((sender, pending))
     }
 
+    /// Mark a token actively used (resets the age-GC clock). (15-0029 addenda)
+    fn touch_token(&mut self, token: &str) {
+        if let Some(st) = self.listen_tokens.get_mut(token) {
+            st.last_active = Instant::now();
+        }
+    }
+
     /// Bind `name` to `token` atomically (name registry + agents map + token state).
     /// Caller is responsible for evicting any stale holder first.
     fn bind_name(&mut self, token: &str, name: &str) {
@@ -666,30 +676,37 @@ impl HubInner {
         //   `open_listen()`.  After the grace window expires the token falls through to the
         //   normal `unlisten_ttl` path so that abandoned `/register` calls cannot accumulate
         //   indefinitely. (sim-gc-race-register-open-listen, sim-gc-registration-grace-cap)
+        // 15-0029 addenda (GC bug fix): age is measured from `last_active` (reset on any active
+        // use), and two classes are EXEMPT from age-GC entirely:
+        //   (a) governor listen tokens (long-lived control credentials), and
+        //   (b) identity-bound tokens — a token whose name is a registered identity. Only
+        //       truly-abandoned tokens (registered/listened but never identity-bound, idle past
+        //       their TTL) are reaped.
+        let identities = &self.identities;
         let to_remove: Vec<String> = self
             .listen_tokens
             .iter()
             .filter(|(_, st)| !st.revoked)
             .filter(|(_, st)| {
+                // (a) governor listen sessions are never age-GC'd.
+                if st.governor_id.is_some() {
+                    return false;
+                }
+                // (b) identity-bound tokens (registered name) are never age-GC'd.
+                if let Some(ref name) = st.name
+                    && identities.contains(name)
+                {
+                    return false;
+                }
                 if st.pending_first_listen {
-                    // Registered but never used for open_listen().
-                    // Within the grace window: GC immune (client may still call open_listen).
-                    // After grace expires: evict immediately — the grace window IS the TTL
-                    // for tokens that were registered but never used, bounding accumulation
-                    // from unauthenticated /register calls. (sim-gc-registration-grace-cap)
-                    now.duration_since(st.issued_at) > registration_grace
+                    // Registered but never used for open_listen(): the grace window is the TTL.
+                    now.duration_since(st.last_active) > registration_grace
                 } else if !st.ever_listened {
                     // Branches 1 (no grant) and 3 (ever_granted): both use unlisten_ttl.
-                    now.duration_since(st.issued_at) > unlisten_ttl
+                    now.duration_since(st.last_active) > unlisten_ttl
                 } else if !st.ever_granted && st.name.is_none() {
-                    // Branch 2: ever_listened && !ever_granted && name-unbound.
-                    // Tokens with an announced name (st.name.is_some()) fall through to false
-                    // and are never age-evicted — name binding is the exemption signal.
-                    // NOTE: only named sessions are exempt; a session that has not called
-                    // announce() (name=None) remains eligible for Branch-2 GC.
-                    // Stale named token GC via last_active timestamp lands in 15-0029.
-                    // (P0 fix: gc-named-token-exemption — preserved from hotfix/dbcb351)
-                    now.duration_since(st.issued_at) > no_grant_ttl
+                    // Branch 2: listened but never granted and name-unbound — idle past no_grant_ttl.
+                    now.duration_since(st.last_active) > no_grant_ttl
                 } else {
                     false
                 }
@@ -4152,6 +4169,7 @@ impl DeliveryHub {
                 state.ever_listened = true;
                 state.pending_first_listen = false;
                 state.presence_push = presence_push;
+                state.last_active = Instant::now(); // 15-0029 addenda: reset age-GC clock
             }
             *inner.sse_connections.entry(token.clone()).or_insert(0) += 1;
 
@@ -4478,6 +4496,9 @@ impl DeliveryHub {
             return Err(Error::TokenRevoked);
         }
 
+        // 15-0029 addenda: announce is active use — reset the age-GC clock.
+        inner.touch_token(token);
+
         // Check if name is already claimed by THIS token (idempotent re-announce).
         if inner
             .name_to_token
@@ -4654,6 +4675,9 @@ impl DeliveryHub {
             Some(n) => n,
             None => return Ok((None, 0)),
         };
+
+        // 15-0029 addenda: a dequeue is active use — reset the age-GC clock.
+        inner.touch_token(token);
 
         // R5.4: Re-arm notify BEFORE returning messages.
         if let Some(st) = inner.listen_tokens.get_mut(token) {
@@ -8347,7 +8371,7 @@ mod tests {
         // Backdate issued_at past the unlisten TTL (default 300 s, min 60 s).
         {
             let mut inner = hub.inner.lock().unwrap();
-            inner.listen_tokens.get_mut(&stale).unwrap().issued_at =
+            inner.listen_tokens.get_mut(&stale).unwrap().last_active =
                 Instant::now() - Duration::from_secs(400);
         }
 
@@ -8382,7 +8406,7 @@ mod tests {
             let st = inner.listen_tokens.get_mut(&stale).unwrap();
             st.ever_granted = true;
             // Backdate well past unlisten_ttl so Branch 3 fires.
-            st.issued_at = Instant::now() - Duration::from_secs(4000);
+            st.last_active = Instant::now() - Duration::from_secs(4000);
 
             let st2 = inner.listen_tokens.get_mut(&fresh_enough).unwrap();
             st2.ever_granted = true;
@@ -8423,7 +8447,7 @@ mod tests {
         // Backdate issued_at past the no-grant TTL (default 1800 s, min 120 s).
         {
             let mut inner = hub.inner.lock().unwrap();
-            inner.listen_tokens.get_mut(&stale).unwrap().issued_at =
+            inner.listen_tokens.get_mut(&stale).unwrap().last_active =
                 Instant::now() - Duration::from_secs(2000);
         }
 
@@ -8469,7 +8493,7 @@ mod tests {
         // Backdate issued_at well past the default no-grant TTL (1800 s).
         {
             let mut inner = hub.inner.lock().unwrap();
-            inner.listen_tokens.get_mut(&tok).unwrap().issued_at =
+            inner.listen_tokens.get_mut(&tok).unwrap().last_active =
                 Instant::now() - Duration::from_secs(2000);
         }
 
@@ -8481,85 +8505,147 @@ mod tests {
         );
     }
 
-    // ── AC-T6: GC Branch 3 fires sim_offline to grant-peer SSE. (15-0002H) ────
+    // ── AC-T6: identity-bound tokens are exempt from age-GC. (15-0029 addenda) ────
     //
-    // When gc_tokens() evicts a !ever_listened && ever_granted token (Branch 3),
-    // the opted-in grant-peer with an active SSE stream must receive a sim_offline
-    // presence event after the settle window expires. (15-0028)
+    // Supersedes the prior Branch-3 age-GC-of-named-tokens behaviour: a token whose name is a
+    // registered identity is now PERMANENT (the identity outlives the credential). Such a token
+    // is never age-evicted, even when !ever_listened && ever_granted and idle far past its TTL.
+    // No spurious sim_offline is emitted to grant-peers from age-GC.
 
     #[tokio::test(start_paused = true)]
-    async fn ac_t6_gc_branch3_sends_offline_to_grant_peer_sse() {
+    async fn ac_t6_gc_branch3_identity_bound_token_exempt() {
         let hub = make_hub(Duration::from_secs(30));
         let gov = hub.install_governor(None);
-
-        // Set settle window to 1s so the settle task fires after a 1s time advance.
         hub.set_settle_window_for_test(Duration::from_secs(1));
 
-        // Agent A: full listen-flow session (the observer — opted in to push presence events).
+        // Agent A: observer with an opted-in push stream.
         let reg_a = hub.register_participant();
         let (tok_a, mut rx_a) = hub
-            .open_listen(Some(&reg_a), None, None, None, false, true) // presence_push=true
+            .open_listen(Some(&reg_a), None, None, None, false, true)
             .unwrap();
         hub.announce(&tok_a, "GcA6").unwrap();
 
-        // Agent B: issue token + announce, but NO open_listen (ever_listened stays false).
+        // Agent B: issue token + announce a name (→ identity-bound), but NO open_listen.
         let tok_b = hub.issue_token();
         hub.announce(&tok_b, "GcB6").unwrap();
-
-        // Establish a grant between B (identity=tok_b) and A (identity=tok_a).
-        // FP1 in approve_grant_req() fills in name_a="GcB6" and name_b="GcA6" from
-        // token_to_name, so grant_peer_presence_senders("GcB6") resolves A's SSE sender.
         hub.approve_grant(&gov, &tok_b, &tok_a, None).unwrap();
 
-        // Set ever_granted=true on B and backdate past unlisten_ttl.
-        // (The governor-direct approve_grant path does not set ever_granted on the
-        //  token state — that is only done by the 2-phase approve_grant_request flow.)
+        // Set ever_granted=true and backdate far past unlisten_ttl.
         {
             let mut inner = hub.inner.lock().unwrap();
             let st = inner.listen_tokens.get_mut(&tok_b).unwrap();
             st.ever_granted = true;
-            st.issued_at = Instant::now() - Duration::from_secs(400);
+            st.last_active = Instant::now() - Duration::from_secs(4000);
         }
 
-        // Drain any setup events from A's stream.
         while rx_a.try_recv().is_ok() {}
 
-        // Trigger inline GC via issue_token() — spawns a settle task with 1s window.
+        // Trigger inline GC.
         let _trigger = hub.issue_token();
 
-        // B must be evicted.
+        // The identity-bound token must SURVIVE (it is exempt from age-GC).
         assert!(
-            matches!(hub.validate_token(&tok_b), Err(Error::TokenRejected)),
-            "Branch 3: !ever_listened && ever_granted token past TTL must be GC'd"
+            hub.validate_token(&tok_b).is_ok(),
+            "identity-bound token must be exempt from age-GC"
         );
 
-        // Yield to let the spawned settle task be scheduled and register its sleep(1s)
-        // with the tokio timer infrastructure.
+        // No sim_offline must fire for the exempt token.
+        tokio::time::advance(Duration::from_secs(3)).await;
         tokio::task::yield_now().await;
-
-        // Before advancing time, the offline event must NOT yet be in the channel.
+        let drained: Vec<String> = std::iter::from_fn(|| rx_a.try_recv().ok()).collect();
         assert!(
-            rx_a.try_recv().is_err(),
-            "offline event must not fire before settle window expires"
+            !drained
+                .iter()
+                .any(|e| e.contains("\"offline\"") && e.contains("\"GcB6\"")),
+            "no sim_offline may fire for an exempt identity-bound token; got: {drained:?}"
         );
+    }
 
-        // Advance tokio time past the settle window (1s) to fire the settle task.
-        tokio::time::advance(Duration::from_secs(2)).await;
-        // Yield to let the woken settle task run its push_presence_event code.
-        tokio::task::yield_now().await;
+    // ── 15-0029 addenda: last_active GC + identity/governor exemptions ─────────
 
-        // A must now receive a sim_offline presence event for "GcB6".
-        let ev = rx_a.try_recv().ok();
-        let has_offline = ev
-            .as_deref()
-            .map(|e| {
-                e.contains("\"presence\"") && e.contains("\"offline\"") && e.contains("\"GcB6\"")
-            })
-            .unwrap_or(false);
+    /// GC-AC-4: an identity-bound participant token is exempt from age-GC.
+    #[test]
+    fn test_identity_bound_token_not_gcd() {
+        let hub = make_hub(Duration::from_secs(30));
+        let reg = hub.register_participant();
+        let (tok, _rx) = hub
+            .open_listen(Some(&reg), None, None, None, false, false)
+            .unwrap();
+        hub.announce(&tok, "Bound").unwrap();
+        {
+            let mut inner = hub.inner.lock().unwrap();
+            inner.listen_tokens.get_mut(&tok).unwrap().last_active =
+                Instant::now() - Duration::from_secs(100_000);
+        }
+        let _ = hub.trigger_gc_for_test();
         assert!(
-            has_offline,
-            "grant-peer A must receive sim_offline when GC evicts GcB6; got: {:?}",
-            ev
+            hub.validate_token(&tok).is_ok(),
+            "identity-bound token must survive age-GC"
+        );
+    }
+
+    /// GC-AC-1: an active (listening + identity-bound) token survives well beyond an hour.
+    #[test]
+    fn test_active_token_survives_one_hour() {
+        let hub = make_hub(Duration::from_secs(30));
+        hub.set_gc_unlisten_ttl_for_test(Duration::from_secs(1));
+        let reg = hub.register_participant();
+        let (tok, _rx) = hub
+            .open_listen(Some(&reg), None, None, None, false, false)
+            .unwrap();
+        hub.announce(&tok, "Active").unwrap();
+        // Simulate > 1h since creation; the token remains identity-bound and recently active.
+        {
+            let mut inner = hub.inner.lock().unwrap();
+            inner.listen_tokens.get_mut(&tok).unwrap().last_active =
+                Instant::now() - Duration::from_secs(3700);
+        }
+        let _ = hub.trigger_gc_for_test();
+        assert!(
+            hub.validate_token(&tok).is_ok(),
+            "active identity-bound token must survive > 1h"
+        );
+    }
+
+    /// GC-AC-2: a governor listen token is never age-GC'd.
+    #[test]
+    fn test_governor_listen_token_survives_indefinitely() {
+        let hub = make_hub(Duration::from_secs(30));
+        let gov = hub.install_governor(None);
+        let (tok, _rx) = hub
+            .open_listen(Some(&gov.0), None, None, None, false, false)
+            .unwrap();
+        {
+            let mut inner = hub.inner.lock().unwrap();
+            let st = inner.listen_tokens.get_mut(&tok).unwrap();
+            assert!(
+                st.governor_id.is_some(),
+                "governor listen token must record governor_id"
+            );
+            st.last_active = Instant::now() - Duration::from_secs(100_000);
+        }
+        let _ = hub.trigger_gc_for_test();
+        assert!(
+            hub.validate_token(&tok).is_ok(),
+            "governor listen token must survive age-GC"
+        );
+    }
+
+    /// GC-AC-3: a registered-but-never-used token IS reaped once idle past its TTL.
+    #[test]
+    fn test_abandoned_token_gcd() {
+        let hub = make_hub(Duration::from_secs(30));
+        let tok = hub.register_participant(); // pending_first_listen=true, no name
+        {
+            let mut inner = hub.inner.lock().unwrap();
+            inner.listen_tokens.get_mut(&tok).unwrap().last_active =
+                Instant::now() - Duration::from_secs(100_000);
+        }
+        let evicted = hub.trigger_gc_for_test();
+        assert!(evicted >= 1, "abandoned token must be reaped");
+        assert!(
+            hub.validate_token(&tok).is_err(),
+            "abandoned token must be gone"
         );
     }
 
