@@ -306,6 +306,11 @@ struct HubInner {
     gov_events: broadcast::Sender<String>,
     /// Self-issued listen token state (keyed by token string).
     listen_tokens: HashMap<String, ListenTokenState>,
+    /// Permanent identity roster (15-0029 / FG-7). A name is inserted on first announce and
+    /// NEVER removed by GC, revoke, or token expiry. Loaded from the `identities` DB table at
+    /// startup. Checked by announce()/open_listen() to detect a registered name with no active
+    /// binding (orphaned name → NAME_IN_USE; governor rebind is the only reclaim path).
+    identities: HashSet<String>,
     /// Maps announced name → token (for name-claim lookup).
     name_to_token: HashMap<String, String>,
     /// Active SSE connection count per token.
@@ -610,6 +615,8 @@ impl HubInner {
     /// Bind `name` to `token` atomically (name registry + agents map + token state).
     /// Caller is responsible for evicting any stale holder first.
     fn bind_name(&mut self, token: &str, name: &str) {
+        // FG-7: a freshly bound name is a permanent identity (combined listen+announce path).
+        self.identities.insert(name.to_string());
         self.name_to_token
             .insert(name.to_string(), token.to_string());
         self.token_to_name
@@ -836,6 +843,7 @@ impl DeliveryHub {
                 req_counter: 0,
                 gov_events,
                 listen_tokens: HashMap::new(),
+                identities: HashSet::new(),
                 name_to_token: HashMap::new(),
                 sse_connections: HashMap::new(),
                 gc_ttl_unlisten,
@@ -865,23 +873,42 @@ impl DeliveryHub {
         persisted_tokens: Vec<PersistedToken>,
         persisted_grants: Vec<PersistedGrant>,
         persisted_denial_blocks: Vec<PersistedDenialBlock>,
+        persisted_identities: Vec<crate::persistence::PersistedIdentity>,
     ) -> Self {
         let mut hub = Self::new(lapse_after);
         {
             let mut inner = hub.inner.lock().unwrap();
+            // BLOCKER-5: partition participant tokens into the listen-token map. The "listen"
+            // inclusion is a belt-and-suspenders guard — after migration all rows are
+            // "participant", but the fallback ensures a first post-upgrade startup cannot
+            // discard valid sessions if the predicate runs before migration completes.
             let (listen_toks, regular_toks): (Vec<PersistedToken>, Vec<PersistedToken>) =
                 persisted_tokens
                     .into_iter()
-                    .partition(|t| t.token_type == "listen");
+                    .partition(|t| t.token_type == "participant" || t.token_type == "listen");
             inner.trust.load_from_store(regular_toks, persisted_grants);
+            // Populate the permanent identity roster (FG-7) BEFORE token restore so guards see it.
+            for row in persisted_identities {
+                inner.identities.insert(row.name);
+            }
             for t in listen_toks {
                 let mut state = ListenTokenState::new();
                 state.ever_listened = true;
                 state.ever_granted = true;
+                // BLOCKER-5 name restore: for participant tokens the `identity` column holds the
+                // name (post-migration). Fall back to the retired `name` column only for a stale
+                // pre-migration row whose identity still equals the token.
+                let resolved_name: Option<String> =
+                    if !t.identity.is_empty() && t.identity != t.token {
+                        Some(t.identity.clone())
+                    } else {
+                        t.name.clone()
+                    };
                 // Restore name bindings so the agent is reachable while offline.
                 // If two persisted tokens share a name (shouldn't happen), last-write-wins.
-                if let Some(ref name) = t.name {
+                if let Some(name) = resolved_name {
                     state.name = Some(name.clone());
+                    inner.identities.insert(name.clone());
                     inner.name_to_token.insert(name.clone(), t.token.clone());
                     inner.token_to_name.insert(t.token.clone(), name.clone());
                     inner.agents.insert(
@@ -2650,7 +2677,7 @@ impl DeliveryHub {
             Option<Arc<tokio::sync::Notify>>,
             Option<(String, String, String, String, String, String)>,
             Vec<mpsc::UnboundedSender<String>>,
-            Vec<String>,
+            Vec<(String, String)>,
         ) = {
             let mut inner = self.lock();
 
@@ -2811,10 +2838,10 @@ impl DeliveryHub {
 
                 // AC-T3: collect token strings for both agents (by name) so we can
                 // persist them to DB after the lock releases.
-                let mut listen_to_persist: Vec<String> = Vec::new();
+                let mut listen_to_persist: Vec<(String, String)> = Vec::new();
                 for name in [&from_name, &to_name] {
                     if let Some(tok) = inner.name_to_token.get(name.as_str()).cloned() {
-                        listen_to_persist.push(tok);
+                        listen_to_persist.push((tok, name.clone()));
                     }
                 }
 
@@ -2883,10 +2910,14 @@ impl DeliveryHub {
         if !listen_to_persist.is_empty()
             && let Some(store) = self.token_store.clone()
         {
-            for tok in listen_to_persist {
+            for (tok, name) in listen_to_persist {
                 let store2 = store.clone();
                 self.db_write(async move {
-                    if let Err(e) = store2.upsert_token(&tok, &tok, "listen", None, None).await {
+                    // 15-0029: participant rows write identity=name (never identity=token).
+                    if let Err(e) = store2
+                        .upsert_token(&tok, &name, "participant", None, None)
+                        .await
+                    {
                         eprintln!("WARNING: token store write failed: {e}");
                     }
                 });
@@ -3277,7 +3308,7 @@ impl DeliveryHub {
 
                     // Mark ever_granted on listen tokens and collect SSE senders.
                     let mut identity_senders: Vec<mpsc::UnboundedSender<String>> = Vec::new();
-                    let mut listen_to_persist: Vec<String> = Vec::new();
+                    let mut listen_to_persist: Vec<(String, String)> = Vec::new();
                     for identity in [&from_identity, &to_identity] {
                         if let Some(st) = inner.listen_tokens.get_mut(identity.as_str()) {
                             st.ever_granted = true;
@@ -3288,7 +3319,7 @@ impl DeliveryHub {
                     }
                     for name in [&from_name, &to_name] {
                         if let Some(tok) = inner.name_to_token.get(name.as_str()).cloned() {
-                            listen_to_persist.push(tok);
+                            listen_to_persist.push((tok, name.clone()));
                         }
                     }
 
@@ -3357,10 +3388,14 @@ impl DeliveryHub {
         if !listen_to_persist.is_empty()
             && let Some(store) = self.token_store.clone()
         {
-            for tok in listen_to_persist {
+            for (tok, name) in listen_to_persist {
                 let store2 = store.clone();
                 self.db_write(async move {
-                    if let Err(e) = store2.upsert_token(&tok, &tok, "listen", None, None).await {
+                    // 15-0029: participant rows write identity=name (never identity=token).
+                    if let Err(e) = store2
+                        .upsert_token(&tok, &name, "participant", None, None)
+                        .await
+                    {
                         eprintln!("WARNING: token store write failed: {e}");
                     }
                 });
@@ -4139,8 +4174,13 @@ impl DeliveryHub {
         {
             let tok = token.clone();
             self.db_write(async move {
+                // FG-7: persist the permanent identity record (idempotent; created_at preserved).
+                if let Err(e) = store.upsert_identity(&name).await {
+                    eprintln!("WARNING: identity store write failed: {e}");
+                }
+                // BLOCKER-1 / FG-3: write identity=name, type="participant" (name col retired).
                 if let Err(e) = store
-                    .upsert_token(&tok, &tok, "listen", None, Some(&name))
+                    .upsert_token(&tok, &name, "participant", None, None)
                     .await
                 {
                     eprintln!("WARNING: token store write failed: {e}");
@@ -4419,6 +4459,9 @@ impl DeliveryHub {
         }
 
         // Claim the name (atomic under the Mutex).
+        // FG-7: record the permanent identity on first announce. The roster entry is never
+        // removed by GC/revoke/expiry; it is the authority the BLOCKER-3 orphan guard checks.
+        inner.identities.insert(name.to_string());
         inner
             .name_to_token
             .insert(name.to_string(), token.to_string());
@@ -4495,8 +4538,13 @@ impl DeliveryHub {
             let tok = token.to_string();
             let name_s = name.to_string();
             self.db_write(async move {
+                // FG-7: persist the permanent identity record (idempotent; created_at preserved).
+                if let Err(e) = store.upsert_identity(&name_s).await {
+                    eprintln!("WARNING: identity store write failed: {e}");
+                }
+                // BLOCKER-1 / FG-3: write identity=name, type="participant" (name col retired).
                 if let Err(e) = store
-                    .upsert_token(&tok, &tok, "listen", None, Some(&name_s))
+                    .upsert_token(&tok, &name_s, "participant", None, None)
                     .await
                 {
                     eprintln!("WARNING: token store write failed: {e}");
@@ -7085,7 +7133,341 @@ mod tests {
             .load_denial_blocks()
             .await
             .expect("load denial blocks");
-        DeliveryHub::new_with_persisted_state(lapse, store, tokens, grants, denial_blocks)
+        let identities = store.load_identities().await.expect("load identities");
+        DeliveryHub::new_with_persisted_state(
+            lapse,
+            store,
+            tokens,
+            grants,
+            denial_blocks,
+            identities,
+        )
+    }
+
+    // ── 15-0029 S1: schema / migration / startup ──────────────────────────────
+
+    use crate::persistence::TokenStore;
+
+    async fn build_hub_from_store(store: Arc<TokenStore>, lapse: Duration) -> DeliveryHub {
+        let tokens = store.load_tokens().await.expect("load tokens");
+        let grants = store.load_grants().await.expect("load grants");
+        let denial = store.load_denial_blocks().await.expect("load denial");
+        let identities = store.load_identities().await.expect("load identities");
+        DeliveryHub::new_with_persisted_state(lapse, store, tokens, grants, denial, identities)
+    }
+
+    /// S1-AC-1: the `identities` table exists on a fresh DB.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_s1_identities_table_created() {
+        let db = unique_test_db();
+        let store = TokenStore::open(&db).await.expect("open");
+        store.upsert_identity("Scout7").await.expect("upsert id");
+        let ids = store.load_identities().await.expect("load");
+        assert!(ids.iter().any(|i| i.name == "Scout7"));
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// S1-AC-2: running migrate twice does not error (idempotent).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_s1_migrate_idempotent() {
+        let db = unique_test_db();
+        let store = TokenStore::open(&db).await.expect("open");
+        store.migrate_for_test().await.expect("migrate 2");
+        store.migrate_for_test().await.expect("migrate 3");
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// S1-AC-3: a listen-type token with a name backfills the identities table on migration.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_s1_identities_populated_from_listen_tokens() {
+        let db = unique_test_db();
+        let store = TokenStore::open(&db).await.expect("open");
+        store
+            .seed_raw_token("111111111", "111111111", "listen", Some("Scout7"))
+            .await
+            .expect("seed");
+        store.migrate_for_test().await.expect("migrate");
+        let ids = store.load_identities().await.expect("load");
+        assert!(ids.iter().any(|i| i.name == "Scout7"));
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// S1-AC-4: listen-type rows are renamed to participant.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_s1_listen_renamed_to_participant() {
+        let db = unique_test_db();
+        let store = TokenStore::open(&db).await.expect("open");
+        store
+            .seed_raw_token("222222222", "222222222", "listen", Some("Scout7"))
+            .await
+            .expect("seed");
+        store.migrate_for_test().await.expect("migrate");
+        assert_eq!(store.count_tokens_by_type("listen").await.unwrap(), 0);
+        assert_eq!(
+            store.token_type_of("222222222").await.unwrap().as_deref(),
+            Some("participant")
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// S1-AC-5: v2-type rows become participant (via v2→listen→participant). No dead v2→participant.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_s1_v2_renamed_via_listen() {
+        let db = unique_test_db();
+        let store = TokenStore::open(&db).await.expect("open");
+        store
+            .seed_raw_token("333333333", "333333333", "v2", Some("Unit12"))
+            .await
+            .expect("seed");
+        store.migrate_for_test().await.expect("migrate");
+        assert_eq!(store.count_tokens_by_type("v2").await.unwrap(), 0);
+        assert_eq!(
+            store.token_type_of("333333333").await.unwrap().as_deref(),
+            Some("participant")
+        );
+        let ids = store.load_identities().await.expect("load");
+        assert!(ids.iter().any(|i| i.name == "Unit12"));
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// S1-AC-6: agent-type rows are deleted on migration.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_s1_agent_tokens_purged() {
+        let db = unique_test_db();
+        let store = TokenStore::open(&db).await.expect("open");
+        store
+            .seed_raw_token("agent-1", "id-alpha", "agent", None)
+            .await
+            .expect("seed");
+        store.migrate_for_test().await.expect("migrate");
+        assert_eq!(store.count_tokens_by_type("agent").await.unwrap(), 0);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// S1-AC-7: participant tokens with identity == token (never announced) are purged.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_s1_orphan_tokens_purged() {
+        let db = unique_test_db();
+        let store = TokenStore::open(&db).await.expect("open");
+        // identity == token, no name → orphan.
+        store
+            .seed_raw_token("444444444", "444444444", "listen", None)
+            .await
+            .expect("seed");
+        store.migrate_for_test().await.expect("migrate");
+        assert_eq!(store.token_identity("444444444").await.unwrap(), None);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// S1-AC-7b: a named token survives the Step-6 purge — including a numeric-name edge case.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_s1_named_token_survives_purge() {
+        let db = unique_test_db();
+        let store = TokenStore::open(&db).await.expect("open");
+        // Correct post-FG3 row: identity already holds the name.
+        store
+            .seed_raw_token("555555555", "Scout7", "listen", None)
+            .await
+            .expect("seed named");
+        // Adversarial edge case: the name string is itself numeric (but != the token).
+        store
+            .seed_raw_token("666666666", "42", "listen", None)
+            .await
+            .expect("seed numeric-named");
+        store.migrate_for_test().await.expect("migrate");
+        assert_eq!(
+            store.token_identity("555555555").await.unwrap().as_deref(),
+            Some("Scout7")
+        );
+        assert_eq!(
+            store.token_identity("666666666").await.unwrap().as_deref(),
+            Some("42")
+        );
+        // Both name bindings must load into memory.
+        let hub = build_hub_from_store(Arc::new(store), Duration::from_secs(30)).await;
+        let inner = hub.lock();
+        assert_eq!(
+            inner.name_to_token.get("Scout7").map(String::as_str),
+            Some("555555555")
+        );
+        assert_eq!(
+            inner.name_to_token.get("42").map(String::as_str),
+            Some("666666666")
+        );
+        drop(inner);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// S1-AC-9: startup partition matches participant tokens; they load into listen_tokens.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_s1_startup_partition_on_participant() {
+        let db = unique_test_db();
+        let store = TokenStore::open(&db).await.expect("open");
+        store
+            .seed_raw_token("777777777", "Scout7", "participant", None)
+            .await
+            .expect("seed");
+        store.migrate_for_test().await.expect("migrate");
+        let hub = build_hub_from_store(Arc::new(store), Duration::from_secs(30)).await;
+        let inner = hub.lock();
+        assert!(inner.listen_tokens.contains_key("777777777"));
+        drop(inner);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// S1-AC-10: startup restores the name binding from the identity column (not the name column).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_s1_startup_reads_identity_for_name() {
+        let db = unique_test_db();
+        let store = TokenStore::open(&db).await.expect("open");
+        store
+            .seed_raw_token("888888888", "Scout7", "participant", None)
+            .await
+            .expect("seed");
+        store.migrate_for_test().await.expect("migrate");
+        let hub = build_hub_from_store(Arc::new(store), Duration::from_secs(30)).await;
+        let inner = hub.lock();
+        assert_eq!(
+            inner.name_to_token.get("Scout7").map(String::as_str),
+            Some("888888888")
+        );
+        assert_eq!(
+            inner.token_to_name.get("888888888").map(String::as_str),
+            Some("Scout7")
+        );
+        drop(inner);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// S1-AC-11: the in-memory identities HashSet is populated from the identities table.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_s1_identities_hashset_loaded() {
+        let db = unique_test_db();
+        let store = TokenStore::open(&db).await.expect("open");
+        store.upsert_identity("Scout7").await.expect("seed id");
+        let hub = build_hub_from_store(Arc::new(store), Duration::from_secs(30)).await;
+        let inner = hub.lock();
+        assert!(inner.identities.contains("Scout7"));
+        drop(inner);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    async fn assert_announce_writes_identity_not_token() {
+        let db = unique_test_db();
+        let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
+        let reg = hub.register_participant();
+        let (tok, _rx) = hub
+            .open_listen(Some(&reg), None, None, None, false, false)
+            .unwrap();
+        hub.announce(&tok, "Alice", false).unwrap();
+        let store = hub.token_store.clone().unwrap();
+        assert_eq!(
+            store.token_identity(&tok).await.unwrap().as_deref(),
+            Some("Alice")
+        );
+        assert_eq!(
+            store.token_type_of(&tok).await.unwrap().as_deref(),
+            Some("participant")
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// S1-AC-12 / EPIC-AC-23: announce writes identity=name and token_type="participant".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_s1_upsert_writes_participant_type_and_name_identity() {
+        assert_announce_writes_identity_not_token().await;
+    }
+
+    /// EPIC-AC-23 alias: after announce, the token row stores identity=name (not the token).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_upsert_token_writes_identity_not_token() {
+        assert_announce_writes_identity_not_token().await;
+    }
+
+    /// EPIC-AC-10: an agent-type seed row leaves zero agent rows after startup migration.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_no_agent_rows_after_startup() {
+        let db = unique_test_db();
+        let store = TokenStore::open(&db).await.expect("open");
+        store
+            .seed_raw_token("agent-7", "id-x", "agent", None)
+            .await
+            .expect("seed");
+        store.migrate_for_test().await.expect("migrate");
+        assert_eq!(store.count_tokens_by_type("agent").await.unwrap(), 0);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// EPIC-AC-11: a listen-type seed row leaves zero listen rows after startup migration.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_no_listen_rows_after_startup() {
+        let db = unique_test_db();
+        let store = TokenStore::open(&db).await.expect("open");
+        store
+            .seed_raw_token("999999999", "Scout7", "listen", None)
+            .await
+            .expect("seed");
+        store.migrate_for_test().await.expect("migrate");
+        assert_eq!(store.count_tokens_by_type("listen").await.unwrap(), 0);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// EPIC-AC-12: a participant token with a name populates the identities table on startup.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_identities_table_populated_on_startup() {
+        let db = unique_test_db();
+        let store = TokenStore::open(&db).await.expect("open");
+        store
+            .seed_raw_token("121212121", "Alice", "participant", None)
+            .await
+            .expect("seed");
+        store.migrate_for_test().await.expect("migrate");
+        let ids = store.load_identities().await.expect("load");
+        assert!(ids.iter().any(|i| i.name == "Alice"));
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// EPIC-AC-24: a participant session is restored (token + name binding) after restart.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_participant_sessions_restored_after_restart() {
+        let db = unique_test_db();
+        let tok = {
+            let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
+            let reg = hub.register_participant();
+            let (tok, _rx) = hub
+                .open_listen(Some(&reg), None, None, None, false, false)
+                .unwrap();
+            hub.announce(&tok, "Alice", false).unwrap();
+            tok
+        };
+        // Restart.
+        let hub2 = make_persisted_hub(&db, Duration::from_secs(30)).await;
+        assert!(
+            hub2.validate_token(&tok).is_ok(),
+            "token must be valid after restart"
+        );
+        {
+            let inner = hub2.lock();
+            assert_eq!(
+                inner.name_to_token.get("Alice").map(String::as_str),
+                Some(tok.as_str()),
+                "name binding 'Alice' must be restored"
+            );
+        }
+        // A message addressed to Alice must route (not RecipientUnknown).
+        let gov = hub2.install_governor(None);
+        let sender = hub2
+            .mint_participant_token(&gov, "id-sender", None)
+            .unwrap();
+        hub2.register("sender", &sender, PresenceScope::GrantScoped)
+            .unwrap();
+        let res = hub2.send(&sender, "Alice", Payload(b"hi".to_vec()), None, None);
+        assert!(
+            !matches!(res, Err(Error::RecipientUnknown)),
+            "message to restored 'Alice' must not be RecipientUnknown; got {:?}",
+            res
+        );
+        let _ = std::fs::remove_file(&db);
     }
 
     // ── Attachments (native file/attachment send) ────────────────────────────────
@@ -7235,7 +7617,8 @@ mod tests {
         ));
     }
 
-    /// AC1: after restart, all previously minted non-expired tokens work without re-provisioning.
+    /// AC1: after restart, previously persisted non-expired credentials work without
+    /// re-provisioning. (15-0029 final form: participant = listen token; minted agents removed.)
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ac1_tokens_survive_restart() {
         let db = unique_test_db();
@@ -7243,14 +7626,18 @@ mod tests {
         let (gov_tok, participant_tok) = {
             let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
             let gov = hub.install_governor(None);
-            let agent = hub.mint_participant_token(&gov, "alice", None).unwrap();
-            (gov, agent)
+            let reg = hub.register_participant();
+            let (tok, _rx) = hub
+                .open_listen(Some(&reg), None, None, None, false, false)
+                .unwrap();
+            hub.announce(&tok, "alice", false).unwrap();
+            (gov, tok)
         };
 
         let hub2 = make_persisted_hub(&db, Duration::from_secs(30)).await;
         assert!(
-            hub2.validate_participant_token(&participant_tok).is_ok(),
-            "AC1: agent token must survive restart"
+            hub2.validate_token(&participant_tok).is_ok(),
+            "AC1: participant token must survive restart"
         );
         assert!(
             hub2.validate_governor_token(&gov_tok).is_ok(),
@@ -7260,28 +7647,39 @@ mod tests {
         let _ = std::fs::remove_file(&db);
     }
 
-    /// AC2: after restart, all previously approved non-expired grants still authorize message sending.
+    /// AC2: after restart, previously approved non-expired grants still authorize message sending.
+    /// (15-0029 final form: grants are keyed on stable names from the participant listen flow.)
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ac2_grants_survive_restart() {
         let db = unique_test_db();
 
-        let (agent_a, agent_b) = {
+        let (tok_a, _tok_b) = {
             let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
             let gov = hub.install_governor(None);
-            let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
-            let tok_b = hub.mint_participant_token(&gov, "id-bob", None).unwrap();
-            hub.approve_grant(&gov, "id-alice", "id-bob", None).unwrap();
-            (tok_a, tok_b)
+            let reg_a = hub.register_participant();
+            let (a, _ra) = hub
+                .open_listen(Some(&reg_a), None, None, None, false, false)
+                .unwrap();
+            hub.announce(&a, "alice", false).unwrap();
+            let reg_b = hub.register_participant();
+            let (b, _rb) = hub
+                .open_listen(Some(&reg_b), None, None, None, false, false)
+                .unwrap();
+            hub.announce(&b, "bob", false).unwrap();
+            hub.approve_grant(&gov, &a, &b, None).unwrap();
+            (a, b)
         };
 
         let hub2 = make_persisted_hub(&db, Duration::from_secs(30)).await;
-        hub2.register("alice", &agent_a, PresenceScope::GrantScoped)
-            .unwrap();
-        hub2.register("bob", &agent_b, PresenceScope::GrantScoped)
-            .unwrap();
         assert!(
             matches!(
-                hub2.send(&agent_a, "bob", Payload(b"hi".to_vec()), None, None),
+                hub2.send(
+                    &ParticipantToken(tok_a.clone()),
+                    "bob",
+                    Payload(b"hi".to_vec()),
+                    None,
+                    None
+                ),
                 Ok(Ack::Accepted)
             ),
             "AC2: grant must allow sending after restart"
@@ -7372,29 +7770,40 @@ mod tests {
     }
 
     /// AC6: permanent grant persisted; restart doesn't remove it.
+    /// (15-0029 final form: participant listen flow + name-keyed grant.)
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ac6_permanent_grant_survives_restart() {
         let db = unique_test_db();
 
-        let (tok_a, tok_b) = {
+        let tok_a = {
             let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
             let gov = hub.install_governor(None);
-            let a = hub.mint_participant_token(&gov, "id-a", None).unwrap();
-            let b = hub.mint_participant_token(&gov, "id-b", None).unwrap();
-            hub.approve_grant(&gov, "id-a", "id-b", None).unwrap(); // no expiry = permanent
-            (a, b)
+            let reg_a = hub.register_participant();
+            let (a, _ra) = hub
+                .open_listen(Some(&reg_a), None, None, None, false, false)
+                .unwrap();
+            hub.announce(&a, "ag-a", false).unwrap();
+            let reg_b = hub.register_participant();
+            let (b, _rb) = hub
+                .open_listen(Some(&reg_b), None, None, None, false, false)
+                .unwrap();
+            hub.announce(&b, "ag-b", false).unwrap();
+            hub.approve_grant(&gov, &a, &b, None).unwrap(); // no expiry = permanent
+            a
         };
 
-        // Reload many times — grant must persist
+        // Reload many times — grant must persist.
         for _ in 0..3 {
             let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
-            hub.register("ag-a", &tok_a, PresenceScope::GrantScoped)
-                .unwrap();
-            hub.register("ag-b", &tok_b, PresenceScope::GrantScoped)
-                .unwrap();
             assert!(
                 matches!(
-                    hub.send(&tok_a, "ag-b", Payload(b"x".to_vec()), None, None),
+                    hub.send(
+                        &ParticipantToken(tok_a.clone()),
+                        "ag-b",
+                        Payload(b"x".to_vec()),
+                        None,
+                        None
+                    ),
                     Ok(Ack::Accepted)
                 ),
                 "AC6: permanent grant must survive repeated restarts"
