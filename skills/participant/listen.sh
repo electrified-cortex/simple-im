@@ -5,6 +5,14 @@
 # (announce/reconnect/sub/breadcrumb/presence/keepalive) -> STDERR (logged,
 # not a wake). [2026-06-24: per operator — "S-IM should ONLY notify you of
 # real messages and nothing else." Crash/health is covered by a separate watcher.]
+#
+# 15-0029 (final form): the client NEVER self-registers. A participant credential is
+# issued by the governor out-of-band; this script only LISTENS with that credential and
+# captures the subscription_id from every welcome. Credential loss (no token / 401 /
+# revoked) and name conflicts are terminal exit codes for the governor to act on:
+#   exit 2 -> NAME_IN_USE  (governor must rebind the identity to a new credential)
+#   exit 3 -> CREDENTIAL_LOST (governor must issue a new token)
+# All JSON field extraction uses jq (BT-NFR4).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SIM_URL_FILE="$SCRIPT_DIR/service.url"
@@ -19,6 +27,11 @@ if [[ -z "$SIM_URL" || -z "$HANDLE" ]]; then
     exit 1
 fi
 
+if ! command -v jq >/dev/null 2>&1; then
+    echo "ERROR: jq is required but not found on PATH"
+    exit 1
+fi
+
 BACKOFF=2
 MAX_BACKOFF=60
 STABLE_THRESHOLD=30
@@ -30,30 +43,18 @@ FORCE_LISTEN=""  # Set to "--force" when ACTIVE_SUBSCRIPTION flag fires; cleared
 
 connect() {
     local listen_extra=""
+    # The ONLY force path: a 409 ACTIVE_SUBSCRIPTION from /listen supersedes our own stale
+    # subscription on the SAME token. This is a subscription-level reclaim, never a name takeover.
     [[ "${1:-}" == "--force" ]] && listen_extra="?force=true"
 
     local token
     token="$(cat "$TOKEN_FILE" 2>/dev/null | tr -d '[:space:]')"
 
-    # If no token, register first
+    # No credential — the governor must provision one (the client never self-registers).
     if [[ -z "$token" ]]; then
-        echo >&2 "sim: no token — registering via /register"
-        local reg_result
-        reg_result=$(curl -s -X POST "$SIM_URL/register" \
-            -H "Content-Type: application/json" 2>/dev/null)
-        token=$(echo "$reg_result" | grep -o '"token":"[^"]*"' | sed 's/"token":"//;s/"//')
-        if [[ -n "$token" ]]; then
-            echo "$token" > "$TOKEN_FILE"
-            echo >&2 "sim: registered — token saved"
-        else
-            echo >&2 "sim: registration failed — ${reg_result}"
-            return 1
-        fi
-    fi
-
-    local auth_header=""
-    if [[ -n "$token" ]]; then
-        auth_header="Authorization: Bearer $token"
+        echo >&2 "[SIM] CREDENTIAL_LOST: governor must issue a new token"
+        echo "CREDENTIAL_LOST" > "$SCRIPT_DIR/.sim_credential_lost_flag"
+        return 1
     fi
 
     local connect_start
@@ -61,66 +62,83 @@ connect() {
 
     curl -s -N -X POST "$SIM_URL/listen${listen_extra}" \
         -H "Content-Type: application/json" \
-        ${auth_header:+-H "$auth_header"} \
+        -H "Authorization: Bearer $token" \
         -d '{}' 2>/dev/null | while IFS= read -r line; do
         # Skip empty lines and keepalives
         [[ -z "$line" ]] && continue
         [[ "$line" == :* ]] && continue
 
-        # Detect non-SSE error response (e.g. 401 AUTH_FAILED on stale/invalid token).
-        # S-IM restart clears all tokens — an agent with a pre-restart token in TOKEN_FILE
-        # will get AUTH_FAILED on the first POST /listen. Without this guard, FAIL_COUNT
-        # would increment 10 times and trigger a false SIM-DOWN. Instead: clear the file
-        # and break; the outer loop's next iteration will call /register for a fresh token.
+        # Non-SSE error response (e.g. 401 AUTH_FAILED on an invalid/stale token). In the final
+        # form there is no self-re-registration: a lost credential is terminal (exit 3) so the
+        # governor reissues out-of-band.
         if [[ "$line" == *'"AUTH_FAILED"'* || "$line" == *'"TOKEN_REJECTED"'* ]]; then
-            echo >&2 "sim: token rejected — clearing for re-registration"
-            > "$TOKEN_FILE"
+            echo >&2 "[SIM] CREDENTIAL_LOST: governor must issue a new token"
+            echo "CREDENTIAL_LOST" > "$SCRIPT_DIR/.sim_credential_lost_flag"
             break
         fi
 
         if [[ "$line" == *'"ACTIVE_SUBSCRIPTION"'* ]]; then
-            echo >&2 "sim: orphaned subscription detected — will force-reclaim on next connect"
+            echo >&2 "sim: orphaned subscription detected — will reclaim our own slot on next connect"
             echo "FORCE_RECLAIM" > "$SCRIPT_DIR/.sim_force_reclaim_flag"
             break
         fi
 
         if [[ "$line" == data:* ]]; then
             data="${line#data: }"
-            type=$(echo "$data" | grep -o '"type":"[^"]*"' | head -1 | sed 's/"type":"//;s/"//')
-            event=$(echo "$data" | grep -o '"event":"[^"]*"' | head -1 | sed 's/"event":"//;s/"//')
+            type=$(printf '%s' "$data" | jq -r '.type // empty' 2>/dev/null)
+            event=$(printf '%s' "$data" | jq -r '.event // empty' 2>/dev/null)
 
             case "$type/$event" in
                 service/welcome)
-                    # Welcome no longer echoes the token — use $token (set at top of connect()).
-                    # Announce handle to go live.
+                    # BT-FR1: capture the subscription_id (present on EVERY welcome and equal to
+                    # the participant token) and persist it whenever it differs from the stored
+                    # value — first connect AND idempotently on each reconnect.
+                    sub_id=$(printf '%s' "$data" | jq -r '.subscription_id // empty' 2>/dev/null)
+                    if [[ -n "$sub_id" && "$sub_id" != "$token" ]]; then
+                        printf '%s' "$sub_id" > "$TOKEN_FILE"
+                        token="$sub_id"
+                        echo >&2 "sim: subscription_id captured and persisted"
+                    fi
+                    # Announce our handle to go live. No takeover flag in the body (final form):
+                    # a name held by another credential is NAME_IN_USE and requires a governor rebind.
                     announce_result=$(curl -s -w "\n%{http_code}" -X POST "$SIM_URL/announce" \
                         -H "Content-Type: application/json" \
                         -H "Authorization: Bearer $token" \
-                        -d "{\"name\":\"$HANDLE\",\"force\":true}" 2>/dev/null)
+                        -d "{\"name\":\"$HANDLE\"}" 2>/dev/null)
                     announce_code="${announce_result##*$'\n'}"
-                    echo >&2 "sim: announce HTTP $announce_code"
-                    if [[ "$announce_code" != "204" ]]; then
-                        echo >&2 "sim: announce failed — body: ${announce_result%$'\n'*}"
-                    fi
+                    case "$announce_code" in
+                        204)
+                            echo >&2 "sim: announce ok"
+                            ;;
+                        409)
+                            echo >&2 "[SIM] NAME_IN_USE: governor rebind required for $HANDLE"
+                            echo "NAME_IN_USE" > "$SCRIPT_DIR/.sim_name_in_use_flag"
+                            break
+                            ;;
+                        401)
+                            echo >&2 "[SIM] CREDENTIAL_LOST: governor must issue a new token"
+                            echo "CREDENTIAL_LOST" > "$SCRIPT_DIR/.sim_credential_lost_flag"
+                            break
+                            ;;
+                        *)
+                            echo >&2 "sim: announce HTTP $announce_code — body: ${announce_result%$'\n'*}"
+                            ;;
+                    esac
                     ;;
                 service/superseded|service/cancelled)
                     echo >&2 "sim: stream superseded — reconnecting"
                     break
                     ;;
                 service/revoked)
-                    echo >&2 "sim: token revoked — re-registering"
-                    > "$TOKEN_FILE"
-                    # Signal outer loop: revoke is intentional governance, not a server failure.
-                    # FAIL_COUNT must not be incremented. Bash runs the pipe-RHS in a subshell so
-                    # we can't set FAIL_COUNT here directly — use a flag file instead.
-                    echo "REVOKED" > "$SCRIPT_DIR/.sim_revoke_flag"
+                    echo >&2 "[SIM] CREDENTIAL_LOST: session revoked"
+                    echo "CREDENTIAL_LOST" > "$SCRIPT_DIR/.sim_credential_lost_flag"
                     break
                     ;;
                 sub/*)
                     echo >&2 "sim: subscription event (sub_id embedded)"
                     ;;
                 notify/*)
-                    pending=$(echo "$data" | grep -o '"pending":[0-9]*' | grep -o '[0-9]*')
+                    pending=$(printf '%s' "$data" | jq -r '.pending // 0' 2>/dev/null)
                     if [[ "${pending:-0}" -gt 0 ]]; then
                         echo "sim: notify pending=${pending}"
                     else
@@ -128,7 +146,8 @@ connect() {
                     fi
                     ;;
                 presence/*)
-                    echo >&2 "sim: presence event=${event} participant=$(echo "$data" | grep -o '"participant":"[^"]*"' | sed 's/"participant":"//;s/"//')"
+                    participant=$(printf '%s' "$data" | jq -r '.participant // empty' 2>/dev/null)
+                    echo >&2 "sim: presence event=${event} participant=${participant}"
                     ;;
                 *)
                     echo >&2 "sim: event type=$type event=$event"
@@ -145,23 +164,26 @@ while true; do
     connect_end=$(date +%s)
     elapsed=$((connect_end - connect_start))
 
-    # Re-registration triggers — two cases, both are intentional, not server failures:
-    #   1. Revoke flag: governor explicitly cycled the token (service/revoked handler).
-    #   2. Empty/missing TOKEN_FILE: AUTH_FAILED on stale token cleared the file (redeploy recovery).
-    # In both cases: reset backoff, skip FAIL_COUNT increment, continue to re-register.
-    if [[ -f "$SCRIPT_DIR/.sim_revoke_flag" ]] || [[ ! -s "$TOKEN_FILE" ]]; then
-        rm -f "$SCRIPT_DIR/.sim_revoke_flag"
-        BACKOFF=2
-        continue
+    # Terminal: credential lost (no token / 401 / revoked). The governor must issue a new token
+    # out-of-band; the client does not self-recover. Exit 3 so the supervisor surfaces it.
+    if [[ -f "$SCRIPT_DIR/.sim_credential_lost_flag" ]]; then
+        rm -f "$SCRIPT_DIR/.sim_credential_lost_flag"
+        exit 3
     fi
 
-    # Orphaned subscription recovery (ACTIVE_SUBSCRIPTION 409).
-    # Use ?force=true on the NEXT connect() call — no DELETE, no FAIL_COUNT increment.
+    # Terminal: our name is held by a different credential. Only a governor rebind can reclaim it.
+    if [[ -f "$SCRIPT_DIR/.sim_name_in_use_flag" ]]; then
+        rm -f "$SCRIPT_DIR/.sim_name_in_use_flag"
+        exit 2
+    fi
+
+    # Orphaned-subscription recovery (ACTIVE_SUBSCRIPTION 409 from /listen). Reclaim our OWN slot
+    # via ?force=true on the NEXT connect() — same-token only, no DELETE, no FAIL_COUNT increment.
     if [[ -f "$SCRIPT_DIR/.sim_force_reclaim_flag" ]]; then
         rm -f "$SCRIPT_DIR/.sim_force_reclaim_flag"
         FORCE_LISTEN="--force"
         BACKOFF=2
-        echo >&2 "sim: orphaned subscription — next connect will use force-reclaim"
+        echo >&2 "sim: orphaned subscription — next connect will reclaim our own slot"
         continue
     fi
 

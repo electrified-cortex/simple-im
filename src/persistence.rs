@@ -7,9 +7,17 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePo
 pub struct PersistedToken {
     pub token: String,
     pub identity: String,
-    pub token_type: String, // "governor", "agent", or "listen"
+    pub token_type: String, // "governor" or "participant" (post-15-0029; "agent"/"listen" purged)
     pub expires_at_secs: Option<u64>,
-    pub name: Option<String>, // announce name for listen tokens; None for governor/agent tokens
+    /// Retired announce-name column (15-0029). Kept as a read-only startup fallback for rows that
+    /// predate the `identity`-as-name model; never written after this epic. See migration Step 7.
+    pub name: Option<String>,
+}
+
+/// A permanent identity record (15-0029 / FG-7). The name survives token GC, revoke, and expiry.
+pub struct PersistedIdentity {
+    pub name: String,
+    pub created_at: String,
 }
 
 pub struct PersistedDenialBlock {
@@ -176,6 +184,97 @@ impl TokenStore {
         .execute(&self.pool)
         .await?;
 
+        // 15-0029 S1 / FG-7: permanent identities table — a name's record must survive
+        // token GC (a token is a replaceable credential; the identity/name is permanent).
+        // Step 1 of the zero-debt migration plan. Additive and idempotent.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS identities (
+                name        TEXT PRIMARY KEY,
+                created_at  TEXT NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // ── 15-0029 zero-debt migration Steps 2–7 ──────────────────────────────
+        // All idempotent, all mandatory. Run AFTER the identities table exists and AFTER
+        // the v2→listen rename above. Provably-safe: a row is preserved by the Step-6 purge
+        // iff its identity is a REGISTERED NAME (present in `identities`, populated by 2a/2b).
+
+        // Step 2a: backfill identities from rows where `identity` already holds the name.
+        let id_2a = sqlx::query(
+            "INSERT OR IGNORE INTO identities (name, created_at) \
+             SELECT identity, created_at FROM tokens \
+             WHERE token_type IN ('listen', 'participant') \
+               AND identity IS NOT NULL AND identity != '' AND identity != token",
+        )
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+
+        // Step 2b: backfill identities for FG-3 defect rows (identity == token) using `name`.
+        let id_2b = sqlx::query(
+            "INSERT OR IGNORE INTO identities (name, created_at) \
+             SELECT name, created_at FROM tokens \
+             WHERE token_type IN ('listen', 'participant') \
+               AND (identity = token OR identity IS NULL OR identity = '') \
+               AND name IS NOT NULL AND name != ''",
+        )
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+
+        // Step 3: fix the identity column for FG-3 defect rows (identity == token → identity = name).
+        sqlx::query(
+            "UPDATE tokens SET identity = name \
+             WHERE token_type IN ('listen', 'participant') \
+               AND name IS NOT NULL AND name != '' \
+               AND (identity = token OR identity IS NULL OR identity = '')",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Step 4: rename listen → participant (token-type collapse 3→2).
+        let renamed =
+            sqlx::query("UPDATE tokens SET token_type = 'participant' WHERE token_type = 'listen'")
+                .execute(&self.pool)
+                .await?
+                .rows_affected();
+
+        // Step 5: purge legacy agent-N tokens (mandatory breaking change).
+        let agent_purged = sqlx::query("DELETE FROM tokens WHERE token_type = 'agent'")
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+
+        // Step 6: purge participant tokens with no valid identity binding (mandatory).
+        // Keep iff identity is a registered name — does NOT rely on the "names are never numeric"
+        // invariant. Steps 2a/2b ran first, so every announced name is already in `identities`.
+        let orphan_purged = sqlx::query(
+            "DELETE FROM tokens \
+             WHERE token_type = 'participant' \
+               AND (identity IS NULL OR identity = '' OR identity NOT IN (SELECT name FROM identities))",
+        )
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+
+        // Step 7: the retired `name` column is intentionally RETAINED as a dead, read-only
+        // startup fallback (SA-4 documented edge case). Dropping it would remove the BLOCKER-5
+        // name-restore fallback and risk a grant-time identity-clobber data-loss window; no
+        // business logic writes to it after this epic. name_col_dropped = 0.
+        let name_col_dropped = 0;
+
+        eprintln!(
+            "sim_migrate: identities_created={} listen_renamed={} agent_purged={} \
+             orphan_purged={} name_col_dropped={}",
+            id_2a + id_2b,
+            renamed,
+            agent_purged,
+            orphan_purged,
+            name_col_dropped,
+        );
+
         Ok(())
     }
 
@@ -236,7 +335,35 @@ impl TokenStore {
             .collect())
     }
 
+    /// Load all permanent identity records (15-0029 / FG-7).
+    pub async fn load_identities(&self) -> Result<Vec<PersistedIdentity>, sqlx::Error> {
+        use sqlx::Row;
+        let rows = sqlx::query("SELECT name, created_at FROM identities")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| PersistedIdentity {
+                name: r.get("name"),
+                created_at: r.get("created_at"),
+            })
+            .collect())
+    }
+
     // ── Write ─────────────────────────────────────────────────────────────────
+
+    /// Insert a permanent identity record on first announce. `INSERT OR IGNORE` preserves the
+    /// original `created_at` across governor rebinds (EPIC-AC-8): a name's first-announce
+    /// timestamp is immutable.
+    pub async fn upsert_identity(&self, name: &str) -> Result<(), sqlx::Error> {
+        let now = system_time_to_secs_str(SystemTime::now());
+        sqlx::query("INSERT OR IGNORE INTO identities (name, created_at) VALUES (?, ?)")
+            .bind(name)
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
 
     pub async fn upsert_token(
         &self,
@@ -276,6 +403,35 @@ impl TokenStore {
             .bind(token)
             .execute(&self.pool)
             .await?;
+        Ok(())
+    }
+
+    /// Operator-anchored governor reset (15-0029 / security-MAJOR-1/2): delete the revoked
+    /// governor rows and insert the new governor in a SINGLE transaction, so a crash cannot
+    /// leave the hub with no durable governor.
+    pub async fn reset_governors(
+        &self,
+        delete_ids: &[String],
+        new_token: &str,
+    ) -> Result<(), sqlx::Error> {
+        let now = system_time_to_secs_str(SystemTime::now());
+        let mut tx = self.pool.begin().await?;
+        for id in delete_ids {
+            sqlx::query("DELETE FROM tokens WHERE token = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        sqlx::query(
+            "INSERT OR REPLACE INTO tokens (token, identity, token_type, expires_at, created_at, name) \
+             VALUES (?, ?, 'governor', NULL, ?, NULL)",
+        )
+        .bind(new_token)
+        .bind(new_token)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -481,5 +637,77 @@ impl TokenStore {
             .execute(&self.pool)
             .await?;
         Ok(res.rows_affected())
+    }
+}
+
+// ── Test-only migration seams (15-0029) ─────────────────────────────────────────
+#[cfg(test)]
+impl TokenStore {
+    /// Re-run the schema migration (idempotency + legacy-row processing in tests).
+    pub async fn migrate_for_test(&self) -> Result<(), sqlx::Error> {
+        self.migrate().await
+    }
+
+    /// Insert a raw token row (including the legacy `name` column) to simulate a pre-migration DB.
+    pub async fn seed_raw_token(
+        &self,
+        token: &str,
+        identity: &str,
+        token_type: &str,
+        name: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        let now = system_time_to_secs_str(SystemTime::now());
+        sqlx::query(
+            "INSERT OR REPLACE INTO tokens (token, identity, token_type, expires_at, created_at, name) \
+             VALUES (?, ?, ?, NULL, ?, ?)",
+        )
+        .bind(token)
+        .bind(identity)
+        .bind(token_type)
+        .bind(now)
+        .bind(name)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Count token rows of a given type.
+    pub async fn count_tokens_by_type(&self, token_type: &str) -> Result<i64, sqlx::Error> {
+        use sqlx::Row;
+        let row = sqlx::query("SELECT COUNT(*) AS c FROM tokens WHERE token_type = ?")
+            .bind(token_type)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.get("c"))
+    }
+
+    /// Return the `identity` column for a token, or None if the row is gone.
+    pub async fn token_identity(&self, token: &str) -> Result<Option<String>, sqlx::Error> {
+        use sqlx::Row;
+        let row = sqlx::query("SELECT identity FROM tokens WHERE token = ?")
+            .bind(token)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get("identity")))
+    }
+
+    /// Return the `token_type` column for a token, or None if the row is gone.
+    pub async fn token_type_of(&self, token: &str) -> Result<Option<String>, sqlx::Error> {
+        use sqlx::Row;
+        let row = sqlx::query("SELECT token_type FROM tokens WHERE token = ?")
+            .bind(token)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get("token_type")))
+    }
+
+    /// Return the `created_at` of an identity record, or None if absent.
+    pub async fn identity_created_at(&self, name: &str) -> Result<Option<String>, sqlx::Error> {
+        use sqlx::Row;
+        let row = sqlx::query("SELECT created_at FROM identities WHERE name = ?")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get("created_at")))
     }
 }

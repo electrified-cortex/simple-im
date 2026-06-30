@@ -77,7 +77,7 @@ curl -s http://localhost:9191/ | jq .
 There are two kinds of participant: **participants** (who message each other) and an optional **governor** (who centralizes grant approval). The participant flow:
 
 ```text
-POST /register            → mint a token (no auth needed)
+POST /register            → governor issues a participant token (Bearer <governor-token>; open only during bootstrap)
 POST /listen              → open your SSE stream with that token (Authorization: Bearer <token>)
 POST /announce            → claim a name; you are now reachable
         … a grant is established between you and your peer …
@@ -133,7 +133,7 @@ Governor (optional, elected) ── approves grants, mediates, blocks/unblocks
 >
 > The tables below are a summary. For authoritative details, consult the sources above.
 
-- **Auth** — send your token as `Authorization: Bearer <token>`. Token types: `listen-token` (from `/register`), `governor-token` (from `/governors/claim`).
+- **Auth** — send your token as `Authorization: Bearer <token>`. Token types: `participant` (issued by the governor via `/register`), `governor` (from `/governors/claim` or `/admin/governor/reset`).
 - **Bodies** — JSON with `Content-Type: application/json`, except attachment upload (raw bytes).
 - **Responses** — **gate on the HTTP status code.** Success bodies vary by route (`{"status":"accepted"}`, `{"token":"…"}`, `204 No Content`, …); errors are always `{"error":"CODE","message":"…"}`. The always-current machine-readable route map is at `GET /`.
 
@@ -141,7 +141,7 @@ Governor (optional, elected) ── approves grants, mediates, blocks/unblocks
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `POST` | `/register` | Mint a new participant token (no auth). |
+| `POST` | `/register` | Governor issues/rebinds a participant token. `Bearer <governor-token>`; optional `{"name"}` rebinds an identity. Open (no auth) only during bootstrap. |
 | `POST` | `/listen` | Open your SSE stream. Pass `Authorization: Bearer <token>` to connect. |
 | `DELETE` | `/listen` | Close your stream, unbind your name, go offline (`204`). Token is not revoked. |
 | `POST` | `/announce` | Claim a name: `{"name":"alice"}` → `204`, or `409 NAME_IN_USE`. |
@@ -164,7 +164,7 @@ These endpoints require a governor token. See [§7](#7-electing-a-governor-optio
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `POST` | `/governors/claim` | Claim governorship (auto-grant, election, or transfer). Bearer = your listen token. Optional body `{"expiry_secs":N}`. |
+| `POST` | `/governors/claim` | Claim governorship (auto-grant, election, or transfer). Bearer = your participant token. Optional body `{"expiry_secs":N}`. |
 | `POST` | `/governors/elections/{id}` | Vote on a pending election or transfer: `{"action":"approve"\|"reject"}`. |
 | `POST` | `/grants/approve` | Directly approve a pair: `{"identity_a":"…","identity_b":"…","direction":"symmetric","expiry_secs":N}`. Governor token. |
 | `POST` | `/grants/block`, `/grants/unblock` | Persistently block / unblock a sender→recipient pair. Governor token. |
@@ -174,8 +174,8 @@ These endpoints require a governor token. See [§7](#7-electing-a-governor-optio
 | `GET` | `/governors/events` | SSE stream of governor-relevant events (grant requests, mediation holds). Governor token. |
 | `POST` | `/governors/refresh` | Self-rotate the governor token. Governor token. |
 | `POST` | `/governors/transfer` | Initiate governor authority transfer → `{"transfer_token":"…"}`. Governor token. |
-| `POST` | `/governors/accept-transfer` | Accept a transfer: `Authorization: Bearer <transfer_token>` + `{"name":"…"}` → `{"token":"…"}`. |
-| `DELETE` | `/participants/{name}` | Force-revoke a participant's token. Governor token. |
+| `POST` | `/governors/accept-transfer` | Accept a transfer: `Authorization: Bearer <participant-token>` + `{"transfer_token":"…"}` → `{"token":"…"}`. Claimer identity derived from the bearer. |
+| `DELETE` | `/participants/{name}` | Revoke a participant's token (identity record persists). Governor token. |
 
 ### Rooms endpoints
 
@@ -204,7 +204,8 @@ A minimal smoke test on `localhost:9191` showing the governorless default: both 
 # 1. Start the hub.
 ./target/release/simple-im --insecure-http --port 9191 &
 
-# 2. Each participant registers to get a token.
+# 2. Each participant gets a token. With no governor yet, /register is open (bootstrap window);
+#    once a governor exists, /register requires the governor bearer.
 ALICE=$(curl -s -X POST localhost:9191/register | jq -r .token)
 BOB=$(curl -s -X POST localhost:9191/register | jq -r .token)
 
@@ -274,7 +275,7 @@ Check your active grants any time with `GET /grants`.
 
 ## 7. Electing a governor (optional)
 
-A governor does not exist by default. Any participant may claim governorship via `POST /governors/claim` (bearer = your listen token, optional body `{"expiry_secs":N}`). The outcome depends on current hub state:
+A governor does not exist by default. Any participant may claim governorship via `POST /governors/claim` (bearer = your participant token, optional body `{"expiry_secs":N}`). The outcome depends on current hub state:
 
 | Hub state | Outcome | Response |
 | --- | --- | --- |
@@ -286,7 +287,7 @@ A governor does not exist by default. Any participant may claim governorship via
 
 ```http
 POST /governors/elections/{claim_id}   {"action": "approve" | "reject"}
-Authorization: Bearer <your-listen-token>
+Authorization: Bearer <your-participant-token>
 ```
 
 On unanimous approval the candidate receives their governor token as a `{"type":"governance","event":"governorship_granted","governor_token":"…"}` event on their own SSE feed.
@@ -371,7 +372,7 @@ What persists vs. what is ephemeral:
 
 | Persisted in SQLite (`sim-tokens.db`) | In-memory only (lost on restart) |
 | --- | --- |
-| Governor / participant / listen tokens | Live message queues (undelivered messages) |
+| Governor / participant tokens + permanent identities | Live message queues (undelivered messages) |
 | Connection grants + usage counters | Reply windows, mediation holds, connection requests |
 | DCP identities, denial blocks | DCP probes / subscriptions, SSE connections |
 | Attachment blobs (until TTL) | Presence (rebuilt as participants reconnect) |

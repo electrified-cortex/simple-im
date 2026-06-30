@@ -158,12 +158,17 @@ async fn main() {
                 eprintln!("WARNING: could not load denial blocks from store: {e}");
                 vec![]
             });
+            let identities = store.load_identities().await.unwrap_or_else(|e| {
+                eprintln!("WARNING: could not load identities from store: {e}");
+                vec![]
+            });
             eprintln!(
-                "Token store: {} (loaded {} tokens, {} grants, {} denial blocks)",
+                "Token store: {} (loaded {} tokens, {} grants, {} denial blocks, {} identities)",
                 db_path,
                 tokens.len(),
                 grants.len(),
-                denial_blocks.len()
+                denial_blocks.len(),
+                identities.len()
             );
             let hub = simple_im::delivery::DeliveryHub::new_with_persisted_state(
                 liveness,
@@ -171,6 +176,7 @@ async fn main() {
                 tokens,
                 grants,
                 denial_blocks,
+                identities,
             );
             let state = Arc::new(AppState::new_with_hub(hub));
             run(config.insecure_http, addr, state).await;

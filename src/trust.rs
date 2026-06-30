@@ -725,20 +725,27 @@ impl<F: Fn() -> Instant> TrustChain<F> {
         Ok(transfer_token)
     }
 
-    /// Accept a pending governor transfer. The presenter provides the transfer token and their
-    /// identity. On success: a new governor token is minted, the initiating governor is revoked,
-    /// and the pending transfer is consumed. Returns the new governor token.
+    /// Clear all pending governor transfers (used by the operator-anchored admin reset, so an
+    /// in-flight transfer token cannot bypass the revoke). (15-0029 / completeness-M2)
+    pub fn clear_pending_transfers(&mut self) {
+        self.pending_transfers.clear();
+    }
+
+    /// Accept a pending governor transfer. The caller passes the transfer token and the identity
+    /// it resolved from the **verified participant bearer** (never from the request body). On
+    /// success: a new governor token is minted, the initiating governor is revoked, and the
+    /// pending transfer is consumed. Returns the new governor token. (FG-5 / security-MAJOR-3)
     pub fn accept_governor_transfer(
         &mut self,
         transfer_token: &str,
-        claiming_identity: &str,
+        verified_bearer_identity: &str,
     ) -> Result<GovernorToken, Error> {
         let pending = self
             .pending_transfers
             .get(transfer_token)
             .ok_or(Error::AuthFailed)?;
         if let Some(ref expected) = pending.to_identity.clone()
-            && expected != claiming_identity
+            && expected != verified_bearer_identity
         {
             return Err(Error::Forbidden);
         }

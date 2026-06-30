@@ -7,8 +7,9 @@ info:
     optional governor trust layer, and real-time push over SSE.
 
     **Authentication**: Most endpoints require `Authorization: Bearer <token>`.
-    Token types: `listen-token` (participant), `governor-token` (governor),
-    `transfer_token` (governor transfer), `dcp_auth_token` (DCP identity).
+    Token types: `participant` (issued by the governor via POST /register) and
+    `governor` (from POST /governors/claim or /admin/governor/reset). A one-time
+    governor `transfer_token` is carried in the POST /governors/accept-transfer body.
 
     **Errors**: All errors return `{"error":"CODE","message":"..."}` with an
     appropriate HTTP status code. Gate on status code, not body content.
@@ -116,13 +117,32 @@ paths:
   /register:
     post:
       tags: [participant]
-      summary: Register a new participant
-      description: Mint a new participant token for future /listen use
+      summary: Issue or rebind a participant token (governor-gated)
+      description: |
+        Governor-gated participant token issuance (FG-2). Requires a governor bearer once a
+        governor is active. With an optional `{name}` body it performs an ATOMIC governor rebind:
+        the identity's current token is invalidated (its stream receives service/superseded with
+        reason governor_rebind) and a fresh token is bound to the same name.
+
+        During initial bootstrap (no governor yet) this endpoint is open (no auth); the operator
+        may close that window with SIMPLE_IM_BOOTSTRAP_TIMEOUT_SECS (then 503).
       operationId: register
-      security: []
+      security:
+        - bearerAuth: []
+        - {}
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                  description: Existing identity to atomically rebind to a new token
       responses:
         "200":
-          description: Token minted
+          description: Token issued (and bound, if a name was given)
           content:
             application/json:
               schema:
@@ -132,6 +152,17 @@ paths:
                   token:
                     type: string
                     description: Participant token for subsequent calls
+                  name:
+                    type: string
+                    description: Present when the token was bound to an identity (rebind)
+        "401":
+          $ref: "#/components/responses/AuthFailed"
+        "403":
+          description: Bearer is a participant token, not a governor
+        "404":
+          description: name given but not a registered identity
+        "503":
+          description: Bootstrap window closed by timeout with no governor established
 
   /listen:
     post:
@@ -148,7 +179,10 @@ paths:
           in: query
           schema:
             type: boolean
-          description: Force reclaim if name is held by stale session
+          description: |
+            Supersede this token's OWN existing subscription (same-token only) when /listen
+            returns 409 ACTIVE_SUBSCRIPTION. This is subscription-level only — it never takes a
+            name from another credential (FG-1: name force-reclaim is removed).
       requestBody:
         content:
           application/json:
@@ -906,7 +940,10 @@ paths:
     post:
       tags: [governor]
       summary: Accept governor transfer
-      description: Accept a governor transfer using the transfer token
+      description: |
+        A participant claims governorship (FG-5). Authenticate with the recipient's OWN
+        participant bearer; the claiming identity is derived from that verified bearer, never from
+        the body. The one-time transfer token is carried in the body.
       operationId: acceptGovernorTransfer
       security:
         - bearerAuth: []
@@ -916,10 +953,11 @@ paths:
           application/json:
             schema:
               type: object
-              required: [name]
+              required: [transfer_token]
               properties:
-                name:
+                transfer_token:
                   type: string
+                  description: The one-time transfer token issued by POST /governors/transfer
       responses:
         "200":
           description: Transfer accepted
@@ -935,6 +973,10 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/AuthFailed"
+        "403":
+          description: Bearer is a governor, or the transfer's bound identity does not match
+        "404":
+          description: Transfer token not found or already consumed
 
   /governors/mediate:
     post:
@@ -1318,10 +1360,10 @@ components:
       scheme: bearer
       description: |
         Token types vary by endpoint:
-        - `listen-token`: participant operations
-        - `governor-token`: governor operations
-        - `transfer_token`: governor transfer acceptance
-        - `dcp_auth_token`: DCP connect-probe-ack
+        - `participant`: participant operations (issued by the governor via POST /register)
+        - `governor`: governor operations (POST /governors/claim or /admin/governor/reset)
+        - governor transfer acceptance uses a participant bearer; the one-time transfer token
+          travels in the request body, not the Authorization header
 
   responses:
     AuthFailed:
@@ -1406,9 +1448,8 @@ components:
       properties:
         name:
           type: string
-        force:
-          type: boolean
-          default: false
+      # FG-1: no force field. A name held by another credential — or an orphaned registered
+      # identity — is 409 NAME_IN_USE; only a governor rebind (POST /register {name}) reclaims it.
 
     DcpAnnounceBody:
       type: object

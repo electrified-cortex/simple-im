@@ -10,6 +10,9 @@ use tokio::net::TcpListener;
 
 struct TestServer {
     base_url: String,
+    /// Governor bearer used for governor-gated POST /register (15-0029 / FG-2). None in the
+    /// bootstrap (no-governor) case, where /register is open.
+    gov: Option<String>,
 }
 
 impl TestServer {
@@ -23,6 +26,7 @@ impl TestServer {
         });
         TestServer {
             base_url: format!("http://127.0.0.1:{}", addr.port()),
+            gov: None,
         }
     }
 
@@ -42,6 +46,7 @@ impl TestServer {
         (
             TestServer {
                 base_url: format!("http://127.0.0.1:{}", addr.port()),
+                gov: Some(gov_tok.clone()),
             },
             gov_tok,
         )
@@ -56,9 +61,15 @@ impl TestServer {
     }
 }
 
-/// POST /register — mint a fresh token (new-participant flow).
+/// POST /register — mint a fresh token (new-participant flow). Governor-aware: when the server
+/// has an active governor (15-0029 / FG-2), the governor bearer is supplied; otherwise the
+/// bootstrap window is used (no bearer).
 async fn register_participant_tok(server: &TestServer, client: &reqwest::Client) -> String {
-    let r = client.post(server.url("/register")).send().await.unwrap();
+    let mut req = client.post(server.url("/register"));
+    if let Some(ref gov) = server.gov {
+        req = req.header("Authorization", format!("Bearer {}", gov));
+    }
+    let r = req.send().await.unwrap();
     assert_eq!(r.status(), StatusCode::OK, "POST /register failed");
     let body: Value = r.json().await.unwrap();
     body["token"].as_str().unwrap().to_owned()
@@ -878,26 +889,12 @@ async fn ac_n4_race_free_dequeue_then_arrival_fires_notify() {
 async fn ac_a4_toctou_concurrent_announce_exactly_one_wins() {
     use tokio::task;
 
-    // Agent 0 holds the name, then disconnects (making name stale).
-    // Agents A and B then race to claim the stale name simultaneously.
-    // Exactly one must succeed; the other must get NAME_IN_USE.
+    // Agents A and B race to claim a FRESH name simultaneously.
+    // Exactly one must succeed; the other must get NAME_IN_USE. (15-0029: no force/steal path,
+    // so a stale-name race is no longer how this is exercised — racing for a free name is.)
 
     let server = Arc::new(TestServer::spawn().await);
     let client = Arc::new(server.client());
-
-    // Original holder claims "RaceName" then drops SSE → stale.
-    let (tok0, stream0) = listen_get_token(&server, &client, None).await;
-    client
-        .post(server.url("/announce"))
-        .header("Authorization", format!("Bearer {}", tok0))
-        .json(&json!({"name": "RaceName"}))
-        .send()
-        .await
-        .unwrap();
-    // Abort the SSE task — makes holder stale (connection count decrements).
-    stream0.abort();
-    // Give the server time to process the SSE close.
-    tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Two racers, both with active SSE (keeps them from being auto-evicted by each other).
     let (tok_a, stream_a) = listen_get_token(&server, &client, None).await;
@@ -2279,6 +2276,7 @@ async fn spawn_server_with_ttl(liveness_secs: u64) -> TestServer {
     });
     TestServer {
         base_url: format!("http://127.0.0.1:{}", addr.port()),
+        gov: None,
     }
 }
 
@@ -2298,6 +2296,7 @@ async fn spawn_server_with_governor_ttl(liveness_secs: u64) -> (TestServer, Stri
     (
         TestServer {
             base_url: format!("http://127.0.0.1:{}", addr.port()),
+            gov: Some(gov_tok.clone()),
         },
         gov_tok,
     )
@@ -2955,14 +2954,19 @@ async fn ac_lid5_long_poll_returns_200_when_message_arrives() {
     assert!(id >= 1, "returned ID must be ≥ 1, got {}", id);
 }
 
-// ── AC-GT1: POST /governors/accept-transfer reads token from Authorization header ─
+// ── AC-GT1: POST /governors/accept-transfer requires a verified participant bearer ─
+// (15-0029 / FG-5: the claimer's identity is derived from the participant bearer; the transfer
+// token travels in the body.)
 
 #[tokio::test]
-async fn ac_gt1_accept_transfer_reads_token_from_auth_header() {
+async fn ac_gt1_accept_transfer_requires_participant_bearer() {
     let (server, gov_token) = TestServer::spawn_with_governor().await;
     let client = server.client();
 
-    // Initiate a governor transfer — returns a one-time transfer_token.
+    // A named participant "Alice" who will claim governorship.
+    let (alice_tok, _s) = make_identity(&server, &client, "Alice").await;
+
+    // Initiate an unrestricted governor transfer — returns a one-time transfer_token.
     let transfer_resp = client
         .post(server.url("/governors/transfer"))
         .header("Authorization", format!("Bearer {}", gov_token))
@@ -2970,60 +2974,37 @@ async fn ac_gt1_accept_transfer_reads_token_from_auth_header() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        transfer_resp.status(),
-        StatusCode::OK,
-        "transfer initiation should succeed"
-    );
-    let transfer_body: Value = transfer_resp.json().await.unwrap();
-    let transfer_token = transfer_body["transfer_token"]
+    assert_eq!(transfer_resp.status(), StatusCode::OK);
+    let transfer_token = transfer_resp.json::<Value>().await.unwrap()["transfer_token"]
         .as_str()
         .expect("missing transfer_token")
         .to_string();
 
-    // Accept the transfer — transfer_token goes in Authorization header, name goes in body.
-    let accept_resp = client
+    // No bearer → 401.
+    let no_auth = client
         .post(server.url("/governors/accept-transfer"))
-        .header("Authorization", format!("Bearer {}", transfer_token))
-        .json(&json!({"name": "new-governor"}))
+        .json(&json!({"transfer_token": transfer_token}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(no_auth.status(), StatusCode::UNAUTHORIZED);
+
+    // Accept with the participant bearer + transfer_token in body → 200.
+    let accept = client
+        .post(server.url("/governors/accept-transfer"))
+        .header("Authorization", format!("Bearer {}", alice_tok))
+        .json(&json!({"transfer_token": transfer_token}))
         .send()
         .await
         .unwrap();
     assert_eq!(
-        accept_resp.status(),
+        accept.status(),
         StatusCode::OK,
         "accept-transfer should succeed"
     );
-    let accept_body: Value = accept_resp.json().await.unwrap();
     assert!(
-        accept_body["token"].is_string(),
+        accept.json::<Value>().await.unwrap()["token"].is_string(),
         "response must contain new governor token"
-    );
-
-    // Calling without Authorization header must return 401.
-    let no_auth_resp = client
-        .post(server.url("/governors/accept-transfer"))
-        .json(&json!({"name": "intruder"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        no_auth_resp.status(),
-        StatusCode::UNAUTHORIZED,
-        "missing Authorization header must return 401"
-    );
-
-    // Calling with transfer_token in body (old pattern) and no Authorization header must also return 401.
-    let old_pattern_resp = client
-        .post(server.url("/governors/accept-transfer"))
-        .json(&json!({"transfer_token": transfer_token, "name": "intruder"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        old_pattern_resp.status(),
-        StatusCode::UNAUTHORIZED,
-        "transfer_token in body (old pattern) must not be accepted"
     );
 }
 
@@ -3084,7 +3065,7 @@ async fn ac_pp1_announce_sends_online_to_grant_peer_sse() {
     let (_, mut rx_a) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
-    hub.announce(&tok_a, "PpA", false).unwrap();
+    hub.announce(&tok_a, "PpA").unwrap();
 
     // Agent B: open listen stream but do NOT announce yet.
     let tok_b = hub.register_participant();
@@ -3111,7 +3092,7 @@ async fn ac_pp1_announce_sends_online_to_grant_peer_sse() {
     drain_receiver(&mut rx_a);
 
     // B announces for the first time — should trigger online event to A.
-    hub.announce(&tok_b, "PpB", false).unwrap();
+    hub.announce(&tok_b, "PpB").unwrap();
 
     let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
     let ev = wait_for_event_containing(
@@ -3138,14 +3119,14 @@ async fn ac_pp2_cancel_listen_sends_offline_to_grant_peer_sse() {
     let (_, mut rx_a) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
-    hub.announce(&tok_a, "PpA2", false).unwrap();
+    hub.announce(&tok_a, "PpA2").unwrap();
 
     let tok_b = hub.register_participant();
 
     let (_, _rx_b) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
-    hub.announce(&tok_b, "PpB2", false).unwrap();
+    hub.announce(&tok_b, "PpB2").unwrap();
 
     hub.approve_grant_req(
         &gov,
@@ -3191,14 +3172,14 @@ async fn ac_pp3_sse_drop_sends_offline_to_grant_peer_sse() {
     let (_, mut rx_a) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
-    hub.announce(&tok_a, "PpA3", false).unwrap();
+    hub.announce(&tok_a, "PpA3").unwrap();
 
     let tok_b = hub.register_participant();
 
     let (_, _rx_b) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
-    hub.announce(&tok_b, "PpB3", false).unwrap();
+    hub.announce(&tok_b, "PpB3").unwrap();
 
     hub.approve_grant_req(
         &gov,
@@ -3246,14 +3227,14 @@ async fn ac_pp4_no_grant_no_presence_event_to_non_peer() {
     let (_, mut rx_a) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
-    hub.announce(&tok_a, "PpA4", false).unwrap();
+    hub.announce(&tok_a, "PpA4").unwrap();
 
     let tok_b = hub.register_participant();
 
     let (_, _rx_b) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
-    hub.announce(&tok_b, "PpB4", false).unwrap();
+    hub.announce(&tok_b, "PpB4").unwrap();
 
     hub.approve_grant_req(
         &gov,
@@ -3279,7 +3260,7 @@ async fn ac_pp4_no_grant_no_presence_event_to_non_peer() {
     drain_receiver(&mut rx_a);
 
     // C announces — should NOT produce a presence event to A.
-    hub.announce(&tok_c, "PpC4", false).unwrap();
+    hub.announce(&tok_c, "PpC4").unwrap();
 
     // Give a short window for any spurious events.
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -3317,7 +3298,7 @@ async fn ac_pp5_minted_agent_deregister_sends_offline_to_listen_peer() {
     let (_, mut rx_a) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
-    hub.announce(&tok_a, "PpA5", false).unwrap();
+    hub.announce(&tok_a, "PpA5").unwrap();
 
     // Bob: minted participant with a stable identity distinct from his token.
     let bob_tok: ParticipantToken = hub.mint_participant_token(&gov, "bob-id-5", None).unwrap();
@@ -3349,13 +3330,11 @@ async fn ac_pp5_minted_agent_deregister_sends_offline_to_listen_peer() {
     );
 }
 
-// AC6 (15-0002G): force-eviction in announce() → grant-peer receives sim_offline.
-//
-// Agent B holds a name with an active SSE. Agent C announces the same name with force=true,
-// evicting B. Agent A is a grant-peer of B with an active SSE stream and must receive a
-// sim_offline presence event for B's name.
+// AC6 (15-0029 / FG-1): force-reclaim is removed. A LIVE name-holder B is never evicted by
+// another token C — C receives NAME_IN_USE, and grant-peer A receives NO sim_offline for B.
 #[tokio::test]
-async fn ac_pp6_force_eviction_sends_offline_to_grant_peer_sse() {
+async fn ac_pp6_live_holder_not_evicted_no_offline() {
+    use simple_im::delivery::AnnounceResult;
     use simple_im::trust::ApproveGrantRequest;
 
     let (hub, gov) = make_presence_hub();
@@ -3366,15 +3345,15 @@ async fn ac_pp6_force_eviction_sends_offline_to_grant_peer_sse() {
     let (_, mut rx_a) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
-    hub.announce(&tok_a, "PpA6", false).unwrap();
+    hub.announce(&tok_a, "PpA6").unwrap();
 
-    // Agent B: announces "PpB6" — will be force-evicted.
+    // Agent B: announces "PpB6" with a live SSE stream.
     let tok_b = hub.register_participant();
 
     let (_, _rx_b) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
-    hub.announce(&tok_b, "PpB6", false).unwrap();
+    hub.announce(&tok_b, "PpB6").unwrap();
 
     // Approve grant between A and B with explicit names.
     hub.approve_grant_req(
@@ -3393,15 +3372,21 @@ async fn ac_pp6_force_eviction_sends_offline_to_grant_peer_sse() {
     // Drain setup events from A's stream (welcome, online, grant breadcrumbs).
     drain_receiver(&mut rx_a);
 
-    // Agent C force-evicts B by announcing "PpB6" with force=true.
+    // Agent C attempts to claim B's live name — force is gone, so this is NAME_IN_USE.
     let tok_c = hub.register_participant();
 
     let (_, _rx_c) = hub
         .open_listen(Some(&tok_c), None, None, None, false, false)
         .unwrap();
-    hub.announce(&tok_c, "PpB6", true).unwrap();
+    assert!(
+        matches!(
+            hub.announce(&tok_c, "PpB6"),
+            Ok(AnnounceResult::NameInUse { .. })
+        ),
+        "live holder B must not be evicted; C must receive NAME_IN_USE"
+    );
 
-    // A must receive sim_offline for "PpB6".
+    // A must NOT receive a sim_offline for "PpB6" — B was never evicted.
     let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
     let ev = wait_for_event_containing(
         &mut rx_a,
@@ -3410,18 +3395,16 @@ async fn ac_pp6_force_eviction_sends_offline_to_grant_peer_sse() {
     )
     .await;
     assert!(
-        ev.is_some(),
-        "A must receive sim_offline for PpB6 when C force-evicts B; got nothing"
+        ev.is_none(),
+        "A must NOT receive sim_offline for PpB6 — no eviction occurs without force"
     );
 }
 
-// AC6b (15-0002G): stale-holder reclaim in announce() → grant-peer receives sim_offline.
-//
-// Agent B holds a name but its SSE drops (close_listen, simulating connection loss) without
-// an explicit cancel_listen. The name binding remains. Agent C announces the same name
-// (no force needed — holder is stale). Agent A, a grant-peer of B, must receive sim_offline.
+// AC6b (15-0029 / BLOCKER-4): a stale (SSE-dropped) name-holder B is NOT evicted across tokens.
+// Agent C announcing B's stale name receives NAME_IN_USE; B's binding is preserved.
 #[tokio::test]
-async fn ac_pp6b_stale_holder_reclaim_sends_offline_to_grant_peer_sse() {
+async fn ac_pp6b_stale_holder_cross_token_not_evicted() {
+    use simple_im::delivery::AnnounceResult;
     use simple_im::trust::ApproveGrantRequest;
 
     let (hub, gov) = make_presence_hub();
@@ -3429,10 +3412,10 @@ async fn ac_pp6b_stale_holder_reclaim_sends_offline_to_grant_peer_sse() {
     // Agent A: the observer.
     let tok_a = hub.register_participant();
 
-    let (_, mut rx_a) = hub
+    let (_, mut _rx_a) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
-    hub.announce(&tok_a, "PpA6b", false).unwrap();
+    hub.announce(&tok_a, "PpA6b").unwrap();
 
     // Agent B: announces "PpB6b" then its SSE drops without cancel_listen.
     let tok_b = hub.register_participant();
@@ -3440,7 +3423,7 @@ async fn ac_pp6b_stale_holder_reclaim_sends_offline_to_grant_peer_sse() {
     let (_, _rx_b) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
-    hub.announce(&tok_b, "PpB6b", false).unwrap();
+    hub.announce(&tok_b, "PpB6b").unwrap();
 
     // Approve grant between A and B.
     hub.approve_grant_req(
@@ -3459,32 +3442,24 @@ async fn ac_pp6b_stale_holder_reclaim_sends_offline_to_grant_peer_sse() {
     // Simulate B's SSE dropping unexpectedly (no clean cancel — name binding remains).
     hub.close_listen(&tok_b);
 
-    // Drain A's events (includes the offline from close_listen — we're checking the
-    // announce-reclaim path fires an additional or equal offline, but since ac_pp3
-    // covers close_listen, we drain and re-establish a clean observation window).
-    drain_receiver(&mut rx_a);
-
-    // Agent C reclaims "PpB6b" without force (stale holder → no NAME_IN_USE returned).
+    // Agent C attempts to reclaim B's stale name — BLOCKER-4 blocks cross-token eviction.
     let tok_c = hub.register_participant();
 
     let (_, _rx_c) = hub
         .open_listen(Some(&tok_c), None, None, None, false, false)
         .unwrap();
-    // B's name binding persists after close_listen; a non-force announce by C should
-    // evict the stale binding and fire sim_offline to A.
-    hub.announce(&tok_c, "PpB6b", false).unwrap();
-
-    // A must receive sim_offline for "PpB6b" from the stale-holder eviction.
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
-    let ev = wait_for_event_containing(
-        &mut rx_a,
-        &["\"presence\"", "\"offline\"", "\"PpB6b\""],
-        deadline,
-    )
-    .await;
     assert!(
-        ev.is_some(),
-        "A must receive sim_offline for PpB6b when C reclaims the stale binding; got nothing"
+        matches!(
+            hub.announce(&tok_c, "PpB6b"),
+            Ok(AnnounceResult::NameInUse { .. })
+        ),
+        "stale holder B must not be evicted across tokens; C must receive NAME_IN_USE"
+    );
+    // B's name binding must be preserved (still resolvable to PpB6b).
+    assert_eq!(
+        hub.validate_token(&tok_b).unwrap().as_deref(),
+        Some("PpB6b"),
+        "B's stale binding must survive C's blocked reclaim"
     );
 }
 
@@ -3500,14 +3475,14 @@ async fn ac_pp_default_listener_no_events() {
     let (_, mut rx_a) = hub
         .open_listen(Some(&tok_a), None, None, None, false, false)
         .unwrap();
-    hub.announce(&tok_a, "PpOptA", false).unwrap();
+    hub.announce(&tok_a, "PpOptA").unwrap();
 
     // B: open and announce.
     let tok_b = hub.register_participant();
     let (_, _rx_b) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
-    hub.announce(&tok_b, "PpOptB", false).unwrap();
+    hub.announce(&tok_b, "PpOptB").unwrap();
 
     // Establish grant between A and B.
     hub.approve_grant_req(
@@ -3530,7 +3505,7 @@ async fn ac_pp_default_listener_no_events() {
     let (_, _rx_b2) = hub
         .open_listen(Some(&tok_b2), None, None, None, false, false)
         .unwrap();
-    hub.announce(&tok_b2, "PpOptB", false).unwrap();
+    hub.announce(&tok_b2, "PpOptB").unwrap();
 
     // Wait past the settle window for the offline event too.
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -3557,13 +3532,13 @@ async fn ac_pp_timer_cancellation() {
     let (_, mut rx_a) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
-    hub.announce(&tok_a, "PpTcA", false).unwrap();
+    hub.announce(&tok_a, "PpTcA").unwrap();
 
     let tok_b = hub.register_participant();
     let (_, _rx_b) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
-    hub.announce(&tok_b, "PpTcB", false).unwrap();
+    hub.announce(&tok_b, "PpTcB").unwrap();
 
     hub.approve_grant_req(
         &gov,
@@ -3579,31 +3554,20 @@ async fn ac_pp_timer_cancellation() {
     .unwrap();
     drain_receiver(&mut rx_a);
 
-    // B drops (settle timer starts, time is paused so timer doesn't fire).
-    hub.cancel_listen(&tok_b).unwrap();
+    // B's SSE drops (settle timer starts, time is paused so timer doesn't fire).
+    // 15-0029: a routine reconnect keeps the SAME persistent token (FR4 flap-free); a fresh
+    // self-issued token can no longer reclaim a registered name.
+    hub.close_listen(&tok_b);
 
     // Advance 20 ms — still inside the 50 ms window.
     tokio::time::advance(Duration::from_millis(20)).await;
 
-    // B reconnects before the window expires — this must cancel the settle timer.
-    let tok_b2 = hub.register_participant();
+    // B reconnects with the SAME token and re-announces — this cancels the settle timer.
+    // Re-announce is idempotent (flap-free, FR4): no spurious online event is emitted.
     let (_, _rx_b2) = hub
-        .open_listen(Some(&tok_b2), None, None, None, false, false)
+        .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
-    hub.announce(&tok_b2, "PpTcB", false).unwrap();
-
-    // Online event delivered (B is back).
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
-    let online_ev = wait_for_event_containing(
-        &mut rx_a,
-        &["\"presence\"", "\"online\"", "\"PpTcB\""],
-        deadline,
-    )
-    .await;
-    assert!(
-        online_ev.is_some(),
-        "A must receive online event when B reconnects; got nothing"
-    );
+    hub.announce(&tok_b, "PpTcB").unwrap();
     drain_receiver(&mut rx_a);
 
     // Advance well past the settle window — offline must NOT fire (timer was cancelled).
@@ -3632,13 +3596,13 @@ async fn ac_pp_flap_collapse() {
     let (_, mut rx_a) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
-    hub.announce(&tok_a, "PpFlA", false).unwrap();
+    hub.announce(&tok_a, "PpFlA").unwrap();
 
     let tok_b = hub.register_participant();
     let (_, _rx_b) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
-    hub.announce(&tok_b, "PpFlB", false).unwrap();
+    hub.announce(&tok_b, "PpFlB").unwrap();
 
     hub.approve_grant_req(
         &gov,
@@ -3654,27 +3618,22 @@ async fn ac_pp_flap_collapse() {
     .unwrap();
     drain_receiver(&mut rx_a);
 
-    // Flap B online→offline×3 synchronously (all within the 50 ms settle window).
-    // Each reconnect cancels the pending settle timer so no offline is emitted mid-flap.
-    let mut cur_tok_b = tok_b.clone();
+    // Flap B drop→reconnect×3 synchronously (all within the 50 ms settle window), using the
+    // SAME persistent token each time (15-0029 FR4: routine reconnect keeps the token; a fresh
+    // self-issued token can no longer reclaim a registered name). Each re-announce cancels the
+    // pending settle timer so no offline is emitted mid-flap, and emits no spurious online.
     for _ in 0u32..3 {
-        hub.cancel_listen(&cur_tok_b).unwrap();
-        // Reconnect immediately — well within the 50 ms window.
-        let tok_bx = hub.register_participant();
+        hub.close_listen(&tok_b);
+        // Reconnect immediately — well within the 50 ms window — with the same token.
         let (_, _rx_bx) = hub
-            .open_listen(Some(&tok_bx), None, None, None, false, false)
+            .open_listen(Some(&tok_b), None, None, None, false, false)
             .unwrap();
-        hub.announce(&tok_bx, "PpFlB", false).unwrap();
-        cur_tok_b = tok_bx;
-        // Drain the online event fired by the reconnect announce.
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
-        let _ =
-            wait_for_event_containing(&mut rx_a, &["\"presence\"", "\"online\""], deadline).await;
+        hub.announce(&tok_b, "PpFlB").unwrap();
     }
     drain_receiver(&mut rx_a);
 
     // Final drop — settle timer starts; this time no reconnect, so it fires.
-    hub.cancel_listen(&cur_tok_b).unwrap();
+    hub.close_listen(&tok_b);
 
     // Wait past the settle window for the offline event.
     let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
@@ -3717,13 +3676,13 @@ async fn ac_pp_pull_during_settle() {
     let (_, _rx_a) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
-    hub.announce(&tok_a, "PpPsA", false).unwrap();
+    hub.announce(&tok_a, "PpPsA").unwrap();
 
     let tok_b = hub.register_participant();
     let (_, _rx_b) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
-    hub.announce(&tok_b, "PpPsB", false).unwrap();
+    hub.announce(&tok_b, "PpPsB").unwrap();
 
     hub.approve_grant_req(
         &gov,
@@ -3764,13 +3723,13 @@ async fn ac_pp_opt_in_not_persisted() {
     let (_, _rx_a1) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
-    hub.announce(&tok_a, "PpNpA", false).unwrap();
+    hub.announce(&tok_a, "PpNpA").unwrap();
 
     let tok_b = hub.register_participant();
     let (_, _rx_b) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
-    hub.announce(&tok_b, "PpNpB", false).unwrap();
+    hub.announce(&tok_b, "PpNpB").unwrap();
 
     hub.approve_grant_req(
         &gov,
@@ -3801,7 +3760,7 @@ async fn ac_pp_opt_in_not_persisted() {
     let (_, _rx_b2) = hub
         .open_listen(Some(&tok_b2), None, None, None, false, false)
         .unwrap();
-    hub.announce(&tok_b2, "PpNpB", false).unwrap();
+    hub.announce(&tok_b2, "PpNpB").unwrap();
 
     // Wait past the settle window.
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -3830,15 +3789,16 @@ async fn ac_ppv1_permissive_grant_sees_presence() {
     let (_, mut rx_a) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
-    hub.announce(&tok_a, "PpA7a", false).unwrap();
+    hub.announce(&tok_a, "PpA7a").unwrap();
 
     let tok_b = hub.register_participant();
     let (_, _rx_b) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
-    hub.announce(&tok_b, "PpB7a", false).unwrap();
 
-    // Establish permissive grant.
+    // Establish the permissive grant by stable name BEFORE B announces, so B's first announce
+    // fires the online push to its grant-peer A. (15-0029 FR4: reconnects are flap-free, so the
+    // observable online push is the first announce, not a self-issued-token re-announce.)
     hub.approve_grant_req(
         &gov,
         &tok_a,
@@ -3853,13 +3813,8 @@ async fn ac_ppv1_permissive_grant_sees_presence() {
     .unwrap();
     drain_receiver(&mut rx_a);
 
-    // B re-announces (triggers online push to grant-peers).
-    hub.cancel_listen(&tok_b).unwrap();
-    let tok_b2 = hub.register_participant();
-    let (_, _rx_b2) = hub
-        .open_listen(Some(&tok_b2), None, None, None, false, false)
-        .unwrap();
-    hub.announce(&tok_b2, "PpB7a", false).unwrap();
+    // B announces for the first time → online push to grant-peer A.
+    hub.announce(&tok_b, "PpB7a").unwrap();
 
     // Push: A should receive online event.
     let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
@@ -3876,7 +3831,7 @@ async fn ac_ppv1_permissive_grant_sees_presence() {
 
     // Pull: A should see B as online.
     assert!(
-        hub.presence_for_token(&tok_b2, "PpB7a").unwrap_or(false)
+        hub.presence_for_token(&tok_b, "PpB7a").unwrap_or(false)
             || hub.presence_for_token(&tok_a, "PpB7a").unwrap_or(false),
         "Presence pull must return true for grant-peer"
     );
@@ -3891,7 +3846,7 @@ async fn ac_ppv2_no_grant_no_room_zero_visibility() {
     let (_, mut rx_a) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
-    hub.announce(&tok_a, "PpA7b", false).unwrap();
+    hub.announce(&tok_a, "PpA7b").unwrap();
 
     let tok_b = hub.register_participant();
     let (_, _rx_b) = hub
@@ -3900,7 +3855,7 @@ async fn ac_ppv2_no_grant_no_room_zero_visibility() {
     // No grant, no shared room.
     drain_receiver(&mut rx_a);
 
-    hub.announce(&tok_b, "PpB7b", false).unwrap();
+    hub.announce(&tok_b, "PpB7b").unwrap();
 
     // Push: A must NOT receive any event (no grant, no room).
     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -3925,7 +3880,7 @@ async fn ac_ppv3_shared_room_no_grant_sees_presence() {
     let (_, mut rx_a) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
-    hub.announce(&tok_a, "PpA7c", false).unwrap();
+    hub.announce(&tok_a, "PpA7c").unwrap();
 
     // Both A and B join the same room BEFORE B announces (no grant between them).
     let rs = hub.room_store();
@@ -3939,7 +3894,7 @@ async fn ac_ppv3_shared_room_no_grant_sees_presence() {
     let tok_b = hub.register_participant();
     hub.open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
-    hub.announce(&tok_b, "PpB7c", false).unwrap();
+    hub.announce(&tok_b, "PpB7c").unwrap();
 
     // Push: A must receive online event for B.
     let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
@@ -3970,7 +3925,7 @@ async fn ac_ppv4_deny_grant_zero_visibility_even_in_room() {
     let (_, mut rx_a) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
-    hub.announce(&tok_a, "PpA7d", false).unwrap();
+    hub.announce(&tok_a, "PpA7d").unwrap();
 
     // Place a denial block: A (tok_a) is blocked from seeing B ("PpB7d").
     // Key: (from_identity=tok_a, to_name="PpB7d") — mirrors the messaging deny-grant model.
@@ -3989,7 +3944,7 @@ async fn ac_ppv4_deny_grant_zero_visibility_even_in_room() {
     let tok_b = hub.register_participant();
     hub.open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
-    hub.announce(&tok_b, "PpB7d", false).unwrap();
+    hub.announce(&tok_b, "PpB7d").unwrap();
 
     // Push: A must NOT receive any event (deny grant overrides room).
     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -4897,5 +4852,505 @@ async fn ac_room_grant_existing_no_room() {
         StatusCode::OK,
         "grant request must return 200 when requester already holds an active grant with target (no shared room required): got {}",
         rg.json::<Value>().await.unwrap_or_default()
+    );
+}
+
+// ── 15-0029 S3: POST /register governor gate ────────────────────────────────────
+
+/// Announce `name` on a fresh participant token, creating its identity record. Keeps the SSE
+/// open via the returned join handle.
+async fn make_identity(
+    server: &TestServer,
+    client: &reqwest::Client,
+    name: &str,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let (tok, handle) = listen_get_token(server, client, None).await;
+    let r = client
+        .post(server.url("/announce"))
+        .header("Authorization", format!("Bearer {}", tok))
+        .json(&json!({ "name": name }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::NO_CONTENT, "announce {name} failed");
+    (tok, handle)
+}
+
+/// EPIC-AC-1 / S3-AC-1: POST /register with no bearer when a governor is active → 401.
+#[tokio::test]
+async fn test_register_401_when_governor_active() {
+    let (server, _gov) = TestServer::spawn_with_governor().await;
+    let client = server.client();
+    let r = client.post(server.url("/register")).send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// EPIC-AC-2 / S3-AC-2: POST /register with a valid governor bearer → 200 with numeric token.
+#[tokio::test]
+async fn test_register_200_with_governor_bearer() {
+    let (server, gov) = TestServer::spawn_with_governor().await;
+    let client = server.client();
+    let r = client
+        .post(server.url("/register"))
+        .header("Authorization", format!("Bearer {}", gov))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let body: Value = r.json().await.unwrap();
+    let tok = body["token"].as_str().unwrap();
+    assert!(tok.chars().all(|c| c.is_ascii_digit()) && tok.len() >= 8);
+}
+
+/// EPIC-AC-3 / S3-AC-3: POST /register with a participant bearer → 403 (not 401).
+#[tokio::test]
+async fn test_register_403_with_participant_bearer() {
+    let (server, _gov) = TestServer::spawn_with_governor().await;
+    let client = server.client();
+    // Obtain a participant token (governor-gated register helper supplies the gov bearer).
+    let ptok = register_participant_tok(&server, &client).await;
+    let r = client
+        .post(server.url("/register"))
+        .header("Authorization", format!("Bearer {}", ptok))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+}
+
+/// EPIC-AC-4 / S3-AC-4: POST /register with no bearer when no governor exists → 200 (bootstrap).
+#[tokio::test]
+async fn test_register_200_bootstrap_no_governor() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    let r = client.post(server.url("/register")).send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+}
+
+/// S3-AC-5 / EPIC-AC-7: governor rebind with {name} issues a new token, invalidates the old,
+/// and the new token can announce the name without a 409.
+#[tokio::test]
+async fn test_governor_rebind_issues_new_token_invalidates_old() {
+    let (server, gov) = TestServer::spawn_with_governor().await;
+    let client = server.client();
+    let (t1, _s1) = make_identity(&server, &client, "Alice").await;
+
+    let r = client
+        .post(server.url("/register"))
+        .header("Authorization", format!("Bearer {}", gov))
+        .json(&json!({"name": "Alice"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let body: Value = r.json().await.unwrap();
+    let t2 = body["token"].as_str().unwrap().to_string();
+    assert_eq!(body["name"], "Alice");
+    assert_ne!(t2, t1, "rebind must issue a new token");
+
+    // Old token T1 is now invalid.
+    let r1 = client
+        .post(server.url("/announce"))
+        .header("Authorization", format!("Bearer {}", t1))
+        .json(&json!({"name": "Alice"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::UNAUTHORIZED);
+
+    // New token T2 can announce "Alice" without a 409.
+    let r2 = client
+        .post(server.url("/announce"))
+        .header("Authorization", format!("Bearer {}", t2))
+        .json(&json!({"name": "Alice"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::NO_CONTENT);
+}
+
+/// S3-AC-9: governor rebind of an unknown name → 404.
+#[tokio::test]
+async fn test_s3_register_404_unknown_name() {
+    let (server, gov) = TestServer::spawn_with_governor().await;
+    let client = server.client();
+    let r = client
+        .post(server.url("/register"))
+        .header("Authorization", format!("Bearer {}", gov))
+        .json(&json!({"name": "Nobody"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::NOT_FOUND);
+}
+
+/// S3-AC-10: with a bootstrap deadline elapsed and no governor, /register → 503; if the deadline
+/// is still in the future, /register → 200. (Deterministic past/future deadlines, no real wait.)
+#[tokio::test]
+async fn test_s3_bootstrap_timeout_closes_window() {
+    use std::time::Instant;
+
+    async fn spawn_with_deadline(deadline: Option<Instant>) -> TestServer {
+        let mut state = AppState::new(Duration::from_secs(30));
+        state.bootstrap_deadline = deadline;
+        let state = Arc::new(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = simple_im::http::router(Arc::clone(&state));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        TestServer {
+            base_url: format!("http://127.0.0.1:{}", addr.port()),
+            gov: None,
+        }
+    }
+
+    // Closed window (deadline in the past) → 503.
+    let closed = spawn_with_deadline(Some(Instant::now() - Duration::from_secs(1))).await;
+    let r = closed
+        .client()
+        .post(closed.url("/register"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    // Open window (deadline in the future) → 200.
+    let open = spawn_with_deadline(Some(Instant::now() + Duration::from_secs(60))).await;
+    let r2 = open
+        .client()
+        .post(open.url("/register"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::OK);
+}
+
+/// S3-AC-11: discovery marks POST /register as governor auth and the announce entry has no force.
+#[tokio::test]
+async fn test_s3_discovery_governor_auth_hint() {
+    let server = TestServer::spawn().await;
+    let r = server.client().get(server.url("/")).send().await.unwrap();
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(
+        body["routes"]["participant"]["POST /register"]["auth"],
+        "governor"
+    );
+    let announce_body = body["routes"]["participant"]["POST /announce"]["body"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        !announce_body.contains("force"),
+        "announce discovery body must not mention force: {announce_body}"
+    );
+}
+
+// ── 15-0029 S5: governor transfer security + operator-anchored admin reset ───────
+
+/// Spawn a server with a governor AND an admin secret (injected, not via env to avoid races).
+async fn spawn_with_governor_and_admin(secret: Option<&str>) -> (TestServer, String) {
+    use simple_im::delivery::DeliveryHub;
+    let hub = DeliveryHub::new(Duration::from_secs(30));
+    let gov = hub.install_governor(None);
+    let gov_tok = gov.0.clone();
+    let mut state = AppState::new_with_hub(hub);
+    state.admin_secret = secret.map(|s| s.to_string());
+    let state = Arc::new(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = simple_im::http::router(Arc::clone(&state));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (
+        TestServer {
+            base_url: format!("http://127.0.0.1:{}", addr.port()),
+            gov: Some(gov_tok.clone()),
+        },
+        gov_tok,
+    )
+}
+
+async fn make_transfer_token(
+    server: &TestServer,
+    client: &reqwest::Client,
+    gov: &str,
+    to: Option<&str>,
+) -> String {
+    let body = match to {
+        Some(n) => json!({"to": n}),
+        None => json!({}),
+    };
+    let r = client
+        .post(server.url("/governors/transfer"))
+        .header("Authorization", format!("Bearer {}", gov))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    r.json::<Value>().await.unwrap()["transfer_token"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// EPIC-AC-28 / S5-AC-8: accept-transfer requires a participant bearer.
+#[tokio::test]
+async fn test_governor_transfer_requires_participant_bearer() {
+    let (server, gov) = TestServer::spawn_with_governor().await;
+    let client = server.client();
+    let (alice, _s) = make_identity(&server, &client, "Alice").await;
+    let transfer = make_transfer_token(&server, &client, &gov, None).await;
+
+    // No bearer → 401.
+    let r = client
+        .post(server.url("/governors/accept-transfer"))
+        .json(&json!({"transfer_token": transfer}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+
+    // Governor bearer → 403.
+    let r = client
+        .post(server.url("/governors/accept-transfer"))
+        .header("Authorization", format!("Bearer {}", gov))
+        .json(&json!({"transfer_token": transfer}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+
+    // Participant bearer + valid transfer → 200.
+    let r = client
+        .post(server.url("/governors/accept-transfer"))
+        .header("Authorization", format!("Bearer {}", alice))
+        .json(&json!({"transfer_token": transfer}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+}
+
+/// EPIC-AC-29 / S5-AC-9: transfer to_identity is verified against the bearer's name.
+#[tokio::test]
+async fn test_governor_transfer_identity_verified_against_bearer() {
+    let (server, gov) = TestServer::spawn_with_governor().await;
+    let client = server.client();
+    let (alice, _sa) = make_identity(&server, &client, "Alice").await;
+    let (bob, _sb) = make_identity(&server, &client, "Bob").await;
+
+    // Transfer bound to "Alice".
+    let transfer = make_transfer_token(&server, &client, &gov, Some("Alice")).await;
+
+    // Bob (wrong identity) presents the transfer → 403.
+    let r = client
+        .post(server.url("/governors/accept-transfer"))
+        .header("Authorization", format!("Bearer {}", bob))
+        .json(&json!({"transfer_token": transfer}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+
+    // Alice (correct identity) presents the transfer → 200.
+    let r = client
+        .post(server.url("/governors/accept-transfer"))
+        .header("Authorization", format!("Bearer {}", alice))
+        .json(&json!({"transfer_token": transfer}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+}
+
+/// EPIC-AC-13 / S5-AC-1: admin reset with the correct secret → 200 {governor_token}.
+#[tokio::test]
+async fn test_admin_reset_returns_governor_token() {
+    let (server, _gov) = spawn_with_governor_and_admin(Some("anchor-secret")).await;
+    let client = server.client();
+    let r = client
+        .post(server.url("/admin/governor/reset"))
+        .header("X-Admin-Secret", "anchor-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert!(r.json::<Value>().await.unwrap()["governor_token"].is_string());
+}
+
+/// EPIC-AC-14 / S5-AC-2: admin reset with a wrong/missing secret → 401.
+#[tokio::test]
+async fn test_admin_reset_401_wrong_secret() {
+    let (server, _gov) = spawn_with_governor_and_admin(Some("anchor-secret")).await;
+    let client = server.client();
+    let wrong = client
+        .post(server.url("/admin/governor/reset"))
+        .header("X-Admin-Secret", "nope")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+    let missing = client
+        .post(server.url("/admin/governor/reset"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// EPIC-AC-15 / S5-AC-3: after reset, the old governor token is rejected by governor endpoints.
+#[tokio::test]
+async fn test_admin_reset_invalidates_old_governor() {
+    let (server, old_gov) = spawn_with_governor_and_admin(Some("anchor-secret")).await;
+    let client = server.client();
+    let r = client
+        .post(server.url("/admin/governor/reset"))
+        .header("X-Admin-Secret", "anchor-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    // Old governor token on a governor-only endpoint → 401.
+    let participants = client
+        .get(server.url("/participants"))
+        .header("Authorization", format!("Bearer {}", old_gov))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(participants.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// EPIC-AC-26 / S5-AC-4: admin reset with the secret unset/empty → 501.
+#[tokio::test]
+async fn test_admin_reset_501_empty_secret() {
+    let (server, _gov) = spawn_with_governor_and_admin(None).await;
+    let client = server.client();
+    let r = client
+        .post(server.url("/admin/governor/reset"))
+        .header("X-Admin-Secret", "whatever")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::NOT_IMPLEMENTED);
+}
+
+/// EPIC-AC-25 / S5-AC-5: the admin endpoint is absent from the discovery document.
+#[tokio::test]
+async fn test_admin_endpoint_not_in_discovery() {
+    let server = TestServer::spawn().await;
+    let r = server.client().get(server.url("/")).send().await.unwrap();
+    let text = r.text().await.unwrap();
+    assert!(
+        !text.contains("/admin/governor/reset"),
+        "discovery must not advertise the admin reset endpoint"
+    );
+}
+
+/// EPIC-AC-27 / S5-AC-7: admin reset clears pending transfers (the transfer token becomes 404).
+#[tokio::test]
+async fn test_admin_reset_clears_pending_transfers() {
+    let (server, gov) = spawn_with_governor_and_admin(Some("anchor-secret")).await;
+    let client = server.client();
+    let (alice, _s) = make_identity(&server, &client, "Alice").await;
+    let transfer = make_transfer_token(&server, &client, &gov, None).await;
+
+    // Admin reset clears all pending transfers.
+    let reset = client
+        .post(server.url("/admin/governor/reset"))
+        .header("X-Admin-Secret", "anchor-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reset.status(), StatusCode::OK);
+
+    // The previously-issued transfer token is no longer usable → 404.
+    let accept = client
+        .post(server.url("/governors/accept-transfer"))
+        .header("Authorization", format!("Bearer {}", alice))
+        .json(&json!({"transfer_token": transfer}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accept.status(), StatusCode::NOT_FOUND);
+}
+
+// ── 15-0029 S6: listen.sh reconciliation (static verification) ──────────────────
+
+fn listen_sh() -> String {
+    std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/skills/participant/listen.sh"
+    ))
+    .expect("read listen.sh")
+}
+
+/// EPIC-AC-18 / S6-AC-1: listen.sh makes no /register call.
+#[test]
+fn test_listen_sh_no_register_call() {
+    assert_eq!(
+        listen_sh().matches("/register").count(),
+        0,
+        "listen.sh must not call /register"
+    );
+}
+
+/// EPIC-AC-19 / S6-AC-2: no "force" JSON key in the announce body.
+#[test]
+fn test_listen_sh_no_force_in_announce_body() {
+    assert_eq!(
+        listen_sh().matches("\"force\"").count(),
+        0,
+        "listen.sh must not put a force field in any JSON body"
+    );
+}
+
+/// S6-AC-12: jq is used for field extraction (no grep/sed on subscription_id/token). (BT-NFR4)
+#[test]
+fn test_s6_jq_used_for_field_extraction() {
+    let s = listen_sh();
+    assert!(s.contains("jq "), "listen.sh must use jq");
+    for line in s.lines() {
+        let bad = (line.contains("grep") && line.contains("subscription_id"))
+            || (line.contains("sed") && line.contains("token"));
+        assert!(
+            !bad,
+            "no grep/sed extraction of subscription_id/token: {line}"
+        );
+    }
+}
+
+/// S6-AC-3/4/5: terminal exit codes + messages present (NAME_IN_USE=2, CREDENTIAL_LOST=3).
+#[test]
+fn test_s6_exit_codes_and_messages_present() {
+    let s = listen_sh();
+    assert!(s.contains("[SIM] NAME_IN_USE: governor rebind required"));
+    assert!(s.contains("[SIM] CREDENTIAL_LOST: governor must issue a new token"));
+    assert!(s.contains("[SIM] CREDENTIAL_LOST: session revoked"));
+    assert!(s.contains("exit 2"), "NAME_IN_USE must exit 2");
+    assert!(s.contains("exit 3"), "CREDENTIAL_LOST must exit 3");
+}
+
+/// S6-AC-10: ACTIVE_SUBSCRIPTION force on /listen is retained (same-token reclaim).
+#[test]
+fn test_s6_active_subscription_force_retained() {
+    let s = listen_sh();
+    assert!(s.contains("ACTIVE_SUBSCRIPTION"));
+    assert!(
+        s.contains("force=true"),
+        "listen subscription-level force must be retained"
+    );
+}
+
+/// S6-AC-6/7: subscription_id is captured from the welcome and persisted to the token file.
+#[test]
+fn test_s6_subscription_id_captured() {
+    let s = listen_sh();
+    assert!(s.contains(".subscription_id"));
+    assert!(
+        s.contains("> \"$TOKEN_FILE\"") || s.contains(">\"$TOKEN_FILE\""),
+        "subscription_id must be persisted to the token file"
     );
 }

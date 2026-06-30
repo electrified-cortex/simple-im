@@ -46,6 +46,31 @@ pub struct AppState {
     pub rooms: Arc<RoomStore>,
     pub attachment_ttl: Duration,
     pub attachment_max_bytes: usize,
+    /// Bootstrap window close time (15-0029 / security-MINOR-2). When set and elapsed with no
+    /// governor established, unauthenticated POST /register returns 503. None = window never
+    /// closes by timeout. Sourced from `SIMPLE_IM_BOOTSTRAP_TIMEOUT_SECS`.
+    pub bootstrap_deadline: Option<Instant>,
+    /// Operator anchor secret for POST /admin/governor/reset (15-0029). `None` when
+    /// `SIMPLE_IM_ADMIN_SECRET` is unset or empty — the endpoint then returns 501. A non-empty
+    /// secret is required for operator-anchor recovery (security-MINOR-1).
+    pub admin_secret: Option<String>,
+}
+
+/// Compute the bootstrap-window deadline from `SIMPLE_IM_BOOTSTRAP_TIMEOUT_SECS` (seconds).
+/// Returns None when unset, unparsable, or zero (window never times out).
+fn bootstrap_deadline_from_env() -> Option<Instant> {
+    std::env::var("SIMPLE_IM_BOOTSTRAP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .map(|n| Instant::now() + Duration::from_secs(n))
+}
+
+/// Read `SIMPLE_IM_ADMIN_SECRET`. An empty string is treated identically to unset (None).
+fn admin_secret_from_env() -> Option<String> {
+    std::env::var("SIMPLE_IM_ADMIN_SECRET")
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 impl AppState {
@@ -60,6 +85,8 @@ impl AppState {
             rooms,
             attachment_ttl,
             attachment_max_bytes,
+            bootstrap_deadline: bootstrap_deadline_from_env(),
+            admin_secret: admin_secret_from_env(),
         }
     }
 
@@ -72,6 +99,8 @@ impl AppState {
             rooms,
             attachment_ttl,
             attachment_max_bytes,
+            bootstrap_deadline: bootstrap_deadline_from_env(),
+            admin_secret: admin_secret_from_env(),
         }
     }
 }
@@ -159,6 +188,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/governors/mediate", post(handle_mediate))
         .route("/governors/events", get(handle_gov_events))
         .route("/governors/grants", get(handle_governor_list_grants))
+        // Operator-only escape hatch — intentionally absent from the discovery document.
+        .route("/admin/governor/reset", post(handle_admin_governor_reset))
         .route("/grants", get(handle_list_grants))
         .route("/grants/approve", post(handle_approve_grant))
         .route("/grants/request", post(handle_grant_request))
@@ -479,35 +510,97 @@ async fn handle_transfer_governor(
     }
 }
 
-// POST /governors/accept-transfer  — recipient claims authority using the transfer token
-// The transfer credential is passed as `Authorization: Bearer <transfer_token>` (not in body)
-// to prevent credential exposure in request body logs.
+// POST /governors/accept-transfer  — a participant claims governorship (FG-5 / security-MAJOR-3).
+//
+//   Authorization: Bearer <participant-token>   (the claimer; its name is the verified identity)
+//   Body: {"transfer_token": "<transfer-token>"}
+//
+//   200 → {token}                       new governor token
+//   401 → no bearer or bearer fails participant validation
+//   403 → bearer is a governor token (must be a participant)
+//   403 → transfer's to_identity is set and does not match the bearer's name
+//   404 → transfer token not found or already consumed
+//
+// The claiming identity is derived server-side from the verified participant bearer; it is NOT
+// read from the request body. The body carries only the transfer token.
 async fn handle_accept_governor_transfer(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
-    let transfer_token = match bearer_token(&headers) {
+    let bearer = match bearer_token(&headers) {
         Some(t) => t,
         None => return auth_failed(),
     };
-    let claiming_identity = match body.get("name").and_then(|v| v.as_str()) {
-        Some(n) => n.to_string(),
+    // A governor token cannot accept a transfer — must be a participant.
+    if state
+        .hub
+        .validate_governor_token(&GovernorToken(bearer.clone()))
+        .is_ok()
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "FORBIDDEN", "message": "a participant token is required"})),
+        )
+            .into_response();
+    }
+    let transfer_token = match body.get("transfer_token").and_then(|v| v.as_str()) {
+        Some(t) => t.to_string(),
         None => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": "MISSING_FIELD", "message": "missing name"})),
+                Json(json!({"error": "MISSING_FIELD", "message": "missing transfer_token"})),
             )
                 .into_response();
         }
     };
-    match state
-        .hub
-        .accept_governor_transfer(&transfer_token, &claiming_identity)
-    {
+    match state.hub.accept_governor_transfer(&bearer, &transfer_token) {
         Ok(new_token) => (StatusCode::OK, Json(json!({"token": new_token.0}))).into_response(),
+        // transfer token not found / consumed → 404.
+        Err(Error::RecipientUnknown) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "NOT_FOUND", "message": "transfer token not found or consumed"})),
+        )
+            .into_response(),
+        // to_identity mismatch → 403.
+        Err(Error::Forbidden) => (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "FORBIDDEN", "message": "transfer is bound to a different identity"})),
+        )
+            .into_response(),
+        // bearer is not a valid named participant → 401.
         Err(e) => err_response(e),
     }
+}
+
+// POST /admin/governor/reset  — operator-anchored governor recovery (15-0029). Not advertised in
+// the discovery document. Requires the `X-Admin-Secret` header to equal `SIMPLE_IM_ADMIN_SECRET`.
+//
+//   200 → {governor_token}              new governor installed (old governors revoked, pending
+//                                       transfers cleared, committed in one transaction)
+//   401 → missing or wrong secret
+//   501 → SIMPLE_IM_ADMIN_SECRET unset or empty
+async fn handle_admin_governor_reset(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    let secret = match &state.admin_secret {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(json!({"error": "NOT_IMPLEMENTED", "message": "admin secret not configured"})),
+            )
+                .into_response();
+        }
+    };
+    let provided = headers.get("X-Admin-Secret").and_then(|v| v.to_str().ok());
+    // Constant-ish comparison is unnecessary here (loopback operator hatch); equality check.
+    if provided != Some(secret.as_str()) {
+        return auth_failed();
+    }
+    let new_token = state.hub.admin_reset_governor();
+    (StatusCode::OK, Json(json!({"governor_token": new_token.0}))).into_response()
 }
 
 // DELETE /participants/{name}  — governor force-revokes any participant by name
@@ -1097,11 +1190,6 @@ async fn handle_gov_events(State(state): State<Arc<AppState>>, headers: HeaderMa
 #[derive(Deserialize)]
 struct AnnounceBody {
     name: String,
-    /// If true and the name is held by a live session, evict the holder and
-    /// claim the name. Use when recovering from a stale/orphaned session that
-    /// still holds your name. Any valid listen token may force-reclaim.
-    #[serde(default)]
-    force: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -1136,10 +1224,10 @@ async fn handle_discovery() -> Response {
                     "GET /openapi.yaml": {"auth": "none", "body": null, "hint": "OpenAPI 3.x specification (YAML)"}
                 },
                 "participant": {
-                    "POST /register": {"auth": "none", "body": null, "hint": "Mint a new participant token"},
+                    "POST /register": {"auth": "governor", "body": "{name?}", "hint": "Governor issues a participant token; with {name} atomically rebinds an existing identity. Open during bootstrap (no governor)."},
                     "POST /listen": {"auth": "participant", "body": "{name?}", "hint": "Open SSE stream; optional name to auto-announce"},
                     "DELETE /listen": {"auth": "participant", "body": null, "hint": "Close SSE stream, unbind name"},
-                    "POST /announce": {"auth": "participant", "body": "{name, force?}", "hint": "Claim a name for this token"},
+                    "POST /announce": {"auth": "participant", "body": "{name}", "hint": "Claim a name for this token"},
                     "GET /participants": {"auth": "governor", "body": null, "hint": "List all announced participants"},
                     "DELETE /participants/{name}": {"auth": "governor", "body": null, "hint": "Force-revoke participant by name"},
                     "GET /participants/{name}/presence": {"auth": "participant", "body": null, "hint": "Check if participant is online"},
@@ -1168,7 +1256,7 @@ async fn handle_discovery() -> Response {
                     "POST /governors/elections/{id}": {"auth": "participant", "body": "{action}", "hint": "Vote on a pending election/transfer"},
                     "POST /governors/refresh": {"auth": "governor", "body": null, "hint": "Rotate governor token"},
                     "POST /governors/transfer": {"auth": "governor", "body": "{to?}", "hint": "Initiate governor transfer"},
-                    "POST /governors/accept-transfer": {"auth": "transfer_token", "body": "{name}", "hint": "Accept governor transfer"},
+                    "POST /governors/accept-transfer": {"auth": "participant", "body": "{transfer_token}", "hint": "Accept governor transfer (claimer identity derived from the participant bearer)"},
                     "POST /governors/mediate": {"auth": "governor", "body": "{mediation_id, decision, payload?}", "hint": "Resolve a mediation hold"},
                     "GET /governors/events": {"auth": "governor", "body": null, "hint": "SSE stream of governor events"},
                     "GET /governors/grants": {"auth": "governor", "body": null, "hint": "List all grants in the system (supports ?participant=)"}
@@ -1294,12 +1382,82 @@ fn sanitize_filename(name: &str) -> String {
 }
 
 // ── POST /register ─────────────────────────────────────────────────────────────
-// Mint a new participant token for future /listen use.
-// No authentication required (anyone can register, same as anonymous /listen before).
+// Governor-gated participant token issuance (15-0029 / FG-2).
+//
+//   Authorization: Bearer <governor-token>        (required once a governor is active)
+//   Body (optional): {"name": "<existing-identity>"}   → atomic governor rebind
+//
+//   200 → {token}            (no name → fresh unbound token)
+//   200 → {token, name}      (with name → token bound to the identity)
+//   401 → no/invalid governor bearer when a governor is active
+//   403 → bearer is a valid participant token (not a governor)
+//   404 → name given but not a registered identity
+//   503 → bootstrap window closed by timeout with no governor established
+//
+// Bootstrap window: while no governor exists, /register is open (no auth). Each use logs WARN.
+async fn handle_register(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Option<Json<serde_json::Value>>,
+) -> Response {
+    let name = body
+        .as_ref()
+        .and_then(|b| b.0.get("name"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
-async fn handle_register(State(state): State<Arc<AppState>>) -> Response {
-    let token = state.hub.register_participant();
-    (StatusCode::OK, Json(json!({"token": token}))).into_response()
+    if !state.hub.has_active_governor() {
+        // Bootstrap escape hatch (chicken-and-egg): open registration until a governor exists.
+        if let Some(deadline) = state.bootstrap_deadline
+            && Instant::now() > deadline
+        {
+            eprintln!("BOOTSTRAP TIMEOUT: no governor established; closing registration window");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "bootstrap window closed; contact operator"})),
+            )
+                .into_response();
+        }
+        let token = state.hub.register_participant();
+        eprintln!("WARN: POST /register served via open bootstrap window (no active governor)");
+        return (StatusCode::OK, Json(json!({"token": token}))).into_response();
+    }
+
+    // A governor is active — a governor bearer is required.
+    let bearer = match bearer_token(&headers) {
+        Some(b) => b,
+        None => return auth_failed(),
+    };
+    // 403 (not 401) when the presenter is a participant token (completeness-M3).
+    if state.hub.is_participant_token(&bearer) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "FORBIDDEN",
+                "message": "a participant token cannot register participants; present the governor token"
+            })),
+        )
+            .into_response();
+    }
+    let gov = GovernorToken(bearer);
+    match state.hub.issue_participant_token(&gov, name.as_deref()) {
+        Ok((token, Some(name))) => {
+            (StatusCode::OK, Json(json!({"token": token, "name": name}))).into_response()
+        }
+        Ok((token, None)) => (StatusCode::OK, Json(json!({"token": token}))).into_response(),
+        Err(Error::RecipientUnknown) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "RECIPIENT_UNKNOWN", "message": "name not found in identities"})),
+        )
+            .into_response(),
+        Err(Error::Forbidden) => (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "FORBIDDEN", "message": "governor token required"})),
+        )
+            .into_response(),
+        // Invalid/expired governor bearer → 401.
+        Err(e) => err_response(e),
+    }
 }
 
 // ── POST /listen ──────────────────────────────────────────────────────────────
@@ -1418,8 +1576,8 @@ async fn handle_announce(
         Some(n) => n.to_string(),
         None => return err_response(Error::BadRequest),
     };
-    let force = body.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
-    match state.hub.announce(&token, &name, force) {
+    // FG-1: force-reclaim is removed. Any `force` field in the body is ignored.
+    match state.hub.announce(&token, &name) {
         Ok(AnnounceResult::Bound) => StatusCode::NO_CONTENT.into_response(),
         Ok(AnnounceResult::NameInUse { resolution_stream }) => (
             StatusCode::CONFLICT,
@@ -1427,7 +1585,7 @@ async fn handle_announce(
                 "error": "NAME_IN_USE",
                 "message": "name is currently in use",
                 "resolution_stream": resolution_stream,
-                "resolution": "re-announce with force:true to reclaim your own name"
+                "resolution": "contact the governor to rebind your identity to a new credential"
             })),
         )
             .into_response(),
