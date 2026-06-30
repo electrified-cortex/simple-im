@@ -1097,11 +1097,6 @@ async fn handle_gov_events(State(state): State<Arc<AppState>>, headers: HeaderMa
 #[derive(Deserialize)]
 struct AnnounceBody {
     name: String,
-    /// If true and the name is held by a live session, evict the holder and
-    /// claim the name. Use when recovering from a stale/orphaned session that
-    /// still holds your name. Any valid listen token may force-reclaim.
-    #[serde(default)]
-    force: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -1139,7 +1134,7 @@ async fn handle_discovery() -> Response {
                     "POST /register": {"auth": "none", "body": null, "hint": "Mint a new participant token"},
                     "POST /listen": {"auth": "participant", "body": "{name?}", "hint": "Open SSE stream; optional name to auto-announce"},
                     "DELETE /listen": {"auth": "participant", "body": null, "hint": "Close SSE stream, unbind name"},
-                    "POST /announce": {"auth": "participant", "body": "{name, force?}", "hint": "Claim a name for this token"},
+                    "POST /announce": {"auth": "participant", "body": "{name}", "hint": "Claim a name for this token"},
                     "GET /participants": {"auth": "governor", "body": null, "hint": "List all announced participants"},
                     "DELETE /participants/{name}": {"auth": "governor", "body": null, "hint": "Force-revoke participant by name"},
                     "GET /participants/{name}/presence": {"auth": "participant", "body": null, "hint": "Check if participant is online"},
@@ -1418,8 +1413,8 @@ async fn handle_announce(
         Some(n) => n.to_string(),
         None => return err_response(Error::BadRequest),
     };
-    let force = body.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
-    match state.hub.announce(&token, &name, force) {
+    // FG-1: force-reclaim is removed. Any `force` field in the body is ignored.
+    match state.hub.announce(&token, &name) {
         Ok(AnnounceResult::Bound) => StatusCode::NO_CONTENT.into_response(),
         Ok(AnnounceResult::NameInUse { resolution_stream }) => (
             StatusCode::CONFLICT,
@@ -1427,7 +1422,7 @@ async fn handle_announce(
                 "error": "NAME_IN_USE",
                 "message": "name is currently in use",
                 "resolution_stream": resolution_stream,
-                "resolution": "re-announce with force:true to reclaim your own name"
+                "resolution": "contact the governor to rebind your identity to a new credential"
             })),
         )
             .into_response(),

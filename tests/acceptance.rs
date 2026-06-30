@@ -878,26 +878,12 @@ async fn ac_n4_race_free_dequeue_then_arrival_fires_notify() {
 async fn ac_a4_toctou_concurrent_announce_exactly_one_wins() {
     use tokio::task;
 
-    // Agent 0 holds the name, then disconnects (making name stale).
-    // Agents A and B then race to claim the stale name simultaneously.
-    // Exactly one must succeed; the other must get NAME_IN_USE.
+    // Agents A and B race to claim a FRESH name simultaneously.
+    // Exactly one must succeed; the other must get NAME_IN_USE. (15-0029: no force/steal path,
+    // so a stale-name race is no longer how this is exercised — racing for a free name is.)
 
     let server = Arc::new(TestServer::spawn().await);
     let client = Arc::new(server.client());
-
-    // Original holder claims "RaceName" then drops SSE → stale.
-    let (tok0, stream0) = listen_get_token(&server, &client, None).await;
-    client
-        .post(server.url("/announce"))
-        .header("Authorization", format!("Bearer {}", tok0))
-        .json(&json!({"name": "RaceName"}))
-        .send()
-        .await
-        .unwrap();
-    // Abort the SSE task — makes holder stale (connection count decrements).
-    stream0.abort();
-    // Give the server time to process the SSE close.
-    tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Two racers, both with active SSE (keeps them from being auto-evicted by each other).
     let (tok_a, stream_a) = listen_get_token(&server, &client, None).await;
@@ -3084,7 +3070,7 @@ async fn ac_pp1_announce_sends_online_to_grant_peer_sse() {
     let (_, mut rx_a) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
-    hub.announce(&tok_a, "PpA", false).unwrap();
+    hub.announce(&tok_a, "PpA").unwrap();
 
     // Agent B: open listen stream but do NOT announce yet.
     let tok_b = hub.register_participant();
@@ -3111,7 +3097,7 @@ async fn ac_pp1_announce_sends_online_to_grant_peer_sse() {
     drain_receiver(&mut rx_a);
 
     // B announces for the first time — should trigger online event to A.
-    hub.announce(&tok_b, "PpB", false).unwrap();
+    hub.announce(&tok_b, "PpB").unwrap();
 
     let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
     let ev = wait_for_event_containing(
@@ -3138,14 +3124,14 @@ async fn ac_pp2_cancel_listen_sends_offline_to_grant_peer_sse() {
     let (_, mut rx_a) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
-    hub.announce(&tok_a, "PpA2", false).unwrap();
+    hub.announce(&tok_a, "PpA2").unwrap();
 
     let tok_b = hub.register_participant();
 
     let (_, _rx_b) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
-    hub.announce(&tok_b, "PpB2", false).unwrap();
+    hub.announce(&tok_b, "PpB2").unwrap();
 
     hub.approve_grant_req(
         &gov,
@@ -3191,14 +3177,14 @@ async fn ac_pp3_sse_drop_sends_offline_to_grant_peer_sse() {
     let (_, mut rx_a) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
-    hub.announce(&tok_a, "PpA3", false).unwrap();
+    hub.announce(&tok_a, "PpA3").unwrap();
 
     let tok_b = hub.register_participant();
 
     let (_, _rx_b) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
-    hub.announce(&tok_b, "PpB3", false).unwrap();
+    hub.announce(&tok_b, "PpB3").unwrap();
 
     hub.approve_grant_req(
         &gov,
@@ -3246,14 +3232,14 @@ async fn ac_pp4_no_grant_no_presence_event_to_non_peer() {
     let (_, mut rx_a) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
-    hub.announce(&tok_a, "PpA4", false).unwrap();
+    hub.announce(&tok_a, "PpA4").unwrap();
 
     let tok_b = hub.register_participant();
 
     let (_, _rx_b) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
-    hub.announce(&tok_b, "PpB4", false).unwrap();
+    hub.announce(&tok_b, "PpB4").unwrap();
 
     hub.approve_grant_req(
         &gov,
@@ -3279,7 +3265,7 @@ async fn ac_pp4_no_grant_no_presence_event_to_non_peer() {
     drain_receiver(&mut rx_a);
 
     // C announces — should NOT produce a presence event to A.
-    hub.announce(&tok_c, "PpC4", false).unwrap();
+    hub.announce(&tok_c, "PpC4").unwrap();
 
     // Give a short window for any spurious events.
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -3317,7 +3303,7 @@ async fn ac_pp5_minted_agent_deregister_sends_offline_to_listen_peer() {
     let (_, mut rx_a) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
-    hub.announce(&tok_a, "PpA5", false).unwrap();
+    hub.announce(&tok_a, "PpA5").unwrap();
 
     // Bob: minted participant with a stable identity distinct from his token.
     let bob_tok: ParticipantToken = hub.mint_participant_token(&gov, "bob-id-5", None).unwrap();
@@ -3349,13 +3335,11 @@ async fn ac_pp5_minted_agent_deregister_sends_offline_to_listen_peer() {
     );
 }
 
-// AC6 (15-0002G): force-eviction in announce() → grant-peer receives sim_offline.
-//
-// Agent B holds a name with an active SSE. Agent C announces the same name with force=true,
-// evicting B. Agent A is a grant-peer of B with an active SSE stream and must receive a
-// sim_offline presence event for B's name.
+// AC6 (15-0029 / FG-1): force-reclaim is removed. A LIVE name-holder B is never evicted by
+// another token C — C receives NAME_IN_USE, and grant-peer A receives NO sim_offline for B.
 #[tokio::test]
-async fn ac_pp6_force_eviction_sends_offline_to_grant_peer_sse() {
+async fn ac_pp6_live_holder_not_evicted_no_offline() {
+    use simple_im::delivery::AnnounceResult;
     use simple_im::trust::ApproveGrantRequest;
 
     let (hub, gov) = make_presence_hub();
@@ -3366,15 +3350,15 @@ async fn ac_pp6_force_eviction_sends_offline_to_grant_peer_sse() {
     let (_, mut rx_a) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
-    hub.announce(&tok_a, "PpA6", false).unwrap();
+    hub.announce(&tok_a, "PpA6").unwrap();
 
-    // Agent B: announces "PpB6" — will be force-evicted.
+    // Agent B: announces "PpB6" with a live SSE stream.
     let tok_b = hub.register_participant();
 
     let (_, _rx_b) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
-    hub.announce(&tok_b, "PpB6", false).unwrap();
+    hub.announce(&tok_b, "PpB6").unwrap();
 
     // Approve grant between A and B with explicit names.
     hub.approve_grant_req(
@@ -3393,15 +3377,21 @@ async fn ac_pp6_force_eviction_sends_offline_to_grant_peer_sse() {
     // Drain setup events from A's stream (welcome, online, grant breadcrumbs).
     drain_receiver(&mut rx_a);
 
-    // Agent C force-evicts B by announcing "PpB6" with force=true.
+    // Agent C attempts to claim B's live name — force is gone, so this is NAME_IN_USE.
     let tok_c = hub.register_participant();
 
     let (_, _rx_c) = hub
         .open_listen(Some(&tok_c), None, None, None, false, false)
         .unwrap();
-    hub.announce(&tok_c, "PpB6", true).unwrap();
+    assert!(
+        matches!(
+            hub.announce(&tok_c, "PpB6"),
+            Ok(AnnounceResult::NameInUse { .. })
+        ),
+        "live holder B must not be evicted; C must receive NAME_IN_USE"
+    );
 
-    // A must receive sim_offline for "PpB6".
+    // A must NOT receive a sim_offline for "PpB6" — B was never evicted.
     let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
     let ev = wait_for_event_containing(
         &mut rx_a,
@@ -3410,18 +3400,16 @@ async fn ac_pp6_force_eviction_sends_offline_to_grant_peer_sse() {
     )
     .await;
     assert!(
-        ev.is_some(),
-        "A must receive sim_offline for PpB6 when C force-evicts B; got nothing"
+        ev.is_none(),
+        "A must NOT receive sim_offline for PpB6 — no eviction occurs without force"
     );
 }
 
-// AC6b (15-0002G): stale-holder reclaim in announce() → grant-peer receives sim_offline.
-//
-// Agent B holds a name but its SSE drops (close_listen, simulating connection loss) without
-// an explicit cancel_listen. The name binding remains. Agent C announces the same name
-// (no force needed — holder is stale). Agent A, a grant-peer of B, must receive sim_offline.
+// AC6b (15-0029 / BLOCKER-4): a stale (SSE-dropped) name-holder B is NOT evicted across tokens.
+// Agent C announcing B's stale name receives NAME_IN_USE; B's binding is preserved.
 #[tokio::test]
-async fn ac_pp6b_stale_holder_reclaim_sends_offline_to_grant_peer_sse() {
+async fn ac_pp6b_stale_holder_cross_token_not_evicted() {
+    use simple_im::delivery::AnnounceResult;
     use simple_im::trust::ApproveGrantRequest;
 
     let (hub, gov) = make_presence_hub();
@@ -3429,10 +3417,10 @@ async fn ac_pp6b_stale_holder_reclaim_sends_offline_to_grant_peer_sse() {
     // Agent A: the observer.
     let tok_a = hub.register_participant();
 
-    let (_, mut rx_a) = hub
+    let (_, mut _rx_a) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
-    hub.announce(&tok_a, "PpA6b", false).unwrap();
+    hub.announce(&tok_a, "PpA6b").unwrap();
 
     // Agent B: announces "PpB6b" then its SSE drops without cancel_listen.
     let tok_b = hub.register_participant();
@@ -3440,7 +3428,7 @@ async fn ac_pp6b_stale_holder_reclaim_sends_offline_to_grant_peer_sse() {
     let (_, _rx_b) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
-    hub.announce(&tok_b, "PpB6b", false).unwrap();
+    hub.announce(&tok_b, "PpB6b").unwrap();
 
     // Approve grant between A and B.
     hub.approve_grant_req(
@@ -3459,32 +3447,24 @@ async fn ac_pp6b_stale_holder_reclaim_sends_offline_to_grant_peer_sse() {
     // Simulate B's SSE dropping unexpectedly (no clean cancel — name binding remains).
     hub.close_listen(&tok_b);
 
-    // Drain A's events (includes the offline from close_listen — we're checking the
-    // announce-reclaim path fires an additional or equal offline, but since ac_pp3
-    // covers close_listen, we drain and re-establish a clean observation window).
-    drain_receiver(&mut rx_a);
-
-    // Agent C reclaims "PpB6b" without force (stale holder → no NAME_IN_USE returned).
+    // Agent C attempts to reclaim B's stale name — BLOCKER-4 blocks cross-token eviction.
     let tok_c = hub.register_participant();
 
     let (_, _rx_c) = hub
         .open_listen(Some(&tok_c), None, None, None, false, false)
         .unwrap();
-    // B's name binding persists after close_listen; a non-force announce by C should
-    // evict the stale binding and fire sim_offline to A.
-    hub.announce(&tok_c, "PpB6b", false).unwrap();
-
-    // A must receive sim_offline for "PpB6b" from the stale-holder eviction.
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
-    let ev = wait_for_event_containing(
-        &mut rx_a,
-        &["\"presence\"", "\"offline\"", "\"PpB6b\""],
-        deadline,
-    )
-    .await;
     assert!(
-        ev.is_some(),
-        "A must receive sim_offline for PpB6b when C reclaims the stale binding; got nothing"
+        matches!(
+            hub.announce(&tok_c, "PpB6b"),
+            Ok(AnnounceResult::NameInUse { .. })
+        ),
+        "stale holder B must not be evicted across tokens; C must receive NAME_IN_USE"
+    );
+    // B's name binding must be preserved (still resolvable to PpB6b).
+    assert_eq!(
+        hub.validate_token(&tok_b).unwrap().as_deref(),
+        Some("PpB6b"),
+        "B's stale binding must survive C's blocked reclaim"
     );
 }
 
@@ -3500,14 +3480,14 @@ async fn ac_pp_default_listener_no_events() {
     let (_, mut rx_a) = hub
         .open_listen(Some(&tok_a), None, None, None, false, false)
         .unwrap();
-    hub.announce(&tok_a, "PpOptA", false).unwrap();
+    hub.announce(&tok_a, "PpOptA").unwrap();
 
     // B: open and announce.
     let tok_b = hub.register_participant();
     let (_, _rx_b) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
-    hub.announce(&tok_b, "PpOptB", false).unwrap();
+    hub.announce(&tok_b, "PpOptB").unwrap();
 
     // Establish grant between A and B.
     hub.approve_grant_req(
@@ -3530,7 +3510,7 @@ async fn ac_pp_default_listener_no_events() {
     let (_, _rx_b2) = hub
         .open_listen(Some(&tok_b2), None, None, None, false, false)
         .unwrap();
-    hub.announce(&tok_b2, "PpOptB", false).unwrap();
+    hub.announce(&tok_b2, "PpOptB").unwrap();
 
     // Wait past the settle window for the offline event too.
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -3557,13 +3537,13 @@ async fn ac_pp_timer_cancellation() {
     let (_, mut rx_a) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
-    hub.announce(&tok_a, "PpTcA", false).unwrap();
+    hub.announce(&tok_a, "PpTcA").unwrap();
 
     let tok_b = hub.register_participant();
     let (_, _rx_b) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
-    hub.announce(&tok_b, "PpTcB", false).unwrap();
+    hub.announce(&tok_b, "PpTcB").unwrap();
 
     hub.approve_grant_req(
         &gov,
@@ -3579,31 +3559,20 @@ async fn ac_pp_timer_cancellation() {
     .unwrap();
     drain_receiver(&mut rx_a);
 
-    // B drops (settle timer starts, time is paused so timer doesn't fire).
-    hub.cancel_listen(&tok_b).unwrap();
+    // B's SSE drops (settle timer starts, time is paused so timer doesn't fire).
+    // 15-0029: a routine reconnect keeps the SAME persistent token (FR4 flap-free); a fresh
+    // self-issued token can no longer reclaim a registered name.
+    hub.close_listen(&tok_b);
 
     // Advance 20 ms — still inside the 50 ms window.
     tokio::time::advance(Duration::from_millis(20)).await;
 
-    // B reconnects before the window expires — this must cancel the settle timer.
-    let tok_b2 = hub.register_participant();
+    // B reconnects with the SAME token and re-announces — this cancels the settle timer.
+    // Re-announce is idempotent (flap-free, FR4): no spurious online event is emitted.
     let (_, _rx_b2) = hub
-        .open_listen(Some(&tok_b2), None, None, None, false, false)
+        .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
-    hub.announce(&tok_b2, "PpTcB", false).unwrap();
-
-    // Online event delivered (B is back).
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
-    let online_ev = wait_for_event_containing(
-        &mut rx_a,
-        &["\"presence\"", "\"online\"", "\"PpTcB\""],
-        deadline,
-    )
-    .await;
-    assert!(
-        online_ev.is_some(),
-        "A must receive online event when B reconnects; got nothing"
-    );
+    hub.announce(&tok_b, "PpTcB").unwrap();
     drain_receiver(&mut rx_a);
 
     // Advance well past the settle window — offline must NOT fire (timer was cancelled).
@@ -3632,13 +3601,13 @@ async fn ac_pp_flap_collapse() {
     let (_, mut rx_a) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
-    hub.announce(&tok_a, "PpFlA", false).unwrap();
+    hub.announce(&tok_a, "PpFlA").unwrap();
 
     let tok_b = hub.register_participant();
     let (_, _rx_b) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
-    hub.announce(&tok_b, "PpFlB", false).unwrap();
+    hub.announce(&tok_b, "PpFlB").unwrap();
 
     hub.approve_grant_req(
         &gov,
@@ -3654,27 +3623,22 @@ async fn ac_pp_flap_collapse() {
     .unwrap();
     drain_receiver(&mut rx_a);
 
-    // Flap B online→offline×3 synchronously (all within the 50 ms settle window).
-    // Each reconnect cancels the pending settle timer so no offline is emitted mid-flap.
-    let mut cur_tok_b = tok_b.clone();
+    // Flap B drop→reconnect×3 synchronously (all within the 50 ms settle window), using the
+    // SAME persistent token each time (15-0029 FR4: routine reconnect keeps the token; a fresh
+    // self-issued token can no longer reclaim a registered name). Each re-announce cancels the
+    // pending settle timer so no offline is emitted mid-flap, and emits no spurious online.
     for _ in 0u32..3 {
-        hub.cancel_listen(&cur_tok_b).unwrap();
-        // Reconnect immediately — well within the 50 ms window.
-        let tok_bx = hub.register_participant();
+        hub.close_listen(&tok_b);
+        // Reconnect immediately — well within the 50 ms window — with the same token.
         let (_, _rx_bx) = hub
-            .open_listen(Some(&tok_bx), None, None, None, false, false)
+            .open_listen(Some(&tok_b), None, None, None, false, false)
             .unwrap();
-        hub.announce(&tok_bx, "PpFlB", false).unwrap();
-        cur_tok_b = tok_bx;
-        // Drain the online event fired by the reconnect announce.
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
-        let _ =
-            wait_for_event_containing(&mut rx_a, &["\"presence\"", "\"online\""], deadline).await;
+        hub.announce(&tok_b, "PpFlB").unwrap();
     }
     drain_receiver(&mut rx_a);
 
     // Final drop — settle timer starts; this time no reconnect, so it fires.
-    hub.cancel_listen(&cur_tok_b).unwrap();
+    hub.close_listen(&tok_b);
 
     // Wait past the settle window for the offline event.
     let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
@@ -3717,13 +3681,13 @@ async fn ac_pp_pull_during_settle() {
     let (_, _rx_a) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
-    hub.announce(&tok_a, "PpPsA", false).unwrap();
+    hub.announce(&tok_a, "PpPsA").unwrap();
 
     let tok_b = hub.register_participant();
     let (_, _rx_b) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
-    hub.announce(&tok_b, "PpPsB", false).unwrap();
+    hub.announce(&tok_b, "PpPsB").unwrap();
 
     hub.approve_grant_req(
         &gov,
@@ -3764,13 +3728,13 @@ async fn ac_pp_opt_in_not_persisted() {
     let (_, _rx_a1) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
-    hub.announce(&tok_a, "PpNpA", false).unwrap();
+    hub.announce(&tok_a, "PpNpA").unwrap();
 
     let tok_b = hub.register_participant();
     let (_, _rx_b) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
-    hub.announce(&tok_b, "PpNpB", false).unwrap();
+    hub.announce(&tok_b, "PpNpB").unwrap();
 
     hub.approve_grant_req(
         &gov,
@@ -3801,7 +3765,7 @@ async fn ac_pp_opt_in_not_persisted() {
     let (_, _rx_b2) = hub
         .open_listen(Some(&tok_b2), None, None, None, false, false)
         .unwrap();
-    hub.announce(&tok_b2, "PpNpB", false).unwrap();
+    hub.announce(&tok_b2, "PpNpB").unwrap();
 
     // Wait past the settle window.
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -3830,15 +3794,16 @@ async fn ac_ppv1_permissive_grant_sees_presence() {
     let (_, mut rx_a) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
-    hub.announce(&tok_a, "PpA7a", false).unwrap();
+    hub.announce(&tok_a, "PpA7a").unwrap();
 
     let tok_b = hub.register_participant();
     let (_, _rx_b) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
-    hub.announce(&tok_b, "PpB7a", false).unwrap();
 
-    // Establish permissive grant.
+    // Establish the permissive grant by stable name BEFORE B announces, so B's first announce
+    // fires the online push to its grant-peer A. (15-0029 FR4: reconnects are flap-free, so the
+    // observable online push is the first announce, not a self-issued-token re-announce.)
     hub.approve_grant_req(
         &gov,
         &tok_a,
@@ -3853,13 +3818,8 @@ async fn ac_ppv1_permissive_grant_sees_presence() {
     .unwrap();
     drain_receiver(&mut rx_a);
 
-    // B re-announces (triggers online push to grant-peers).
-    hub.cancel_listen(&tok_b).unwrap();
-    let tok_b2 = hub.register_participant();
-    let (_, _rx_b2) = hub
-        .open_listen(Some(&tok_b2), None, None, None, false, false)
-        .unwrap();
-    hub.announce(&tok_b2, "PpB7a", false).unwrap();
+    // B announces for the first time → online push to grant-peer A.
+    hub.announce(&tok_b, "PpB7a").unwrap();
 
     // Push: A should receive online event.
     let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
@@ -3876,7 +3836,7 @@ async fn ac_ppv1_permissive_grant_sees_presence() {
 
     // Pull: A should see B as online.
     assert!(
-        hub.presence_for_token(&tok_b2, "PpB7a").unwrap_or(false)
+        hub.presence_for_token(&tok_b, "PpB7a").unwrap_or(false)
             || hub.presence_for_token(&tok_a, "PpB7a").unwrap_or(false),
         "Presence pull must return true for grant-peer"
     );
@@ -3891,7 +3851,7 @@ async fn ac_ppv2_no_grant_no_room_zero_visibility() {
     let (_, mut rx_a) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
-    hub.announce(&tok_a, "PpA7b", false).unwrap();
+    hub.announce(&tok_a, "PpA7b").unwrap();
 
     let tok_b = hub.register_participant();
     let (_, _rx_b) = hub
@@ -3900,7 +3860,7 @@ async fn ac_ppv2_no_grant_no_room_zero_visibility() {
     // No grant, no shared room.
     drain_receiver(&mut rx_a);
 
-    hub.announce(&tok_b, "PpB7b", false).unwrap();
+    hub.announce(&tok_b, "PpB7b").unwrap();
 
     // Push: A must NOT receive any event (no grant, no room).
     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -3925,7 +3885,7 @@ async fn ac_ppv3_shared_room_no_grant_sees_presence() {
     let (_, mut rx_a) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
-    hub.announce(&tok_a, "PpA7c", false).unwrap();
+    hub.announce(&tok_a, "PpA7c").unwrap();
 
     // Both A and B join the same room BEFORE B announces (no grant between them).
     let rs = hub.room_store();
@@ -3939,7 +3899,7 @@ async fn ac_ppv3_shared_room_no_grant_sees_presence() {
     let tok_b = hub.register_participant();
     hub.open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
-    hub.announce(&tok_b, "PpB7c", false).unwrap();
+    hub.announce(&tok_b, "PpB7c").unwrap();
 
     // Push: A must receive online event for B.
     let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
@@ -3970,7 +3930,7 @@ async fn ac_ppv4_deny_grant_zero_visibility_even_in_room() {
     let (_, mut rx_a) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
-    hub.announce(&tok_a, "PpA7d", false).unwrap();
+    hub.announce(&tok_a, "PpA7d").unwrap();
 
     // Place a denial block: A (tok_a) is blocked from seeing B ("PpB7d").
     // Key: (from_identity=tok_a, to_name="PpB7d") — mirrors the messaging deny-grant model.
@@ -3989,7 +3949,7 @@ async fn ac_ppv4_deny_grant_zero_visibility_even_in_room() {
     let tok_b = hub.register_participant();
     hub.open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
-    hub.announce(&tok_b, "PpB7d", false).unwrap();
+    hub.announce(&tok_b, "PpB7d").unwrap();
 
     // Push: A must NOT receive any event (deny grant overrides room).
     tokio::time::sleep(Duration::from_millis(20)).await;

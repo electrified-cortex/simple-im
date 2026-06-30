@@ -4022,34 +4022,17 @@ impl DeliveryHub {
                         // Cancel any pending settle task (participant reconnected).
                         inner.cancel_settle_online(name);
                         (false, None::<String>, None::<String>)
-                    } else if let Some(existing_token) = inner.name_to_token.get(name).cloned() {
-                        let holder_alive = ListenTokenState::is_sse_alive_in_hub(
-                            &existing_token,
-                            &inner.sse_connections,
-                        );
-                        if holder_alive {
-                            (true, Some(name.to_string()), None)
-                        } else {
-                            // Stale holder — evict and bind.
-                            let old_name = inner
-                                .listen_tokens
-                                .get(&existing_token)
-                                .and_then(|h| h.name.clone());
-                            if let Some(ref n) = old_name {
-                                inner.name_to_token.remove(n.as_str());
-                                inner.agents.remove(n.as_str());
-                                inner.token_to_name.remove(&existing_token);
-                            }
-                            if let Some(holder_mut) = inner.listen_tokens.get_mut(&existing_token) {
-                                holder_mut.name = None;
-                            }
-                            inner.bind_name(&token, name);
-                            // Cancel any pending settle task (name is being reclaimed).
-                            inner.cancel_settle_online(name);
-                            (false, None, Some(name.to_string()))
-                        }
+                    } else if inner.name_to_token.contains_key(name) {
+                        // BLOCKER-4: held by a DIFFERENT token (the same-token case returned
+                        // above). Whether the holder's SSE is live or stale, no cross-token
+                        // eviction occurs — force-reclaim is removed (FG-1). NAME_IN_USE.
+                        (true, Some(name.to_string()), None)
                     } else if inner.registry.is_online(name) {
                         // A minted agent holds this name.
+                        (true, Some(name.to_string()), None)
+                    } else if inner.identities.contains(name) {
+                        // BLOCKER-3: registered identity with no active binding (orphaned) —
+                        // governor rebind is the only reclaim path. NAME_IN_USE.
                         (true, Some(name.to_string()), None)
                     } else {
                         inner.bind_name(&token, name);
@@ -4310,20 +4293,13 @@ impl DeliveryHub {
     /// minted agent), the holder is evicted immediately and the name is claimed.
     /// The evicted holder receives a `{"type":"service","event":"superseded",
     /// "reason":"name_reclaimed"}` event on their SSE stream.
-    pub fn announce(&self, token: &str, name: &str, force: bool) -> Result<AnnounceResult, Error> {
+    pub fn announce(&self, token: &str, name: &str) -> Result<AnnounceResult, Error> {
         let mut inner = self.lock();
         // gc_tokens() returns Branch-3 settle tasks that must be spawned after the lock
         // releases.  We use std::mem::take at each early-return path to fire any pending
         // settle tasks before returning, even if announce itself fails. (15-0002H)
         let mut gc_offline_events = inner.gc_tokens();
         let settle_window = inner.settle_window;
-        // Collects immediate offline events for tokens evicted by this announce call
-        // (force-eviction, stale-holder reclaim, minted-agent force-eviction). These
-        // fire immediately — NOT via settle window — because a deliberate eviction is
-        // not a "brief reconnect" scenario. Fired out-of-lock, before the online event,
-        // to preserve offline-before-online ordering. (15-0002G, 15-0028)
-        let mut eviction_immediate_offline: Vec<(String, Vec<mpsc::UnboundedSender<String>>)> =
-            Vec::new();
 
         // Validate token.
         if !inner.listen_tokens.contains_key(token) {
@@ -4369,93 +4345,45 @@ impl DeliveryHub {
             return Ok(AnnounceResult::Bound);
         }
 
-        // Check if name is claimed by another listen token.
+        // FG-1: self-service takeover is removed. A name held by a DIFFERENT token — whether its
+        // SSE is live or stale — is NAME_IN_USE. The same-token reconnect (live or stale self) was
+        // already handled by the idempotent re-announce check above, so any holder reached here
+        // is a different token. No cross-token takeover occurs. (BLOCKER-4)
         if let Some(existing_token) = inner.name_to_token.get(name).cloned() {
-            let holder_alive =
-                ListenTokenState::is_sse_alive_in_hub(&existing_token, &inner.sse_connections);
             if inner.listen_tokens.contains_key(&existing_token) {
-                if holder_alive {
-                    if !force {
-                        // Live SSE holder — return NAME_IN_USE.
-                        let resolution_stream = format!("/sessions/{}/events", name);
-                        drop(inner);
-                        for (n, senders, cancel_rx) in std::mem::take(&mut gc_offline_events) {
-                            spawn_settle_task(n, senders, settle_window, cancel_rx);
-                        }
-                        return Ok(AnnounceResult::NameInUse { resolution_stream });
-                    }
-                    // force=true: notify holder they are being superseded.
-                    // Do NOT clear holder_mut.name here — the shared cleanup block
-                    // below reads it to remove name_to_token/agents/token_to_name.
-                    if let Some(holder_mut) = inner.listen_tokens.get_mut(&existing_token)
-                        && let Some(ref tx) = holder_mut.sse_sender
-                    {
-                        let _ = tx.send(
-                            r#"{"type":"service","event":"superseded","reason":"name_reclaimed"}"#
-                                .to_string(),
-                        );
-                    }
-                    inner.sse_connections.remove(&existing_token);
-                    // Fall through — shared cleanup below removes all name bindings.
-                }
-                // Stale or force-evicted: remove old name binding.
-                let old_name = inner
-                    .listen_tokens
-                    .get(&existing_token)
-                    .and_then(|h| h.name.clone());
-                if let Some(ref n) = old_name {
-                    // Collect offline senders BEFORE removing from agents map.
-                    // INVARIANT: grant_peer_presence_senders() must be called while agents[name]
-                    // still exists. Covers both force=true eviction of a live holder and stale-
-                    // holder reclaim paths — opted-in grant-peers deserve sim_offline. (15-0002G)
-                    // Cancel any pending close_listen settle task for the old name, then collect
-                    // senders for an immediate offline (no settle window — this is a deliberate
-                    // eviction, not a brief reconnect). (15-0028)
-                    inner.settle_tasks.remove(n.as_str());
-                    let eviction_senders = inner.grant_peer_presence_senders(n.as_str());
-                    if !eviction_senders.is_empty() {
-                        eviction_immediate_offline.push((n.to_string(), eviction_senders));
-                    }
-                    inner.name_to_token.remove(n.as_str());
-                    inner.agents.remove(n.as_str());
-                    inner.token_to_name.remove(&existing_token);
-                    // AC2 fix: also evict the registry entry so the minted-agent conflict
-                    // check below (registry.is_online + name_to_token.is_none) doesn't
-                    // mistake this evicted listen-flow agent for a live minted agent.
-                    inner.registry.force_deregister(n);
-                }
-                if let Some(holder_mut) = inner.listen_tokens.get_mut(&existing_token) {
-                    holder_mut.name = None;
-                }
-            } else {
-                inner.name_to_token.remove(name);
-            }
-        }
-
-        // Also check minted-agent registry for name conflicts.
-        if inner.registry.is_online(name) && !inner.name_to_token.contains_key(name) {
-            if !force {
-                // A minted agent holds this name.
                 let resolution_stream = format!("/sessions/{}/events", name);
                 drop(inner);
                 for (n, senders, cancel_rx) in std::mem::take(&mut gc_offline_events) {
                     spawn_settle_task(n, senders, settle_window, cancel_rx);
                 }
                 return Ok(AnnounceResult::NameInUse { resolution_stream });
+            } else {
+                // Dangling name_to_token entry with no live token state — clean it up and
+                // fall through to the orphan/identity guard below.
+                inner.name_to_token.remove(name);
             }
-            // force=true: deregister the minted agent and fire offline immediately to opted-in
-            // grant-peers. INVARIANT: grant_peer_presence_senders() must be called while
-            // agents[name] still exists. Immediate fire (no settle) — deliberate eviction.
-            // (15-0002G, 15-0028)
-            inner.settle_tasks.remove(name);
-            let eviction_senders = inner.grant_peer_presence_senders(name);
-            if !eviction_senders.is_empty() {
-                eviction_immediate_offline.push((name.to_string(), eviction_senders));
+        }
+
+        // A minted agent holding this name is NAME_IN_USE (no takeover path; FG-1).
+        if inner.registry.is_online(name) && !inner.name_to_token.contains_key(name) {
+            let resolution_stream = format!("/sessions/{}/events", name);
+            drop(inner);
+            for (n, senders, cancel_rx) in std::mem::take(&mut gc_offline_events) {
+                spawn_settle_task(n, senders, settle_window, cancel_rx);
             }
-            inner.registry.force_deregister(name);
-            inner.agents.remove(name);
-            inner.token_to_name.retain(|_, n| n != name);
-            inner.active_sse_connections.remove(name);
+            return Ok(AnnounceResult::NameInUse { resolution_stream });
+        }
+
+        // BLOCKER-3: a registered identity with no active binding is orphaned (its token was
+        // GC'd or revoked). Only a governor rebind (POST /register {name}) may reclaim it — any
+        // other token claiming it is impersonation.
+        if !inner.name_to_token.contains_key(name) && inner.identities.contains(name) {
+            let resolution_stream = format!("/sessions/{}/events", name);
+            drop(inner);
+            for (n, senders, cancel_rx) in std::mem::take(&mut gc_offline_events) {
+                spawn_settle_task(n, senders, settle_window, cancel_rx);
+            }
+            return Ok(AnnounceResult::NameInUse { resolution_stream });
         }
 
         // Claim the name (atomic under the Mutex).
@@ -4508,15 +4436,9 @@ impl DeliveryHub {
         };
 
         // Presence push (AC1 / TR1): cancel any pending settle task and collect opted-in
-        // grant-peer SSE senders before releasing the lock.
-        //
-        // Only cancel a pending settle if no eviction offline was just collected.
-        // The eviction paths remove the name from settle_tasks themselves; calling
-        // cancel_settle_online here would be a no-op for evictions but is still
-        // guarded in case the background task races in a stale entry. (15-0002G)
-        if eviction_immediate_offline.is_empty() {
-            inner.cancel_settle_online(name);
-        }
+        // grant-peer SSE senders before releasing the lock. (Force-reclaim is removed, so there
+        // is no longer an eviction-offline path that would suppress this cancel.)
+        inner.cancel_settle_online(name);
         let online_senders = inner.grant_peer_presence_senders(name);
 
         drop(inner);
@@ -4524,12 +4446,6 @@ impl DeliveryHub {
         // Spawn settle tasks for Branch-3 GC evictions after the lock is released. (15-0002H)
         for (n, senders, cancel_rx) in gc_offline_events {
             spawn_settle_task(n, senders, settle_window, cancel_rx);
-        }
-
-        // Fire immediate offline events for force-evicted / stale-reclaimed holders BEFORE
-        // the online event, so grant-peers observe offline → online ordering. (15-0002G, 15-0028)
-        for (n, senders) in eviction_immediate_offline {
-            push_presence_event(senders, &n, "offline");
         }
 
         // Persist at announce so the name survives server restart even before the first grant.
@@ -7359,7 +7275,7 @@ mod tests {
         let (tok, _rx) = hub
             .open_listen(Some(&reg), None, None, None, false, false)
             .unwrap();
-        hub.announce(&tok, "Alice", false).unwrap();
+        hub.announce(&tok, "Alice").unwrap();
         let store = hub.token_store.clone().unwrap();
         assert_eq!(
             store.token_identity(&tok).await.unwrap().as_deref(),
@@ -7437,7 +7353,7 @@ mod tests {
             let (tok, _rx) = hub
                 .open_listen(Some(&reg), None, None, None, false, false)
                 .unwrap();
-            hub.announce(&tok, "Alice", false).unwrap();
+            hub.announce(&tok, "Alice").unwrap();
             tok
         };
         // Restart.
@@ -7468,6 +7384,213 @@ mod tests {
             res
         );
         let _ = std::fs::remove_file(&db);
+    }
+
+    // ── 15-0029 S4: force removal + identity guards ────────────────────────────
+
+    /// EPIC-AC-6 / S4-AC-2: a live name-holder is never evicted by another token.
+    #[test]
+    fn test_announce_live_holder_not_evicted() {
+        let hub = DeliveryHub::new(Duration::from_secs(30));
+        let reg_a = hub.register_participant();
+        let (tok_a, _rx_a) = hub
+            .open_listen(Some(&reg_a), None, None, None, false, false)
+            .unwrap();
+        hub.announce(&tok_a, "Alice").unwrap();
+
+        let reg_b = hub.register_participant();
+        let (tok_b, _rx_b) = hub
+            .open_listen(Some(&reg_b), None, None, None, false, false)
+            .unwrap();
+        assert!(
+            matches!(
+                hub.announce(&tok_b, "Alice"),
+                Ok(AnnounceResult::NameInUse { .. })
+            ),
+            "live holder A must not be evicted; B must get NAME_IN_USE"
+        );
+        assert_eq!(
+            hub.validate_token(&tok_a).unwrap().as_deref(),
+            Some("Alice"),
+            "A must still hold Alice"
+        );
+        assert_eq!(
+            hub.lock().name_to_token.get("Alice").map(String::as_str),
+            Some(tok_a.as_str())
+        );
+    }
+
+    /// EPIC-AC-5 / S4-AC-1: a force flag cannot evict a holder (force argument is gone).
+    #[test]
+    fn test_announce_force_body_ignored_returns_409() {
+        let hub = DeliveryHub::new(Duration::from_secs(30));
+        let reg_a = hub.register_participant();
+        let (tok_a, _rx_a) = hub
+            .open_listen(Some(&reg_a), None, None, None, false, false)
+            .unwrap();
+        hub.announce(&tok_a, "Alice").unwrap();
+        let reg_b = hub.register_participant();
+        let (tok_b, _rx_b) = hub
+            .open_listen(Some(&reg_b), None, None, None, false, false)
+            .unwrap();
+        // The HTTP layer ignores any `force` field; the hub method has no force parameter at all.
+        assert!(matches!(
+            hub.announce(&tok_b, "Alice"),
+            Ok(AnnounceResult::NameInUse { .. })
+        ));
+        assert_eq!(
+            hub.validate_token(&tok_a).unwrap().as_deref(),
+            Some("Alice")
+        );
+    }
+
+    /// EPIC-AC-20 / S4-AC-7: an orphaned registered name (token GC'd/revoked) → NAME_IN_USE.
+    #[test]
+    fn test_orphaned_name_returns_name_in_use() {
+        let hub = DeliveryHub::new(Duration::from_secs(30));
+        let reg_a = hub.register_participant();
+        let (tok_a, _rx_a) = hub
+            .open_listen(Some(&reg_a), None, None, None, false, false)
+            .unwrap();
+        hub.announce(&tok_a, "Alice").unwrap();
+        // Simulate revoke + GC: clear A's live binding and token, KEEP the identity record.
+        {
+            let mut inner = hub.lock();
+            inner.name_to_token.remove("Alice");
+            inner.token_to_name.remove(&tok_a);
+            inner.agents.remove("Alice");
+            inner.listen_tokens.remove(&tok_a);
+            inner.sse_connections.remove(&tok_a);
+            assert!(inner.identities.contains("Alice"));
+        }
+        let reg_b = hub.register_participant();
+        let (tok_b, _rx_b) = hub
+            .open_listen(Some(&reg_b), None, None, None, false, false)
+            .unwrap();
+        assert!(
+            matches!(
+                hub.announce(&tok_b, "Alice"),
+                Ok(AnnounceResult::NameInUse { .. })
+            ),
+            "orphaned registered name must be NAME_IN_USE (governor rebind required)"
+        );
+    }
+
+    /// EPIC-AC-21 / S4-AC-8: a stale holder is not evicted across tokens.
+    #[test]
+    fn test_stale_cross_token_eviction_blocked() {
+        let hub = DeliveryHub::new(Duration::from_secs(30));
+        let reg_a = hub.register_participant();
+        let (tok_a, rx_a) = hub
+            .open_listen(Some(&reg_a), None, None, None, false, false)
+            .unwrap();
+        hub.announce(&tok_a, "Alice").unwrap();
+        // Make A's SSE stale (drop the connection; the name binding remains).
+        drop(rx_a);
+        hub.close_listen(&tok_a);
+
+        let reg_b = hub.register_participant();
+        let (tok_b, _rx_b) = hub
+            .open_listen(Some(&reg_b), None, None, None, false, false)
+            .unwrap();
+        assert!(
+            matches!(
+                hub.announce(&tok_b, "Alice"),
+                Ok(AnnounceResult::NameInUse { .. })
+            ),
+            "stale cross-token takeover must be blocked (BLOCKER-4)"
+        );
+        assert_eq!(
+            hub.validate_token(&tok_a).unwrap().as_deref(),
+            Some("Alice"),
+            "stale A's binding must survive"
+        );
+    }
+
+    /// EPIC-AC-22 / S4-AC-9: same-token stale reconnect succeeds.
+    #[test]
+    fn test_same_token_stale_reconnect_succeeds() {
+        let hub = DeliveryHub::new(Duration::from_secs(30));
+        let reg_a = hub.register_participant();
+        let (tok_a, rx_a) = hub
+            .open_listen(Some(&reg_a), None, None, None, false, false)
+            .unwrap();
+        hub.announce(&tok_a, "Alice").unwrap();
+        drop(rx_a);
+        hub.close_listen(&tok_a); // stale SSE; binding remains
+        assert!(
+            matches!(hub.announce(&tok_a, "Alice"), Ok(AnnounceResult::Bound)),
+            "same-token stale reconnect must succeed"
+        );
+    }
+
+    fn read_crate_src(rel: &str) -> String {
+        std::fs::read_to_string(format!("{}/{}", env!("CARGO_MANIFEST_DIR"), rel))
+            .unwrap_or_else(|e| panic!("read {rel}: {e}"))
+    }
+
+    /// S4-AC-3: AnnounceBody has no `force` field.
+    #[test]
+    fn test_s4_no_force_field_in_announcebody() {
+        let src = read_crate_src("src/http.rs");
+        let start = src
+            .find("struct AnnounceBody")
+            .expect("AnnounceBody struct present");
+        let rest = &src[start..];
+        let end = rest.find('}').expect("struct close brace");
+        let body = &rest[..end];
+        assert!(
+            !body.contains("force"),
+            "AnnounceBody must not declare a force field: {body}"
+        );
+    }
+
+    /// EPIC-AC-17 / S4-AC-4 / S4-AC-6: no force-eviction / force-reclaim in the announce path.
+    #[test]
+    fn test_no_force_announce_code_path() {
+        let src = read_crate_src("src/delivery.rs");
+        let start = src.find("pub fn announce(").expect("announce fn present");
+        let rest = &src[start..];
+        let end = rest
+            .find("pub fn dequeue(")
+            .expect("next fn after announce");
+        let announce_body = &rest[..end];
+        for line in announce_body.lines() {
+            let has_force = line.contains("force");
+            let has_evict_or_reclaim = line.contains("evict") || line.contains("reclaim");
+            assert!(
+                !(has_force && has_evict_or_reclaim),
+                "announce() must contain no force-eviction/force-reclaim line: {line}"
+            );
+        }
+        // The HTTP announce handler must not extract a force field from the body.
+        let http = read_crate_src("src/http.rs");
+        let hstart = http
+            .find("async fn handle_announce(")
+            .expect("handle_announce present");
+        assert!(
+            !http[hstart..].contains("body.get(\"force\")"),
+            "handle_announce must not extract a force field"
+        );
+    }
+
+    /// S4-AC-11 / EPIC-AC-23 grep: no participant/listen upsert writes identity==token.
+    /// (Governor tokens legitimately store identity=token — a governor's identity IS its token.)
+    #[test]
+    fn test_s4_no_identity_equals_token_upsert() {
+        let src = read_crate_src("src/delivery.rs");
+        for line in src.lines() {
+            let identity_eq_token = line.contains("upsert_token(&tok, &tok")
+                || line.contains("upsert_token(&tok2, &tok2")
+                || line.contains("upsert_token(&t, &t");
+            let participantish = line.contains("\"listen\"") || line.contains("\"participant\"");
+            assert!(
+                !(identity_eq_token && participantish),
+                "no participant/listen identity==token upsert may remain: {line}"
+            );
+        }
+        // And specifically the spec's listen-type form must be gone entirely.
+        assert!(!src.contains("upsert_token(&tok, &tok, \"listen\""));
     }
 
     // ── Attachments (native file/attachment send) ────────────────────────────────
@@ -7630,7 +7753,7 @@ mod tests {
             let (tok, _rx) = hub
                 .open_listen(Some(&reg), None, None, None, false, false)
                 .unwrap();
-            hub.announce(&tok, "alice", false).unwrap();
+            hub.announce(&tok, "alice").unwrap();
             (gov, tok)
         };
 
@@ -7660,12 +7783,12 @@ mod tests {
             let (a, _ra) = hub
                 .open_listen(Some(&reg_a), None, None, None, false, false)
                 .unwrap();
-            hub.announce(&a, "alice", false).unwrap();
+            hub.announce(&a, "alice").unwrap();
             let reg_b = hub.register_participant();
             let (b, _rb) = hub
                 .open_listen(Some(&reg_b), None, None, None, false, false)
                 .unwrap();
-            hub.announce(&b, "bob", false).unwrap();
+            hub.announce(&b, "bob").unwrap();
             hub.approve_grant(&gov, &a, &b, None).unwrap();
             (a, b)
         };
@@ -7782,12 +7905,12 @@ mod tests {
             let (a, _ra) = hub
                 .open_listen(Some(&reg_a), None, None, None, false, false)
                 .unwrap();
-            hub.announce(&a, "ag-a", false).unwrap();
+            hub.announce(&a, "ag-a").unwrap();
             let reg_b = hub.register_participant();
             let (b, _rb) = hub
                 .open_listen(Some(&reg_b), None, None, None, false, false)
                 .unwrap();
-            hub.announce(&b, "ag-b", false).unwrap();
+            hub.announce(&b, "ag-b").unwrap();
             hub.approve_grant(&gov, &a, &b, None).unwrap(); // no expiry = permanent
             a
         };
@@ -8023,7 +8146,7 @@ mod tests {
             .open_listen(Some(&reg_token), None, None, None, false, false)
             .unwrap();
         // Announce a name — sets st.name = Some("GcExempt").
-        hub.announce(&tok, "GcExempt", false).unwrap();
+        hub.announce(&tok, "GcExempt").unwrap();
 
         {
             let inner = hub.inner.lock().unwrap();
@@ -8070,11 +8193,11 @@ mod tests {
         let (tok_a, mut rx_a) = hub
             .open_listen(Some(&reg_a), None, None, None, false, true) // presence_push=true
             .unwrap();
-        hub.announce(&tok_a, "GcA6", false).unwrap();
+        hub.announce(&tok_a, "GcA6").unwrap();
 
         // Agent B: issue token + announce, but NO open_listen (ever_listened stays false).
         let tok_b = hub.issue_token();
-        hub.announce(&tok_b, "GcB6", false).unwrap();
+        hub.announce(&tok_b, "GcB6").unwrap();
 
         // Establish a grant between B (identity=tok_b) and A (identity=tok_a).
         // FP1 in approve_grant_req() fills in name_a="GcB6" and name_b="GcA6" from
@@ -8149,7 +8272,7 @@ mod tests {
             let (listen_tok, _rx) = hub
                 .open_listen(Some(&reg_bob), None, None, None, false, false)
                 .unwrap();
-            hub.announce(&listen_tok, "bob", false).unwrap();
+            hub.announce(&listen_tok, "bob").unwrap();
 
             // Register alice so request_grant() can route by name.
             hub.register("alice", &tok_a, PresenceScope::GrantScoped)
@@ -8205,7 +8328,7 @@ mod tests {
             let (listen_tok, _rx) = hub
                 .open_listen(Some(&reg_bob), None, None, None, false, false)
                 .unwrap();
-            hub.announce(&listen_tok, "bob", false).unwrap();
+            hub.announce(&listen_tok, "bob").unwrap();
             listen_tok
         };
 
@@ -8244,7 +8367,7 @@ mod tests {
             let (listen_tok, _rx) = hub
                 .open_listen(Some(&reg_bob), None, None, None, false, false)
                 .unwrap();
-            hub.announce(&listen_tok, "bob", false).unwrap();
+            hub.announce(&listen_tok, "bob").unwrap();
             listen_tok
         };
 
@@ -8272,7 +8395,7 @@ mod tests {
             let (listen_tok, _rx) = hub
                 .open_listen(Some(&reg_charlie), None, None, None, false, false)
                 .unwrap();
-            hub.announce(&listen_tok, name, false).unwrap();
+            hub.announce(&listen_tok, name).unwrap();
             listen_tok
         };
 
@@ -8517,8 +8640,8 @@ mod tests {
             .unwrap();
 
         // Announce both.
-        hub.announce(&listen_a, "alice", false).unwrap();
-        hub.announce(&listen_b, "bob", false).unwrap();
+        hub.announce(&listen_a, "alice").unwrap();
+        hub.announce(&listen_b, "bob").unwrap();
 
         // A has no grant with B → presence_for_token should return false.
         let result = hub.presence_for_token(&listen_a, "bob");
@@ -8547,8 +8670,8 @@ mod tests {
             .unwrap();
 
         // Announce both (this updates name_to_token mappings).
-        hub.announce(&listen_a, "alice", false).unwrap();
-        hub.announce(&listen_b, "bob", false).unwrap();
+        hub.announce(&listen_a, "alice").unwrap();
+        hub.announce(&listen_b, "bob").unwrap();
 
         // Create grant between alice and bob (using their listen tokens as identities).
         hub.approve_grant(&gov, &listen_a, &listen_b, None).unwrap();
@@ -8580,8 +8703,8 @@ mod tests {
             .unwrap();
 
         // Announce both.
-        hub.announce(&listen_a, "alice", false).unwrap();
-        hub.announce(&listen_b, "bob", false).unwrap();
+        hub.announce(&listen_a, "alice").unwrap();
+        hub.announce(&listen_b, "bob").unwrap();
 
         // Create grant with immediate expiry (1ms).
         hub.approve_grant(&gov, &listen_a, &listen_b, Some(Duration::from_millis(1)))
