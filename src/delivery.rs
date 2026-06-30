@@ -3833,6 +3833,114 @@ impl DeliveryHub {
         }
     }
 
+    /// True if `token` is a current (non-revoked) participant (listen) token. Used by the
+    /// /register handler to return 403 (not 401) when a participant presents its own token.
+    pub fn is_participant_token(&self, token: &str) -> bool {
+        self.lock()
+            .listen_tokens
+            .get(token)
+            .map(|s| !s.revoked)
+            .unwrap_or(false)
+    }
+
+    /// Governor-gated participant token issuance (POST /register, FG-2). The governor is
+    /// validated first.
+    ///
+    /// - `name == None`: mint a fresh, unbound participant token.
+    /// - `name == Some(existing)`: ATOMIC governor rebind — in one locked section, invalidate the
+    ///   identity's current token (sending it a `superseded/governor_rebind` SSE), mint a new
+    ///   participant token, and bind it to the name. The identity record and all name-keyed grants
+    ///   are unchanged. Returns `(new_token, Some(name))`.
+    ///
+    /// Errors: `AuthFailed`/`TokenExpired` (governor invalid), `Forbidden` (bearer is a
+    /// participant), `RecipientUnknown` (name given but not a registered identity).
+    pub fn issue_participant_token(
+        &self,
+        gov: &GovernorToken,
+        name: Option<&str>,
+    ) -> Result<(String, Option<String>), Error> {
+        let (new_token, bound, old_token) = {
+            let mut inner = self.lock();
+            inner.trust.validate_governor_token(gov)?;
+
+            let mut rng = rand::thread_rng();
+            let mint = |inner: &mut HubInner, rng: &mut rand::rngs::ThreadRng| -> String {
+                loop {
+                    let digits: u64 = rng.gen_range(10_000_000..=999_999_999_999);
+                    let tok = digits.to_string();
+                    if !inner.listen_tokens.contains_key(&tok) {
+                        let mut state = ListenTokenState::new();
+                        state.pending_first_listen = true;
+                        inner.listen_tokens.insert(tok.clone(), state);
+                        break tok;
+                    }
+                }
+            };
+
+            match name {
+                None => {
+                    let tok = mint(&mut inner, &mut rng);
+                    (tok, None, None)
+                }
+                Some(name) => {
+                    if !inner.identities.contains(name) {
+                        return Err(Error::RecipientUnknown);
+                    }
+                    // Invalidate the identity's current token (if any) and notify it.
+                    let old_token = inner.name_to_token.get(name).cloned();
+                    if let Some(ref old) = old_token {
+                        if let Some(st) = inner.listen_tokens.get(old)
+                            && let Some(ref tx) = st.sse_sender
+                        {
+                            let _ = tx.send(
+                                r#"{"type":"service","event":"superseded","reason":"governor_rebind"}"#
+                                    .to_string(),
+                            );
+                        }
+                        inner.listen_tokens.remove(old);
+                        inner.sse_connections.remove(old);
+                        inner.token_to_name.remove(old);
+                    }
+                    inner.name_to_token.remove(name);
+                    inner.agents.remove(name);
+                    inner.registry.force_deregister(name);
+
+                    // Mint a new token and bind it to the name atomically.
+                    let tok = mint(&mut inner, &mut rng);
+                    if let Some(st) = inner.listen_tokens.get_mut(&tok) {
+                        st.ever_granted = true;
+                    }
+                    inner.bind_name(&tok, name);
+                    (tok, Some(name.to_string()), old_token)
+                }
+            }
+        };
+
+        if let Some(store) = self.token_store.clone() {
+            let new = new_token.clone();
+            let bound_name = bound.clone();
+            let old = old_token.clone();
+            self.db_write(async move {
+                if let Some(old) = old {
+                    let _ = store.delete_token(&old).await;
+                }
+                if let Some(ref nm) = bound_name {
+                    if let Err(e) = store.upsert_identity(nm).await {
+                        eprintln!("WARNING: identity store write failed: {e}");
+                    }
+                    if let Err(e) = store
+                        .upsert_token(&new, nm, "participant", None, None)
+                        .await
+                    {
+                        eprintln!("WARNING: token store write failed: {e}");
+                    }
+                }
+            });
+        }
+
+        Ok((new_token, bound))
+    }
+
     /// Opens an SSE listen stream for a token.
     ///
     /// Token is REQUIRED. If no token or unknown token, returns `AuthFailed`.
@@ -7591,6 +7699,122 @@ mod tests {
         }
         // And specifically the spec's listen-type form must be gone entirely.
         assert!(!src.contains("upsert_token(&tok, &tok, \"listen\""));
+    }
+
+    // ── 15-0029 S3: governor rebind (issue_participant_token) ──────────────────
+
+    /// EPIC-AC-8 / S3-AC-7: the identities row's created_at is unchanged across a governor rebind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_identity_record_unchanged_after_rebind() {
+        let db = unique_test_db();
+        let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
+        let gov = hub.install_governor(None);
+        let reg = hub.register_participant();
+        let (t1, _rx) = hub
+            .open_listen(Some(&reg), None, None, None, false, false)
+            .unwrap();
+        hub.announce(&t1, "Alice").unwrap();
+        let store = hub.token_store.clone().unwrap();
+        let before = store.identity_created_at("Alice").await.unwrap();
+        assert!(
+            before.is_some(),
+            "identity record must exist after announce"
+        );
+
+        // Governor rebind.
+        let (t2, name) = hub.issue_participant_token(&gov, Some("Alice")).unwrap();
+        assert_eq!(name.as_deref(), Some("Alice"));
+        assert_ne!(t2, t1);
+
+        let after = store.identity_created_at("Alice").await.unwrap();
+        assert_eq!(before, after, "created_at must be unchanged by rebind");
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// EPIC-AC-9 / S3-AC-8: a name-keyed grant survives a governor rebind of one party's token.
+    #[test]
+    fn test_grants_survive_rebind() {
+        let hub = DeliveryHub::new(Duration::from_secs(30));
+        let gov = hub.install_governor(None);
+
+        let reg_a = hub.register_participant();
+        let (t1, _ra) = hub
+            .open_listen(Some(&reg_a), None, None, None, false, false)
+            .unwrap();
+        hub.announce(&t1, "Alice").unwrap();
+        let reg_b = hub.register_participant();
+        let (tb, _rb) = hub
+            .open_listen(Some(&reg_b), None, None, None, false, false)
+            .unwrap();
+        hub.announce(&tb, "Bob").unwrap();
+        // Grant (Alice, Bob) — names auto-filled from token_to_name.
+        hub.approve_grant(&gov, &t1, &tb, None).unwrap();
+
+        // Rebind Alice → T2 (T1 invalidated).
+        let (t2, _name) = hub.issue_participant_token(&gov, Some("Alice")).unwrap();
+        assert!(
+            hub.validate_token(&t1).is_err(),
+            "old token must be invalid"
+        );
+
+        // The grant (keyed on names) still authorizes Alice→Bob from the new token.
+        assert!(
+            matches!(
+                hub.send(
+                    &ParticipantToken(t2.clone()),
+                    "Bob",
+                    Payload(b"hi".to_vec()),
+                    None,
+                    None
+                ),
+                Ok(Ack::Accepted)
+            ),
+            "grant must survive rebind"
+        );
+    }
+
+    /// S3 rebind invalidates the old token and the new token can announce (hub-level EPIC-AC-7).
+    #[test]
+    fn test_rebind_invalidates_old_token_new_can_announce() {
+        let hub = DeliveryHub::new(Duration::from_secs(30));
+        let gov = hub.install_governor(None);
+        let reg = hub.register_participant();
+        let (t1, _rx) = hub
+            .open_listen(Some(&reg), None, None, None, false, false)
+            .unwrap();
+        hub.announce(&t1, "Alice").unwrap();
+
+        let (t2, _name) = hub.issue_participant_token(&gov, Some("Alice")).unwrap();
+        assert_ne!(t2, t1);
+        // Old token: announce now rejected.
+        assert!(matches!(
+            hub.announce(&t1, "Alice"),
+            Err(Error::TokenRejected)
+        ));
+        // New token: bound, announce is idempotent Bound.
+        assert!(matches!(
+            hub.announce(&t2, "Alice"),
+            Ok(AnnounceResult::Bound)
+        ));
+    }
+
+    /// S3-AC-9: governor rebind of an unknown name → RecipientUnknown (404).
+    #[test]
+    fn test_issue_participant_token_unknown_name() {
+        let hub = DeliveryHub::new(Duration::from_secs(30));
+        let gov = hub.install_governor(None);
+        assert!(matches!(
+            hub.issue_participant_token(&gov, Some("Nobody")),
+            Err(Error::RecipientUnknown)
+        ));
+    }
+
+    /// S3: issue_participant_token requires a valid governor (a participant token → AuthFailed).
+    #[test]
+    fn test_issue_participant_token_requires_governor() {
+        let hub = DeliveryHub::new(Duration::from_secs(30));
+        let forged = GovernorToken("not-a-governor".to_string());
+        assert!(hub.issue_participant_token(&forged, None).is_err());
     }
 
     // ── Attachments (native file/attachment send) ────────────────────────────────

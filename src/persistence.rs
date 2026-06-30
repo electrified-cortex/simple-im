@@ -671,4 +671,14 @@ impl TokenStore {
             .await?;
         Ok(row.map(|r| r.get("token_type")))
     }
+
+    /// Return the `created_at` of an identity record, or None if absent.
+    pub async fn identity_created_at(&self, name: &str) -> Result<Option<String>, sqlx::Error> {
+        use sqlx::Row;
+        let row = sqlx::query("SELECT created_at FROM identities WHERE name = ?")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get("created_at")))
+    }
 }

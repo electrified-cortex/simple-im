@@ -46,6 +46,20 @@ pub struct AppState {
     pub rooms: Arc<RoomStore>,
     pub attachment_ttl: Duration,
     pub attachment_max_bytes: usize,
+    /// Bootstrap window close time (15-0029 / security-MINOR-2). When set and elapsed with no
+    /// governor established, unauthenticated POST /register returns 503. None = window never
+    /// closes by timeout. Sourced from `SIMPLE_IM_BOOTSTRAP_TIMEOUT_SECS`.
+    pub bootstrap_deadline: Option<Instant>,
+}
+
+/// Compute the bootstrap-window deadline from `SIMPLE_IM_BOOTSTRAP_TIMEOUT_SECS` (seconds).
+/// Returns None when unset, unparsable, or zero (window never times out).
+fn bootstrap_deadline_from_env() -> Option<Instant> {
+    std::env::var("SIMPLE_IM_BOOTSTRAP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .map(|n| Instant::now() + Duration::from_secs(n))
 }
 
 impl AppState {
@@ -60,6 +74,7 @@ impl AppState {
             rooms,
             attachment_ttl,
             attachment_max_bytes,
+            bootstrap_deadline: bootstrap_deadline_from_env(),
         }
     }
 
@@ -72,6 +87,7 @@ impl AppState {
             rooms,
             attachment_ttl,
             attachment_max_bytes,
+            bootstrap_deadline: bootstrap_deadline_from_env(),
         }
     }
 }
@@ -1131,7 +1147,7 @@ async fn handle_discovery() -> Response {
                     "GET /openapi.yaml": {"auth": "none", "body": null, "hint": "OpenAPI 3.x specification (YAML)"}
                 },
                 "participant": {
-                    "POST /register": {"auth": "none", "body": null, "hint": "Mint a new participant token"},
+                    "POST /register": {"auth": "governor", "body": "{name?}", "hint": "Governor issues a participant token; with {name} atomically rebinds an existing identity. Open during bootstrap (no governor)."},
                     "POST /listen": {"auth": "participant", "body": "{name?}", "hint": "Open SSE stream; optional name to auto-announce"},
                     "DELETE /listen": {"auth": "participant", "body": null, "hint": "Close SSE stream, unbind name"},
                     "POST /announce": {"auth": "participant", "body": "{name}", "hint": "Claim a name for this token"},
@@ -1289,12 +1305,82 @@ fn sanitize_filename(name: &str) -> String {
 }
 
 // ── POST /register ─────────────────────────────────────────────────────────────
-// Mint a new participant token for future /listen use.
-// No authentication required (anyone can register, same as anonymous /listen before).
+// Governor-gated participant token issuance (15-0029 / FG-2).
+//
+//   Authorization: Bearer <governor-token>        (required once a governor is active)
+//   Body (optional): {"name": "<existing-identity>"}   → atomic governor rebind
+//
+//   200 → {token}            (no name → fresh unbound token)
+//   200 → {token, name}      (with name → token bound to the identity)
+//   401 → no/invalid governor bearer when a governor is active
+//   403 → bearer is a valid participant token (not a governor)
+//   404 → name given but not a registered identity
+//   503 → bootstrap window closed by timeout with no governor established
+//
+// Bootstrap window: while no governor exists, /register is open (no auth). Each use logs WARN.
+async fn handle_register(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Option<Json<serde_json::Value>>,
+) -> Response {
+    let name = body
+        .as_ref()
+        .and_then(|b| b.0.get("name"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
-async fn handle_register(State(state): State<Arc<AppState>>) -> Response {
-    let token = state.hub.register_participant();
-    (StatusCode::OK, Json(json!({"token": token}))).into_response()
+    if !state.hub.has_active_governor() {
+        // Bootstrap escape hatch (chicken-and-egg): open registration until a governor exists.
+        if let Some(deadline) = state.bootstrap_deadline
+            && Instant::now() > deadline
+        {
+            eprintln!("BOOTSTRAP TIMEOUT: no governor established; closing registration window");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "bootstrap window closed; contact operator"})),
+            )
+                .into_response();
+        }
+        let token = state.hub.register_participant();
+        eprintln!("WARN: POST /register served via open bootstrap window (no active governor)");
+        return (StatusCode::OK, Json(json!({"token": token}))).into_response();
+    }
+
+    // A governor is active — a governor bearer is required.
+    let bearer = match bearer_token(&headers) {
+        Some(b) => b,
+        None => return auth_failed(),
+    };
+    // 403 (not 401) when the presenter is a participant token (completeness-M3).
+    if state.hub.is_participant_token(&bearer) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "FORBIDDEN",
+                "message": "a participant token cannot register participants; present the governor token"
+            })),
+        )
+            .into_response();
+    }
+    let gov = GovernorToken(bearer);
+    match state.hub.issue_participant_token(&gov, name.as_deref()) {
+        Ok((token, Some(name))) => {
+            (StatusCode::OK, Json(json!({"token": token, "name": name}))).into_response()
+        }
+        Ok((token, None)) => (StatusCode::OK, Json(json!({"token": token}))).into_response(),
+        Err(Error::RecipientUnknown) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "RECIPIENT_UNKNOWN", "message": "name not found in identities"})),
+        )
+            .into_response(),
+        Err(Error::Forbidden) => (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "FORBIDDEN", "message": "governor token required"})),
+        )
+            .into_response(),
+        // Invalid/expired governor bearer → 401.
+        Err(e) => err_response(e),
+    }
 }
 
 // ── POST /listen ──────────────────────────────────────────────────────────────

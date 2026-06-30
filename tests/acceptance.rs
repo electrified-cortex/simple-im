@@ -10,6 +10,9 @@ use tokio::net::TcpListener;
 
 struct TestServer {
     base_url: String,
+    /// Governor bearer used for governor-gated POST /register (15-0029 / FG-2). None in the
+    /// bootstrap (no-governor) case, where /register is open.
+    gov: Option<String>,
 }
 
 impl TestServer {
@@ -23,6 +26,7 @@ impl TestServer {
         });
         TestServer {
             base_url: format!("http://127.0.0.1:{}", addr.port()),
+            gov: None,
         }
     }
 
@@ -42,6 +46,7 @@ impl TestServer {
         (
             TestServer {
                 base_url: format!("http://127.0.0.1:{}", addr.port()),
+                gov: Some(gov_tok.clone()),
             },
             gov_tok,
         )
@@ -56,9 +61,15 @@ impl TestServer {
     }
 }
 
-/// POST /register — mint a fresh token (new-participant flow).
+/// POST /register — mint a fresh token (new-participant flow). Governor-aware: when the server
+/// has an active governor (15-0029 / FG-2), the governor bearer is supplied; otherwise the
+/// bootstrap window is used (no bearer).
 async fn register_participant_tok(server: &TestServer, client: &reqwest::Client) -> String {
-    let r = client.post(server.url("/register")).send().await.unwrap();
+    let mut req = client.post(server.url("/register"));
+    if let Some(ref gov) = server.gov {
+        req = req.header("Authorization", format!("Bearer {}", gov));
+    }
+    let r = req.send().await.unwrap();
     assert_eq!(r.status(), StatusCode::OK, "POST /register failed");
     let body: Value = r.json().await.unwrap();
     body["token"].as_str().unwrap().to_owned()
@@ -2265,6 +2276,7 @@ async fn spawn_server_with_ttl(liveness_secs: u64) -> TestServer {
     });
     TestServer {
         base_url: format!("http://127.0.0.1:{}", addr.port()),
+        gov: None,
     }
 }
 
@@ -2284,6 +2296,7 @@ async fn spawn_server_with_governor_ttl(liveness_secs: u64) -> (TestServer, Stri
     (
         TestServer {
             base_url: format!("http://127.0.0.1:{}", addr.port()),
+            gov: Some(gov_tok.clone()),
         },
         gov_tok,
     )
@@ -4857,5 +4870,196 @@ async fn ac_room_grant_existing_no_room() {
         StatusCode::OK,
         "grant request must return 200 when requester already holds an active grant with target (no shared room required): got {}",
         rg.json::<Value>().await.unwrap_or_default()
+    );
+}
+
+// ── 15-0029 S3: POST /register governor gate ────────────────────────────────────
+
+/// Announce `name` on a fresh participant token, creating its identity record. Keeps the SSE
+/// open via the returned join handle.
+async fn make_identity(
+    server: &TestServer,
+    client: &reqwest::Client,
+    name: &str,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let (tok, handle) = listen_get_token(server, client, None).await;
+    let r = client
+        .post(server.url("/announce"))
+        .header("Authorization", format!("Bearer {}", tok))
+        .json(&json!({ "name": name }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::NO_CONTENT, "announce {name} failed");
+    (tok, handle)
+}
+
+/// EPIC-AC-1 / S3-AC-1: POST /register with no bearer when a governor is active → 401.
+#[tokio::test]
+async fn test_register_401_when_governor_active() {
+    let (server, _gov) = TestServer::spawn_with_governor().await;
+    let client = server.client();
+    let r = client.post(server.url("/register")).send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// EPIC-AC-2 / S3-AC-2: POST /register with a valid governor bearer → 200 with numeric token.
+#[tokio::test]
+async fn test_register_200_with_governor_bearer() {
+    let (server, gov) = TestServer::spawn_with_governor().await;
+    let client = server.client();
+    let r = client
+        .post(server.url("/register"))
+        .header("Authorization", format!("Bearer {}", gov))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let body: Value = r.json().await.unwrap();
+    let tok = body["token"].as_str().unwrap();
+    assert!(tok.chars().all(|c| c.is_ascii_digit()) && tok.len() >= 8);
+}
+
+/// EPIC-AC-3 / S3-AC-3: POST /register with a participant bearer → 403 (not 401).
+#[tokio::test]
+async fn test_register_403_with_participant_bearer() {
+    let (server, _gov) = TestServer::spawn_with_governor().await;
+    let client = server.client();
+    // Obtain a participant token (governor-gated register helper supplies the gov bearer).
+    let ptok = register_participant_tok(&server, &client).await;
+    let r = client
+        .post(server.url("/register"))
+        .header("Authorization", format!("Bearer {}", ptok))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+}
+
+/// EPIC-AC-4 / S3-AC-4: POST /register with no bearer when no governor exists → 200 (bootstrap).
+#[tokio::test]
+async fn test_register_200_bootstrap_no_governor() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+    let r = client.post(server.url("/register")).send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+}
+
+/// S3-AC-5 / EPIC-AC-7: governor rebind with {name} issues a new token, invalidates the old,
+/// and the new token can announce the name without a 409.
+#[tokio::test]
+async fn test_governor_rebind_issues_new_token_invalidates_old() {
+    let (server, gov) = TestServer::spawn_with_governor().await;
+    let client = server.client();
+    let (t1, _s1) = make_identity(&server, &client, "Alice").await;
+
+    let r = client
+        .post(server.url("/register"))
+        .header("Authorization", format!("Bearer {}", gov))
+        .json(&json!({"name": "Alice"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let body: Value = r.json().await.unwrap();
+    let t2 = body["token"].as_str().unwrap().to_string();
+    assert_eq!(body["name"], "Alice");
+    assert_ne!(t2, t1, "rebind must issue a new token");
+
+    // Old token T1 is now invalid.
+    let r1 = client
+        .post(server.url("/announce"))
+        .header("Authorization", format!("Bearer {}", t1))
+        .json(&json!({"name": "Alice"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::UNAUTHORIZED);
+
+    // New token T2 can announce "Alice" without a 409.
+    let r2 = client
+        .post(server.url("/announce"))
+        .header("Authorization", format!("Bearer {}", t2))
+        .json(&json!({"name": "Alice"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::NO_CONTENT);
+}
+
+/// S3-AC-9: governor rebind of an unknown name → 404.
+#[tokio::test]
+async fn test_s3_register_404_unknown_name() {
+    let (server, gov) = TestServer::spawn_with_governor().await;
+    let client = server.client();
+    let r = client
+        .post(server.url("/register"))
+        .header("Authorization", format!("Bearer {}", gov))
+        .json(&json!({"name": "Nobody"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::NOT_FOUND);
+}
+
+/// S3-AC-10: with a bootstrap deadline elapsed and no governor, /register → 503; if the deadline
+/// is still in the future, /register → 200. (Deterministic past/future deadlines, no real wait.)
+#[tokio::test]
+async fn test_s3_bootstrap_timeout_closes_window() {
+    use std::time::Instant;
+
+    async fn spawn_with_deadline(deadline: Option<Instant>) -> TestServer {
+        let mut state = AppState::new(Duration::from_secs(30));
+        state.bootstrap_deadline = deadline;
+        let state = Arc::new(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = simple_im::http::router(Arc::clone(&state));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        TestServer {
+            base_url: format!("http://127.0.0.1:{}", addr.port()),
+            gov: None,
+        }
+    }
+
+    // Closed window (deadline in the past) → 503.
+    let closed = spawn_with_deadline(Some(Instant::now() - Duration::from_secs(1))).await;
+    let r = closed
+        .client()
+        .post(closed.url("/register"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    // Open window (deadline in the future) → 200.
+    let open = spawn_with_deadline(Some(Instant::now() + Duration::from_secs(60))).await;
+    let r2 = open
+        .client()
+        .post(open.url("/register"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), StatusCode::OK);
+}
+
+/// S3-AC-11: discovery marks POST /register as governor auth and the announce entry has no force.
+#[tokio::test]
+async fn test_s3_discovery_governor_auth_hint() {
+    let server = TestServer::spawn().await;
+    let r = server.client().get(server.url("/")).send().await.unwrap();
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(
+        body["routes"]["participant"]["POST /register"]["auth"],
+        "governor"
+    );
+    let announce_body = body["routes"]["participant"]["POST /announce"]["body"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        !announce_body.contains("force"),
+        "announce discovery body must not mention force: {announce_body}"
     );
 }
