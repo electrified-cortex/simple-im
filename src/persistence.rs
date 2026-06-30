@@ -176,6 +176,21 @@ impl TokenStore {
         .execute(&self.pool)
         .await?;
 
+        // 15-0029 S1 / FG-7: permanent identities table — a name's record must survive
+        // token GC (a token is a replaceable credential; the identity/name is permanent).
+        // Step 1 of the zero-debt migration plan. Additive and idempotent. The remaining
+        // migration steps (2a/2b backfill, identity-column fix, listen→participant rename,
+        // agent/orphan purge, name-column drop) land together with the delivery.rs startup
+        // partition + name-restore fix (BLOCKER-5) so startup never drops live sessions.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS identities (
+                name        TEXT PRIMARY KEY,
+                created_at  TEXT NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
         Ok(())
     }
 
