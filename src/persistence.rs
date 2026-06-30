@@ -406,6 +406,35 @@ impl TokenStore {
         Ok(())
     }
 
+    /// Operator-anchored governor reset (15-0029 / security-MAJOR-1/2): delete the revoked
+    /// governor rows and insert the new governor in a SINGLE transaction, so a crash cannot
+    /// leave the hub with no durable governor.
+    pub async fn reset_governors(
+        &self,
+        delete_ids: &[String],
+        new_token: &str,
+    ) -> Result<(), sqlx::Error> {
+        let now = system_time_to_secs_str(SystemTime::now());
+        let mut tx = self.pool.begin().await?;
+        for id in delete_ids {
+            sqlx::query("DELETE FROM tokens WHERE token = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        sqlx::query(
+            "INSERT OR REPLACE INTO tokens (token, identity, token_type, expires_at, created_at, name) \
+             VALUES (?, ?, 'governor', NULL, ?, NULL)",
+        )
+        .bind(new_token)
+        .bind(new_token)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn upsert_grant(
         &self,

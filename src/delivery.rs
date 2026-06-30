@@ -2564,17 +2564,41 @@ impl DeliveryHub {
         self.lock().trust.transfer_governor(from, to_identity)
     }
 
-    /// Accept a pending governor transfer. Revokes the initiating governor; returns new gov token.
+    /// Accept a pending governor transfer (FG-5 / security-MAJOR-3). The claiming identity is
+    /// derived from the **verified participant bearer** — never from the request body. `bearer`
+    /// must be a current named participant token. Revokes the initiating governor; returns the
+    /// new governor token.
+    ///
+    /// Errors: `AuthFailed` (bearer is not a named participant), `RecipientUnknown` (transfer
+    /// token not found or already consumed → 404), `Forbidden` (transfer's to_identity is set
+    /// and does not match the bearer's name → 403).
     pub fn accept_governor_transfer(
         &self,
+        bearer: &str,
         transfer_token: &str,
-        claiming_identity: &str,
     ) -> Result<GovernorToken, Error> {
         let (new_token, expiry_instant) = {
             let mut inner = self.lock();
-            let new_token = inner
-                .trust
-                .accept_governor_transfer(transfer_token, claiming_identity)?;
+            // Resolve the claiming identity from the verified participant bearer.
+            let is_live_participant = inner
+                .listen_tokens
+                .get(bearer)
+                .map(|s| !s.revoked)
+                .unwrap_or(false);
+            if !is_live_participant {
+                return Err(Error::AuthFailed);
+            }
+            let name = inner
+                .token_to_name
+                .get(bearer)
+                .cloned()
+                .ok_or(Error::AuthFailed)?;
+            let new_token = match inner.trust.accept_governor_transfer(transfer_token, &name) {
+                Ok(t) => t,
+                // trust returns AuthFailed when the transfer token is unknown/consumed → 404.
+                Err(Error::AuthFailed) => return Err(Error::RecipientUnknown),
+                Err(e) => return Err(e),
+            };
             let expiry_instant = inner.trust.governor_expiry(&new_token);
             (new_token, expiry_instant)
         };
@@ -2591,6 +2615,30 @@ impl DeliveryHub {
             });
         }
         Ok(new_token)
+    }
+
+    /// Operator-anchored governor reset (POST /admin/governor/reset). In one locked section:
+    /// revoke every current governor, clear all pending transfers (so an in-flight transfer
+    /// cannot bypass the revoke), and install a fresh governor. The state change is committed to
+    /// SQLite in a single transaction (DELETE old governors + INSERT new) — no crash window
+    /// between revoke and install. Returns the new governor token. (security-MAJOR-1/2, M2)
+    pub fn admin_reset_governor(&self) -> GovernorToken {
+        let (new_token, revoked) = {
+            let mut inner = self.lock();
+            let revoked = inner.trust.revoke_all_governors();
+            inner.trust.clear_pending_transfers();
+            let new_token = inner.trust.install_governor(None);
+            (new_token, revoked)
+        };
+        if let Some(store) = self.token_store.clone() {
+            let new = new_token.0.clone();
+            self.db_write(async move {
+                if let Err(e) = store.reset_governors(&revoked, &new).await {
+                    eprintln!("WARNING: admin governor reset DB write failed: {e}");
+                }
+            });
+        }
+        new_token
     }
 
     /// Rotate the caller's governor token atomically. Old token is immediately invalidated.
@@ -7815,6 +7863,41 @@ mod tests {
         let hub = DeliveryHub::new(Duration::from_secs(30));
         let forged = GovernorToken("not-a-governor".to_string());
         assert!(hub.issue_participant_token(&forged, None).is_err());
+    }
+
+    // ── 15-0029 S5: admin reset durability ─────────────────────────────────────
+
+    /// S5-AC-6: admin reset commits revoke + install in one transaction; after a restart the new
+    /// governor is durable and the old one is gone (no permanently-open bootstrap window).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_s5_admin_reset_single_transaction() {
+        let db = unique_test_db();
+        let (old_gov, new_gov) = {
+            let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
+            let g1 = hub.install_governor(None);
+            let g2 = hub.admin_reset_governor();
+            assert_ne!(g1.0, g2.0);
+            // In-memory: old revoked, new valid.
+            assert!(hub.validate_governor_token(&g1).is_err());
+            assert!(hub.validate_governor_token(&g2).is_ok());
+            (g1, g2)
+        };
+
+        // Restart from the same DB: the new governor is durable; the old is gone.
+        let hub2 = make_persisted_hub(&db, Duration::from_secs(30)).await;
+        assert!(
+            hub2.validate_governor_token(&new_gov).is_ok(),
+            "new governor must be durable after restart"
+        );
+        assert!(
+            hub2.validate_governor_token(&old_gov).is_err(),
+            "old governor must be gone after restart"
+        );
+        assert!(
+            hub2.has_active_governor(),
+            "a governor must exist after restart (no permanently-open bootstrap)"
+        );
+        let _ = std::fs::remove_file(&db);
     }
 
     // ── Attachments (native file/attachment send) ────────────────────────────────

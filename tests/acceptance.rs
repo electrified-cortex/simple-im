@@ -2954,14 +2954,19 @@ async fn ac_lid5_long_poll_returns_200_when_message_arrives() {
     assert!(id >= 1, "returned ID must be ≥ 1, got {}", id);
 }
 
-// ── AC-GT1: POST /governors/accept-transfer reads token from Authorization header ─
+// ── AC-GT1: POST /governors/accept-transfer requires a verified participant bearer ─
+// (15-0029 / FG-5: the claimer's identity is derived from the participant bearer; the transfer
+// token travels in the body.)
 
 #[tokio::test]
-async fn ac_gt1_accept_transfer_reads_token_from_auth_header() {
+async fn ac_gt1_accept_transfer_requires_participant_bearer() {
     let (server, gov_token) = TestServer::spawn_with_governor().await;
     let client = server.client();
 
-    // Initiate a governor transfer — returns a one-time transfer_token.
+    // A named participant "Alice" who will claim governorship.
+    let (alice_tok, _s) = make_identity(&server, &client, "Alice").await;
+
+    // Initiate an unrestricted governor transfer — returns a one-time transfer_token.
     let transfer_resp = client
         .post(server.url("/governors/transfer"))
         .header("Authorization", format!("Bearer {}", gov_token))
@@ -2969,60 +2974,37 @@ async fn ac_gt1_accept_transfer_reads_token_from_auth_header() {
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        transfer_resp.status(),
-        StatusCode::OK,
-        "transfer initiation should succeed"
-    );
-    let transfer_body: Value = transfer_resp.json().await.unwrap();
-    let transfer_token = transfer_body["transfer_token"]
+    assert_eq!(transfer_resp.status(), StatusCode::OK);
+    let transfer_token = transfer_resp.json::<Value>().await.unwrap()["transfer_token"]
         .as_str()
         .expect("missing transfer_token")
         .to_string();
 
-    // Accept the transfer — transfer_token goes in Authorization header, name goes in body.
-    let accept_resp = client
+    // No bearer → 401.
+    let no_auth = client
         .post(server.url("/governors/accept-transfer"))
-        .header("Authorization", format!("Bearer {}", transfer_token))
-        .json(&json!({"name": "new-governor"}))
+        .json(&json!({"transfer_token": transfer_token}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(no_auth.status(), StatusCode::UNAUTHORIZED);
+
+    // Accept with the participant bearer + transfer_token in body → 200.
+    let accept = client
+        .post(server.url("/governors/accept-transfer"))
+        .header("Authorization", format!("Bearer {}", alice_tok))
+        .json(&json!({"transfer_token": transfer_token}))
         .send()
         .await
         .unwrap();
     assert_eq!(
-        accept_resp.status(),
+        accept.status(),
         StatusCode::OK,
         "accept-transfer should succeed"
     );
-    let accept_body: Value = accept_resp.json().await.unwrap();
     assert!(
-        accept_body["token"].is_string(),
+        accept.json::<Value>().await.unwrap()["token"].is_string(),
         "response must contain new governor token"
-    );
-
-    // Calling without Authorization header must return 401.
-    let no_auth_resp = client
-        .post(server.url("/governors/accept-transfer"))
-        .json(&json!({"name": "intruder"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        no_auth_resp.status(),
-        StatusCode::UNAUTHORIZED,
-        "missing Authorization header must return 401"
-    );
-
-    // Calling with transfer_token in body (old pattern) and no Authorization header must also return 401.
-    let old_pattern_resp = client
-        .post(server.url("/governors/accept-transfer"))
-        .json(&json!({"transfer_token": transfer_token, "name": "intruder"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        old_pattern_resp.status(),
-        StatusCode::UNAUTHORIZED,
-        "transfer_token in body (old pattern) must not be accepted"
     );
 }
 
@@ -5062,4 +5044,235 @@ async fn test_s3_discovery_governor_auth_hint() {
         !announce_body.contains("force"),
         "announce discovery body must not mention force: {announce_body}"
     );
+}
+
+// ── 15-0029 S5: governor transfer security + operator-anchored admin reset ───────
+
+/// Spawn a server with a governor AND an admin secret (injected, not via env to avoid races).
+async fn spawn_with_governor_and_admin(secret: Option<&str>) -> (TestServer, String) {
+    use simple_im::delivery::DeliveryHub;
+    let hub = DeliveryHub::new(Duration::from_secs(30));
+    let gov = hub.install_governor(None);
+    let gov_tok = gov.0.clone();
+    let mut state = AppState::new_with_hub(hub);
+    state.admin_secret = secret.map(|s| s.to_string());
+    let state = Arc::new(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = simple_im::http::router(Arc::clone(&state));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (
+        TestServer {
+            base_url: format!("http://127.0.0.1:{}", addr.port()),
+            gov: Some(gov_tok.clone()),
+        },
+        gov_tok,
+    )
+}
+
+async fn make_transfer_token(
+    server: &TestServer,
+    client: &reqwest::Client,
+    gov: &str,
+    to: Option<&str>,
+) -> String {
+    let body = match to {
+        Some(n) => json!({"to": n}),
+        None => json!({}),
+    };
+    let r = client
+        .post(server.url("/governors/transfer"))
+        .header("Authorization", format!("Bearer {}", gov))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    r.json::<Value>().await.unwrap()["transfer_token"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// EPIC-AC-28 / S5-AC-8: accept-transfer requires a participant bearer.
+#[tokio::test]
+async fn test_governor_transfer_requires_participant_bearer() {
+    let (server, gov) = TestServer::spawn_with_governor().await;
+    let client = server.client();
+    let (alice, _s) = make_identity(&server, &client, "Alice").await;
+    let transfer = make_transfer_token(&server, &client, &gov, None).await;
+
+    // No bearer → 401.
+    let r = client
+        .post(server.url("/governors/accept-transfer"))
+        .json(&json!({"transfer_token": transfer}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+
+    // Governor bearer → 403.
+    let r = client
+        .post(server.url("/governors/accept-transfer"))
+        .header("Authorization", format!("Bearer {}", gov))
+        .json(&json!({"transfer_token": transfer}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+
+    // Participant bearer + valid transfer → 200.
+    let r = client
+        .post(server.url("/governors/accept-transfer"))
+        .header("Authorization", format!("Bearer {}", alice))
+        .json(&json!({"transfer_token": transfer}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+}
+
+/// EPIC-AC-29 / S5-AC-9: transfer to_identity is verified against the bearer's name.
+#[tokio::test]
+async fn test_governor_transfer_identity_verified_against_bearer() {
+    let (server, gov) = TestServer::spawn_with_governor().await;
+    let client = server.client();
+    let (alice, _sa) = make_identity(&server, &client, "Alice").await;
+    let (bob, _sb) = make_identity(&server, &client, "Bob").await;
+
+    // Transfer bound to "Alice".
+    let transfer = make_transfer_token(&server, &client, &gov, Some("Alice")).await;
+
+    // Bob (wrong identity) presents the transfer → 403.
+    let r = client
+        .post(server.url("/governors/accept-transfer"))
+        .header("Authorization", format!("Bearer {}", bob))
+        .json(&json!({"transfer_token": transfer}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+
+    // Alice (correct identity) presents the transfer → 200.
+    let r = client
+        .post(server.url("/governors/accept-transfer"))
+        .header("Authorization", format!("Bearer {}", alice))
+        .json(&json!({"transfer_token": transfer}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+}
+
+/// EPIC-AC-13 / S5-AC-1: admin reset with the correct secret → 200 {governor_token}.
+#[tokio::test]
+async fn test_admin_reset_returns_governor_token() {
+    let (server, _gov) = spawn_with_governor_and_admin(Some("anchor-secret")).await;
+    let client = server.client();
+    let r = client
+        .post(server.url("/admin/governor/reset"))
+        .header("X-Admin-Secret", "anchor-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert!(r.json::<Value>().await.unwrap()["governor_token"].is_string());
+}
+
+/// EPIC-AC-14 / S5-AC-2: admin reset with a wrong/missing secret → 401.
+#[tokio::test]
+async fn test_admin_reset_401_wrong_secret() {
+    let (server, _gov) = spawn_with_governor_and_admin(Some("anchor-secret")).await;
+    let client = server.client();
+    let wrong = client
+        .post(server.url("/admin/governor/reset"))
+        .header("X-Admin-Secret", "nope")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+    let missing = client
+        .post(server.url("/admin/governor/reset"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// EPIC-AC-15 / S5-AC-3: after reset, the old governor token is rejected by governor endpoints.
+#[tokio::test]
+async fn test_admin_reset_invalidates_old_governor() {
+    let (server, old_gov) = spawn_with_governor_and_admin(Some("anchor-secret")).await;
+    let client = server.client();
+    let r = client
+        .post(server.url("/admin/governor/reset"))
+        .header("X-Admin-Secret", "anchor-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    // Old governor token on a governor-only endpoint → 401.
+    let participants = client
+        .get(server.url("/participants"))
+        .header("Authorization", format!("Bearer {}", old_gov))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(participants.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// EPIC-AC-26 / S5-AC-4: admin reset with the secret unset/empty → 501.
+#[tokio::test]
+async fn test_admin_reset_501_empty_secret() {
+    let (server, _gov) = spawn_with_governor_and_admin(None).await;
+    let client = server.client();
+    let r = client
+        .post(server.url("/admin/governor/reset"))
+        .header("X-Admin-Secret", "whatever")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::NOT_IMPLEMENTED);
+}
+
+/// EPIC-AC-25 / S5-AC-5: the admin endpoint is absent from the discovery document.
+#[tokio::test]
+async fn test_admin_endpoint_not_in_discovery() {
+    let server = TestServer::spawn().await;
+    let r = server.client().get(server.url("/")).send().await.unwrap();
+    let text = r.text().await.unwrap();
+    assert!(
+        !text.contains("/admin/governor/reset"),
+        "discovery must not advertise the admin reset endpoint"
+    );
+}
+
+/// EPIC-AC-27 / S5-AC-7: admin reset clears pending transfers (the transfer token becomes 404).
+#[tokio::test]
+async fn test_admin_reset_clears_pending_transfers() {
+    let (server, gov) = spawn_with_governor_and_admin(Some("anchor-secret")).await;
+    let client = server.client();
+    let (alice, _s) = make_identity(&server, &client, "Alice").await;
+    let transfer = make_transfer_token(&server, &client, &gov, None).await;
+
+    // Admin reset clears all pending transfers.
+    let reset = client
+        .post(server.url("/admin/governor/reset"))
+        .header("X-Admin-Secret", "anchor-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reset.status(), StatusCode::OK);
+
+    // The previously-issued transfer token is no longer usable → 404.
+    let accept = client
+        .post(server.url("/governors/accept-transfer"))
+        .header("Authorization", format!("Bearer {}", alice))
+        .json(&json!({"transfer_token": transfer}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accept.status(), StatusCode::NOT_FOUND);
 }
