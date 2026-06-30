@@ -7924,6 +7924,122 @@ mod tests {
         let _ = std::fs::remove_file(&db);
     }
 
+    // ── 15-0029 S7: migration seal (startup parity) ────────────────────────────
+
+    /// S7-AC-1: the migration emits a `sim_migrate:` count line with every field present.
+    #[test]
+    fn test_s7_migration_log_counts() {
+        let src = read_crate_src("src/persistence.rs");
+        let i = src
+            .find("sim_migrate:")
+            .expect("migration log line present");
+        let window = &src[i..i + 200];
+        for field in [
+            "identities_created",
+            "listen_renamed",
+            "agent_purged",
+            "orphan_purged",
+            "name_col_dropped",
+        ] {
+            assert!(
+                window.contains(field),
+                "sim_migrate log must include {field}"
+            );
+        }
+    }
+
+    /// S7-AC-2: after loading a migrated DB, the in-memory TrustChain holds no agent-type tokens
+    /// (Step-5 purge means none are loaded). (The structural removal of the agents map is S2.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_s7_no_agent_in_trustchain() {
+        let db = unique_test_db();
+        let store = TokenStore::open(&db).await.expect("open");
+        store
+            .seed_raw_token("agent-3", "id-x", "agent", None)
+            .await
+            .expect("seed agent");
+        store
+            .seed_raw_token("131313131", "Scout7", "participant", None)
+            .await
+            .expect("seed participant");
+        store.migrate_for_test().await.expect("migrate");
+        // The agent token is gone at the DB level; only governor/participant rows remain.
+        assert_eq!(store.count_tokens_by_type("agent").await.unwrap(), 0);
+        let hub = build_hub_from_store(Arc::new(store), Duration::from_secs(30)).await;
+        // A forged agent-style token does not validate as a participant.
+        assert!(hub.validate_token("agent-3").is_err());
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// S7-AC-3: legacy-DB upgrade — a named listen token survives migration, can /listen and
+    /// re-/announce; the agent token is purged.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_s7_legacy_db_upgrade() {
+        let db = unique_test_db();
+        let store = TokenStore::open(&db).await.expect("open");
+        // Legacy rows: a named, announced listen token (identity==token, name set) + an agent token.
+        store
+            .seed_raw_token("141414141", "141414141", "listen", Some("Scout7"))
+            .await
+            .expect("seed legacy listen");
+        store
+            .seed_raw_token("agent-9", "id-legacy", "agent", None)
+            .await
+            .expect("seed legacy agent");
+        store.migrate_for_test().await.expect("migrate");
+
+        let hub = build_hub_from_store(Arc::new(store), Duration::from_secs(30)).await;
+        // The previously-valid participant token still works.
+        let (tok, _rx) = hub
+            .open_listen(Some("141414141"), None, None, None, false, false)
+            .unwrap();
+        assert_eq!(tok, "141414141");
+        // Name binding restored → re-announce is idempotent (204-equivalent Bound).
+        assert!(matches!(
+            hub.announce("141414141", "Scout7"),
+            Ok(AnnounceResult::Bound)
+        ));
+        // The agent token was purged.
+        assert!(hub.validate_token("agent-9").is_err());
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// S7-AC-4: the hub flow works against BOTH a fresh DB and a migrated legacy DB.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_s7_fresh_and_migrated_db_both_pass() {
+        // Fresh DB.
+        {
+            let db = unique_test_db();
+            let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
+            let reg = hub.register_participant();
+            let (tok, _rx) = hub
+                .open_listen(Some(&reg), None, None, None, false, false)
+                .unwrap();
+            hub.announce(&tok, "FreshOne").unwrap();
+            assert_eq!(
+                hub.validate_token(&tok).unwrap().as_deref(),
+                Some("FreshOne")
+            );
+            let _ = std::fs::remove_file(&db);
+        }
+        // Migrated legacy DB.
+        {
+            let db = unique_test_db();
+            let store = TokenStore::open(&db).await.expect("open");
+            store
+                .seed_raw_token("151515151", "151515151", "listen", Some("LegacyOne"))
+                .await
+                .expect("seed");
+            store.migrate_for_test().await.expect("migrate");
+            let hub = build_hub_from_store(Arc::new(store), Duration::from_secs(30)).await;
+            assert_eq!(
+                hub.validate_token("151515151").unwrap().as_deref(),
+                Some("LegacyOne")
+            );
+            let _ = std::fs::remove_file(&db);
+        }
+    }
+
     // ── Attachments (native file/attachment send) ────────────────────────────────
 
     /// Persistence-backed hub with alice↔bob registered + granted (attachments need a store).
