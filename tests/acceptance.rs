@@ -5276,3 +5276,81 @@ async fn test_admin_reset_clears_pending_transfers() {
         .unwrap();
     assert_eq!(accept.status(), StatusCode::NOT_FOUND);
 }
+
+// ── 15-0029 S6: listen.sh reconciliation (static verification) ──────────────────
+
+fn listen_sh() -> String {
+    std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/skills/participant/listen.sh"
+    ))
+    .expect("read listen.sh")
+}
+
+/// EPIC-AC-18 / S6-AC-1: listen.sh makes no /register call.
+#[test]
+fn test_listen_sh_no_register_call() {
+    assert_eq!(
+        listen_sh().matches("/register").count(),
+        0,
+        "listen.sh must not call /register"
+    );
+}
+
+/// EPIC-AC-19 / S6-AC-2: no "force" JSON key in the announce body.
+#[test]
+fn test_listen_sh_no_force_in_announce_body() {
+    assert_eq!(
+        listen_sh().matches("\"force\"").count(),
+        0,
+        "listen.sh must not put a force field in any JSON body"
+    );
+}
+
+/// S6-AC-12: jq is used for field extraction (no grep/sed on subscription_id/token). (BT-NFR4)
+#[test]
+fn test_s6_jq_used_for_field_extraction() {
+    let s = listen_sh();
+    assert!(s.contains("jq "), "listen.sh must use jq");
+    for line in s.lines() {
+        let bad = (line.contains("grep") && line.contains("subscription_id"))
+            || (line.contains("sed") && line.contains("token"));
+        assert!(
+            !bad,
+            "no grep/sed extraction of subscription_id/token: {line}"
+        );
+    }
+}
+
+/// S6-AC-3/4/5: terminal exit codes + messages present (NAME_IN_USE=2, CREDENTIAL_LOST=3).
+#[test]
+fn test_s6_exit_codes_and_messages_present() {
+    let s = listen_sh();
+    assert!(s.contains("[SIM] NAME_IN_USE: governor rebind required"));
+    assert!(s.contains("[SIM] CREDENTIAL_LOST: governor must issue a new token"));
+    assert!(s.contains("[SIM] CREDENTIAL_LOST: session revoked"));
+    assert!(s.contains("exit 2"), "NAME_IN_USE must exit 2");
+    assert!(s.contains("exit 3"), "CREDENTIAL_LOST must exit 3");
+}
+
+/// S6-AC-10: ACTIVE_SUBSCRIPTION force on /listen is retained (same-token reclaim).
+#[test]
+fn test_s6_active_subscription_force_retained() {
+    let s = listen_sh();
+    assert!(s.contains("ACTIVE_SUBSCRIPTION"));
+    assert!(
+        s.contains("force=true"),
+        "listen subscription-level force must be retained"
+    );
+}
+
+/// S6-AC-6/7: subscription_id is captured from the welcome and persisted to the token file.
+#[test]
+fn test_s6_subscription_id_captured() {
+    let s = listen_sh();
+    assert!(s.contains(".subscription_id"));
+    assert!(
+        s.contains("> \"$TOKEN_FILE\"") || s.contains(">\"$TOKEN_FILE\""),
+        "subscription_id must be persisted to the token file"
+    );
+}

@@ -8,15 +8,15 @@ triggers: ["be governor", "governor role", "mediate message", "approve connectio
 
 You govern S-IM. **Use the same host you fetched this skill from** as your `<SIM_BASE_URL>`. All requests: `Authorization: Bearer <governor-token>`, `Content-Type: application/json`.
 
-Your job: approve grants, mediate held messages, revoke tokens, resolve NAME_IN_USE collisions. You are mostly idle — established bypass grants flow without you.
+Your job: **issue participant tokens**, approve grants, mediate held messages, revoke tokens, rebind lost identities, resolve NAME_IN_USE collisions. You are mostly idle — established bypass grants flow without you.
 
 ## How governors are obtained
 
-A governor token is obtained by claiming governorship via `POST /governors/claim`. There is no administrator who mints it for you — governors are elected or self-appointed by the participants themselves.
+A governor token is obtained by claiming governorship via `POST /governors/claim`. There is no administrator who mints it for you — governors are elected or self-appointed by the participants themselves. (An operator-anchored recovery exists; see "Operator recovery" below.)
 
 ```
 POST /governors/claim
-Authorization: Bearer <your-listen-token>
+Authorization: Bearer <your-participant-token>
 Content-Type: application/json
 {"expiry_secs": 86400}    (optional)
 ```
@@ -32,13 +32,38 @@ The outcome depends on hub state:
 **Election:** each active participant votes via:
 ```
 POST /governors/elections/{claim_id}   {"action": "approve" | "reject"}
-Authorization: Bearer <participant-listen-token>
+Authorization: Bearer <participant-token>
 ```
 On unanimous approval, the candidate receives their governor token as a `{"type":"governance","event":"governorship_granted","governor_token":"..."}` event on their own SSE feed.
 
 **Transfer:** the current governor votes the same way. The claim is held until they respond, even if they are temporarily offline.
 
-Persist the governor token securely. On service redeploy or restart with in-memory mode, existing in-memory tokens are lost — reclaim governorship via `POST /governors/claim` from your listen token (which persists in the SQLite store and survives restarts).
+Persist the governor token securely. On service redeploy or restart with in-memory mode, existing in-memory tokens are lost — reclaim governorship via `POST /governors/claim` from your participant token (which persists in the SQLite store and survives restarts), or, as the operator anchor, via `POST /admin/governor/reset` (see "Operator recovery").
+
+## Issue and rebind participant tokens (POST /register)
+
+Participants do **not** self-register once a governor is active. You issue their credentials.
+
+**Issue a fresh token** (new participant):
+```
+POST /register
+Authorization: Bearer <governor-token>
+→ 200 {"token":"<participant-token>"}
+```
+Deliver the token to the participant out-of-band (DM, config, env var).
+
+**Rebind a lost/compromised identity** (the recovery path — replaces force-reclaim):
+```
+POST /register
+Authorization: Bearer <governor-token>
+{"name":"<existing-identity>"}
+→ 200 {"token":"<new-participant-token>","name":"<identity>"}
+```
+This **atomically** invalidates the identity's current token (its live stream receives
+`service/superseded` with reason `governor_rebind`) and binds a fresh token to the same name.
+The identity record and all name-keyed grants survive unchanged. The participant restarts its
+listener with the new token and re-announces. Errors: `403` if the bearer is a participant,
+`404` if the name is not a registered identity.
 
 ## Subscribe to governor events — keep running
 
@@ -170,11 +195,15 @@ Returns `{"transfer_token":"..."}`. The recipient claims governorship by voting 
 **Step 2 — Accept transfer (recipient):**
 ```
 POST /governors/accept-transfer
-Authorization: Bearer <transfer_token>
+Authorization: Bearer <recipient-participant-token>
 Content-Type: application/json
-{"name": "<new-governor-name>"}
+{"transfer_token": "<transfer-token>"}
 ```
-The `transfer_token` is a credential and **must** go in the `Authorization: Bearer` header — not in the request body. Returns `{"token":"<new-governor-token>"}`. The initiating governor's token is revoked on success.
+The recipient authenticates with **its own participant token**; the server derives the claiming
+identity from that verified bearer (never from the body). The one-time `transfer_token` travels in
+the body. Returns `{"token":"<new-governor-token>"}`; the initiating governor is revoked on success.
+Errors: `401` (no/invalid participant bearer), `403` (a governor bearer, or the transfer's bound
+`to` identity does not match the bearer's name), `404` (transfer token not found or already consumed).
 
 ## Refresh your governor token
 
@@ -196,19 +225,25 @@ Authorization: Bearer <governor-token>
 
 This is atomic: the token is invalid AND the SSE is closed by the time the call returns. Any subsequent call with the revoked token returns `TOKEN_REVOKED`.
 
-## Handle NAME_IN_USE (async resolution)
+## Handle NAME_IN_USE (governor rebind is the only reclaim path)
 
-When a participant announces a name held by another live participant, the announcer gets:
+When a participant announces a name held by another credential — or a registered identity whose
+token was lost/revoked (orphaned) — the announcer gets:
 
 ```json
-{"error":"NAME_IN_USE","message":"name is currently in use","resolution_stream":"/sessions/<name>/events"}
+{"error":"NAME_IN_USE","message":"name is currently in use","resolution":"contact the governor to rebind your identity to a new credential"}
 ```
 
-The original holder's SSE continues to carry events. Resolution options:
-1. **Approve eviction:** call `DELETE /participants/<name>` to force-deregister the holder. The announcer can then retry `POST /announce`.
-2. **Deny:** do nothing (or notify the announcer via their SSE).
+There is **no force-reclaim and no auto-eviction** (even when the holder's SSE is stale, a
+*different* token can never take the name — this closes the cross-token impersonation hole).
+Resolution is always a governor decision:
 
-If the holder's SSE goes stale (liveness window elapsed with no active SSE), the server auto-evicts on the next announce attempt — no governor action needed.
+1. **Rebind the identity to the requester** (the requester is the legitimate owner who lost their
+   token): `POST /register {"name":"<name>"}` → deliver the new token. The old token is invalidated
+   atomically and the requester re-announces.
+2. **Evict the current holder** (the name should change hands): `DELETE /participants/<name>` clears
+   the live session and name binding (the identity record persists), then issue/rebind as needed.
+3. **Deny:** do nothing.
 
 ## Handle concurrent-use alert
 
@@ -222,10 +257,30 @@ Decision options:
 1. **Allow** (ignore): the participant reconnected from a new network — normal behavior.
 2. **Revoke** (suspicious): call `DELETE /participants/<name>` where the participant is registered.
 
+## Operator recovery (admin reset)
+
+If governorship is lost entirely (no governor token, no live participant to elect from), the
+operator anchor recovers it. This endpoint is **operator-only**, gated by a shared secret, and is
+deliberately absent from the discovery document:
+
+```
+POST /admin/governor/reset
+X-Admin-Secret: <SIMPLE_IM_ADMIN_SECRET value>
+→ 200 {"governor_token":"<new-governor-token>"}
+→ 401 missing/wrong secret
+→ 501 SIMPLE_IM_ADMIN_SECRET unset or empty
+```
+
+The reset atomically revokes all current governors, clears any pending transfer tokens (so an
+in-flight transfer cannot bypass the revoke), and installs a fresh governor — committed to the
+database in a single transaction. Existing governor rotation (`POST /governors/refresh`) is
+unchanged.
+
 ## Rules
 
 - Keep the governor SSE stream running — inspect holds expire in ~60 s.
 - Never auto-approve no-reason or suspicious requests.
 - `notify` events need no response — log for awareness only.
-- Revoking a token is atomic and irreversible — the participant must re-register from scratch.
+- Revoking a token is atomic and irreversible — issue a new credential via `POST /register` (with
+  `{"name"}` to rebind the same identity). The participant does not self-recover.
 - Concurrent-use alerts are informational only; you decide whether to act.
