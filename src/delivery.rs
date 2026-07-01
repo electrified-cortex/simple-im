@@ -8,7 +8,6 @@ use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
-use tokio::time::timeout;
 
 use crate::error::Error;
 use crate::persistence::{
@@ -147,16 +146,6 @@ pub enum ApproveStatus {
     PendingRecipient,
     /// Both parties approved; the grant is now active.
     Established,
-}
-
-/// Result of responding to a bilateral connection request.
-pub enum RespondStatus {
-    /// This party approved but the other party has not yet acted.
-    WaitingForOther,
-    /// Both parties approved and the grant is established.
-    Established { to_name: String },
-    /// One party denied the request.
-    Denied { from_name: String },
 }
 
 /// Result of a dequeue or long-poll operation.
@@ -384,8 +373,8 @@ impl HubInner {
     fn grant_peer_senders(&self, name: &str) -> Vec<mpsc::UnboundedSender<String>> {
         // Resolve the identity for this named agent.
         // INVARIANT: grant_peer_senders is always called before removing the agent from
-        // `self.agents` (see deregister, governor_deregister, revoke_by_name, revoke_token,
-        // cancel_listen, close_listen, announce — all collect senders before cleanup).
+        // `self.agents` (see revoke_by_name, revoke_token, cancel_listen, close_listen,
+        // announce — all collect senders before cleanup).
         // Falls back to `name` to avoid panicking on unexpected call ordering.
         let identity = self
             .agents
@@ -1438,33 +1427,6 @@ impl DeliveryHub {
         Ok(resolution)
     }
 
-    /// Governor-minted agent token for a given identity, persisted if a token store is configured.
-    pub fn mint_participant_token(
-        &self,
-        gov: &GovernorToken,
-        identity: &str,
-        expiry: Option<Duration>,
-    ) -> Result<ParticipantToken, Error> {
-        let token = self
-            .lock()
-            .trust
-            .mint_participant_token(gov, identity, expiry)?;
-        if let Some(store) = self.token_store.clone() {
-            let tok = token.0.clone();
-            let id = identity.to_string();
-            let expires_at = expiry.map(|d| SystemTime::now() + d.min(crate::types::MAX_EXPIRY));
-            self.db_write(async move {
-                if let Err(e) = store
-                    .upsert_token(&tok, &id, "agent", expires_at, None)
-                    .await
-                {
-                    eprintln!("WARNING: token store write failed: {e}");
-                }
-            });
-        }
-        Ok(token)
-    }
-
     /// Establish a symmetric grant between two identities using default options.
     pub fn approve_grant(
         &self,
@@ -1551,131 +1513,6 @@ impl DeliveryHub {
         Ok(grant_id)
     }
 
-    /// Register an agent. Re-registration refreshes liveness and the dequeue notify.
-    /// Any messages queued for this agent during offline periods remain intact.
-    /// Register a name for an agent token, making the agent reachable by that name.
-    pub fn register(
-        &self,
-        name: &str,
-        token: &ParticipantToken,
-        scope: PresenceScope,
-    ) -> Result<(), Error> {
-        let mut inner = self.lock();
-        inner.trust.validate_participant_token(token)?;
-        let identity = inner
-            .trust
-            .participant_identity(token)
-            .ok_or(Error::AuthFailed)?
-            .to_string();
-        inner
-            .registry
-            .register(name, ParticipantIdentity::valid(&identity), scope)?;
-        let notify = Arc::new(tokio::sync::Notify::new());
-        inner.agents.insert(
-            name.to_string(),
-            ParticipantState {
-                identity,
-                notify: Arc::clone(&notify),
-            },
-        );
-        inner
-            .token_to_name
-            .insert(token.0.clone(), name.to_string());
-        // Wake any waiting dequeue caller if messages were queued while offline.
-        if inner
-            .message_queues
-            .get(name)
-            .map(|q| !q.is_empty())
-            .unwrap_or(false)
-        {
-            notify.notify_one();
-        }
-        Ok(())
-    }
-
-    /// Update the presence scope for a live same-identity registration.
-    pub fn set_presence_scope(
-        &self,
-        name: &str,
-        token: &ParticipantToken,
-        scope: PresenceScope,
-    ) -> Result<(), Error> {
-        let mut inner = self.lock();
-        inner.trust.validate_participant_token(token)?;
-        let identity = inner
-            .trust
-            .participant_identity(token)
-            .ok_or(Error::AuthFailed)?
-            .to_string();
-        inner
-            .registry
-            .set_presence_scope(name, &ParticipantIdentity::valid(&identity), scope)
-    }
-
-    /// Returns true if target is online and visible to querier per scope rules.
-    /// Self-query always returns true `is_online`. Invalid token → Err(AuthFailed).
-    pub fn presence_scoped(
-        &self,
-        querier_token: &ParticipantToken,
-        target_name: &str,
-    ) -> Result<bool, Error> {
-        let inner = self.lock();
-        inner.trust.validate_participant_token(querier_token)?;
-        let querier_identity = inner
-            .trust
-            .participant_identity(querier_token)
-            .ok_or(Error::AuthFailed)?
-            .to_string();
-
-        let querier_name = inner
-            .token_to_name
-            .get(&querier_token.0)
-            .map(|s| s.as_str());
-        if querier_name == Some(target_name) {
-            return Ok(inner.is_online_effective(target_name));
-        }
-
-        let scope = match inner.presence_scope_effective(target_name) {
-            Some(s) => s,
-            None => return Ok(false),
-        };
-
-        let is_online = inner.is_online_effective(target_name);
-
-        match scope {
-            PresenceScope::Public => Ok(is_online),
-            PresenceScope::Hidden => Ok(false),
-            PresenceScope::GrantScoped => {
-                let target_identity = match inner.agents.get(target_name) {
-                    Some(state) => state.identity.clone(),
-                    None => return Ok(false),
-                };
-                // FP1 fix: resolve stable names for presence grant check too.
-                let querier_name = inner.token_to_name.get(&querier_identity).cloned();
-                let target_name_str = Some(target_name.to_string());
-                let has_grant = inner
-                    .trust
-                    .check_grant_directed_with_names(
-                        &querier_identity,
-                        &target_identity,
-                        querier_name.as_deref(),
-                        target_name_str.as_deref(),
-                    )
-                    .is_ok()
-                    || inner
-                        .trust
-                        .check_grant_directed_with_names(
-                            &target_identity,
-                            &querier_identity,
-                            target_name_str.as_deref(),
-                            querier_name.as_deref(),
-                        )
-                        .is_ok();
-                Ok(is_online && has_grant)
-            }
-        }
-    }
-
     /// Send a message (§5.3). Implements the full authorization pipeline:
     /// grant → reply window → brief auth (hold) or BriefRequired.
     /// Queues the message for registered recipients regardless of online status.
@@ -1695,34 +1532,21 @@ impl DeliveryHub {
         ) = {
             let mut inner = self.lock();
             inner.prune_expired();
-            // Unified sender auth: agents registered via /listen+/announce live in listen_tokens.
-            // TrustChain fallback retained for any governor-minted agent tokens still in flight.
-            let (from_identity, from_name) =
-                if let Some(agent_state) = inner.listen_tokens.get(&from_token.0) {
-                    if agent_state.revoked {
-                        return Err(Error::TokenRevoked);
-                    }
-                    // Fix 1: name must be bound at send time (durable registry); ghost messages rejected.
-                    let name = inner
-                        .token_to_name
-                        .get(&from_token.0)
-                        .cloned()
-                        .ok_or(Error::AnnounceRequired)?;
-                    (from_token.0.clone(), name)
-                } else {
-                    inner.trust.validate_participant_token(from_token)?;
-                    let identity = inner
-                        .trust
-                        .participant_identity(from_token)
-                        .ok_or(Error::AuthFailed)?
-                        .to_string();
-                    let name = inner
-                        .token_to_name
-                        .get(&from_token.0)
-                        .cloned()
-                        .unwrap_or_default();
-                    (identity, name)
-                };
+            // Sender auth: agents registered via /listen+/announce live in listen_tokens.
+            let agent_state = inner
+                .listen_tokens
+                .get(&from_token.0)
+                .ok_or(Error::AuthFailed)?;
+            if agent_state.revoked {
+                return Err(Error::TokenRevoked);
+            }
+            // Fix 1: name must be bound at send time (durable registry); ghost messages rejected.
+            let from_name = inner
+                .token_to_name
+                .get(&from_token.0)
+                .cloned()
+                .ok_or(Error::AnnounceRequired)?;
+            let from_identity = from_token.0.clone();
 
             // Fix 5: check for an active denial block on this sender→recipient pair before any other check.
             {
@@ -2023,31 +1847,19 @@ impl DeliveryHub {
         // Phase 1 — authenticate sender, confirm a grant covers sender→recipient (sync lock).
         let (from_identity, from_name, attachment_id) = {
             let inner = self.lock();
-            let (from_identity, from_name) = if let Some(st) = inner.listen_tokens.get(from_token) {
-                if st.revoked {
-                    return Err(Error::TokenRevoked);
-                }
-                let name = inner
-                    .token_to_name
-                    .get(from_token)
-                    .cloned()
-                    .ok_or(Error::AnnounceRequired)?;
-                (from_token.to_string(), name)
-            } else {
-                let tok = ParticipantToken(from_token.to_string());
-                inner.trust.validate_participant_token(&tok)?;
-                let identity = inner
-                    .trust
-                    .participant_identity(&tok)
-                    .ok_or(Error::AuthFailed)?
-                    .to_string();
-                let name = inner
-                    .token_to_name
-                    .get(from_token)
-                    .cloned()
-                    .unwrap_or_default();
-                (identity, name)
-            };
+            let st = inner
+                .listen_tokens
+                .get(from_token)
+                .ok_or(Error::AuthFailed)?;
+            if st.revoked {
+                return Err(Error::TokenRevoked);
+            }
+            let from_name = inner
+                .token_to_name
+                .get(from_token)
+                .cloned()
+                .ok_or(Error::AnnounceRequired)?;
+            let from_identity = from_token.to_string();
             let to_identity = match inner.agents.get(to_name) {
                 Some(s) => s.identity.clone(),
                 None => return Err(Error::RecipientUnknown),
@@ -2159,21 +1971,11 @@ impl DeliveryHub {
         // Resolve caller identity + bound name (sync lock).
         let (caller_identity, caller_name) = {
             let inner = self.lock();
-            if let Some(st) = inner.listen_tokens.get(token) {
-                if st.revoked {
-                    return Err(Error::TokenRevoked);
-                }
-                (token.to_string(), inner.token_to_name.get(token).cloned())
-            } else {
-                let tok = ParticipantToken(token.to_string());
-                inner.trust.validate_participant_token(&tok)?;
-                let id = inner
-                    .trust
-                    .participant_identity(&tok)
-                    .ok_or(Error::AuthFailed)?
-                    .to_string();
-                (id, inner.token_to_name.get(token).cloned())
+            let st = inner.listen_tokens.get(token).ok_or(Error::AuthFailed)?;
+            if st.revoked {
+                return Err(Error::TokenRevoked);
             }
+            (token.to_string(), inner.token_to_name.get(token).cloned())
         };
 
         let now = SystemTime::now()
@@ -2320,65 +2122,6 @@ impl DeliveryHub {
         Ok(MediationResult::Delivered { to_name })
     }
 
-    /// Deregister an agent by name, removing it from the roster and notifying grant-peers of its offline status.
-    pub fn deregister(&self, name: &str, token: &ParticipantToken) -> Result<(), Error> {
-        // Begin settle inside the lock (before name is removed from maps),
-        // then spawn settle task after the lock releases. (15-0002D)
-        let (settle_opt, settle_window) = {
-            let mut inner = self.lock();
-            inner.trust.validate_participant_token(token)?;
-            let identity = inner
-                .trust
-                .participant_identity(token)
-                .ok_or(Error::AuthFailed)?
-                .to_string();
-            inner
-                .registry
-                .deregister(name, ParticipantIdentity::valid(&identity))?;
-            let settle_opt = inner.begin_settle_offline(name);
-            let settle_window = inner.settle_window;
-            inner.agents.remove(name);
-            inner.token_to_name.remove(&token.0);
-            inner.active_sse_connections.remove(name);
-            inner.message_queues.remove(name);
-            inner.kick_pending.remove(name);
-            inner
-                .connection_requests
-                .retain(|_, r| r.from_name != name && r.to_name != name);
-            (settle_opt, settle_window)
-        }; // lock released
-        if let Some((senders, cancel_rx)) = settle_opt {
-            spawn_settle_task(name.to_string(), senders, settle_window, cancel_rx);
-        }
-        Ok(())
-    }
-
-    /// Governor force-deregister: removes any registered agent by name, bypassing identity check.
-    pub fn governor_deregister(&self, name: &str, gov: &GovernorToken) -> Result<(), Error> {
-        // Begin settle inside the lock (before name is removed from maps),
-        // then spawn settle task after the lock releases. (15-0002D)
-        let (settle_opt, settle_window) = {
-            let mut inner = self.lock();
-            inner.trust.validate_governor_token(gov)?;
-            let settle_opt = inner.begin_settle_offline(name);
-            let settle_window = inner.settle_window;
-            inner.registry.force_deregister(name);
-            inner.agents.remove(name);
-            inner.token_to_name.retain(|_, n| n != name);
-            inner.active_sse_connections.remove(name);
-            inner.message_queues.remove(name);
-            inner.kick_pending.remove(name);
-            inner
-                .connection_requests
-                .retain(|_, r| r.from_name != name && r.to_name != name);
-            (settle_opt, settle_window)
-        }; // lock released
-        if let Some((senders, cancel_rx)) = settle_opt {
-            spawn_settle_task(name.to_string(), senders, settle_window, cancel_rx);
-        }
-        Ok(())
-    }
-
     /// Governor-deregisters a minted agent AND revokes their listen token (if any), atomically.
     /// The SSE revocation event and presence settle task are started after the lock releases.
     pub fn revoke_by_name(&self, name: &str, gov: &GovernorToken) -> Result<(), Error> {
@@ -2388,7 +2131,7 @@ impl DeliveryHub {
             // Begin settle BEFORE removing name from maps (presence push AC4 / TR4).
             let settle_opt = inner.begin_settle_offline(name);
             let settle_window = inner.settle_window;
-            // minted-agent deregister
+            // registry + presence-map cleanup
             inner.registry.force_deregister(name);
             inner.agents.remove(name);
             inner.token_to_name.retain(|_, n| n != name);
@@ -2398,7 +2141,7 @@ impl DeliveryHub {
             inner
                 .connection_requests
                 .retain(|_, r| r.from_name != name && r.to_name != name);
-            // listen-token revoke
+            // revoke listen token, if any
             let sse_sender = if let Some(listen_tok) = inner.name_to_token.remove(name) {
                 if let Some(state) = inner.listen_tokens.get_mut(&listen_tok) {
                     state.revoked = true;
@@ -2449,13 +2192,6 @@ impl DeliveryHub {
         inner.is_online_effective(name) || inner.is_settle_pending(name)
     }
 
-    /// Validates the token and returns the registered agent name, or None.
-    pub fn registered_name(&self, token: &ParticipantToken) -> Option<String> {
-        let inner = self.lock();
-        inner.trust.validate_participant_token(token).ok()?;
-        inner.token_to_name.get(&token.0).cloned()
-    }
-
     /// Returns all active grants where the calling token's announced name is a party.
     /// Resolves the token to a name via `token_to_name`; returns `Err(AuthFailed)` if
     /// the token has no registered (announced) name.
@@ -2483,11 +2219,6 @@ impl DeliveryHub {
         let inner = self.lock();
         inner.trust.validate_governor_token(gov)?;
         Ok(inner.trust.list_all_grants(participant_filter))
-    }
-
-    /// Validates the token (existence + expiry) without checking registration.
-    pub fn validate_participant_token(&self, token: &ParticipantToken) -> Result<(), Error> {
-        self.lock().trust.validate_participant_token(token)
     }
 
     /// Validates the governor token.
@@ -2533,43 +2264,6 @@ impl DeliveryHub {
             .collect();
         result.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(result)
-    }
-
-    /// Rotate the caller's agent token atomically. Old token is immediately invalidated.
-    /// Identity and all grants remain unchanged (grants are keyed on identity, not token).
-    pub fn refresh_participant_token(
-        &self,
-        old_token: &ParticipantToken,
-    ) -> Result<ParticipantToken, Error> {
-        let (new_token, identity, expiry_instant) = {
-            let mut inner = self.lock();
-            let new_token = inner.trust.rotate_participant_token(old_token)?;
-            let identity = inner
-                .trust
-                .participant_identity(&new_token)
-                .map(|s| s.to_string());
-            let expiry_instant = inner.trust.participant_expiry(&new_token);
-            if let Some(name) = inner.token_to_name.remove(&old_token.0) {
-                inner.token_to_name.insert(new_token.0.clone(), name);
-            }
-            (new_token, identity, expiry_instant)
-        };
-        if let Some(store) = self.token_store.clone() {
-            let old = old_token.0.clone();
-            let new = new_token.0.clone();
-            let id = identity.unwrap_or_default();
-            let expires_at = expiry_instant.map(instant_to_system_time);
-            self.db_write(async move {
-                let _ = store.delete_token(&old).await;
-                if let Err(e) = store
-                    .upsert_token(&new, &id, "agent", expires_at, None)
-                    .await
-                {
-                    eprintln!("WARNING: token store write failed: {e}");
-                }
-            });
-        }
-        Ok(new_token)
     }
 
     /// Initiate a governor transfer. Returns a one-time transfer token to deliver to the recipient.
@@ -2686,312 +2380,6 @@ impl DeliveryHub {
         Ok(new_token)
     }
 
-    /// Governor force-rotate: invalidate all tokens for an agent identity, issue one new token.
-    /// Old token entries are removed from token_to_name; new token is mapped to the same name.
-    pub fn governor_refresh_participant_token(
-        &self,
-        gov: &GovernorToken,
-        identity: &str,
-    ) -> Result<ParticipantToken, Error> {
-        let (new_token, old_ids, expiry_instant) = {
-            let mut inner = self.lock();
-            let (old_ids, new_token) = inner
-                .trust
-                .governor_rotate_participant_token(gov, identity)?;
-            let expiry_instant = inner.trust.participant_expiry(&new_token);
-            for old_id in &old_ids {
-                if let Some(name) = inner.token_to_name.remove(old_id) {
-                    inner.token_to_name.insert(new_token.0.clone(), name);
-                }
-            }
-            (new_token, old_ids, expiry_instant)
-        };
-        if let Some(store) = self.token_store.clone() {
-            let new = new_token.0.clone();
-            let id = identity.to_string();
-            let expires_at = expiry_instant.map(instant_to_system_time);
-            self.db_write(async move {
-                for old_id in &old_ids {
-                    let _ = store.delete_token(old_id).await;
-                }
-                if let Err(e) = store
-                    .upsert_token(&new, &id, "agent", expires_at, None)
-                    .await
-                {
-                    eprintln!("WARNING: token store write failed: {e}");
-                }
-            });
-        }
-        Ok(new_token)
-    }
-
-    /// Respond to a bilateral connection request (approve or deny).
-    /// Auth: valid governor token OR agent token whose identity matches the request's `to` identity.
-    /// On both-approve: establishes grant (persisted if token_store is set) and delivers the
-    /// original message to the recipient. On deny: drops request and queues CONNECTION_DENIED
-    /// to the original sender.
-    #[allow(clippy::type_complexity)] // deliberate: local tuple collects all post-lock side-effects atomically
-    pub fn respond_to_connection_request(
-        &self,
-        token_str: &str,
-        request_id: &str,
-        approve: bool,
-    ) -> Result<RespondStatus, Error> {
-        let (status, notify_opt, persist_grant, identity_senders, listen_to_persist): (
-            RespondStatus,
-            Option<Arc<tokio::sync::Notify>>,
-            Option<(String, String, String, String, String, String)>,
-            Vec<mpsc::UnboundedSender<String>>,
-            Vec<(String, String)>,
-        ) = {
-            let mut inner = self.lock();
-
-            // Verify request exists.
-            if !inner.connection_requests.contains_key(request_id) {
-                return Err(Error::BadRequest);
-            }
-
-            // Auth check: governor takes precedence; then check recipient agent token.
-            let gov_token = GovernorToken(token_str.to_string());
-            let is_governor = inner.trust.validate_governor_token(&gov_token).is_ok();
-
-            let to_identity = inner.connection_requests[request_id].to_identity.clone();
-            let is_recipient = if !is_governor {
-                let participant_token = ParticipantToken(token_str.to_string());
-                match inner.trust.validate_participant_token(&participant_token) {
-                    Ok(()) => inner
-                        .trust
-                        .participant_identity(&participant_token)
-                        .map(|id| id == to_identity.as_str())
-                        .unwrap_or(false),
-                    Err(e) => return Err(e),
-                }
-            } else {
-                false
-            };
-
-            if !is_governor && !is_recipient {
-                return Err(Error::Forbidden);
-            }
-
-            let from_name = inner.connection_requests[request_id].from_name.clone();
-            let to_name = inner.connection_requests[request_id].to_name.clone();
-            let from_identity = inner.connection_requests[request_id].from_identity.clone();
-            let to_identity = inner.connection_requests[request_id].to_identity.clone();
-
-            if !approve {
-                // Denial: drop request and queue CONNECTION_DENIED to original sender.
-                inner.connection_requests.remove(request_id);
-                let denial_json = serde_json::json!({
-                    "type": "connection_denied",
-                    "request_id": request_id,
-                    "from": &from_name,
-                    "to": &to_name,
-                })
-                .to_string();
-                let qmsg = QueuedMessage {
-                    payload: Payload(denial_json.into_bytes()),
-                    from_name: "system".to_string(),
-                    reason: None,
-                    event_type: Some("connection_denied".to_string()),
-                    thread_id: None,
-                };
-                inner
-                    .message_queues
-                    .entry(from_name.clone())
-                    .or_default()
-                    .push_back(qmsg);
-                inner.kick_pending.insert(from_name.clone());
-                inner.increment_msg_id_for_name(&from_name);
-                let notify = inner.agents.get(&from_name).map(|s| Arc::clone(&s.notify));
-                (
-                    RespondStatus::Denied { from_name },
-                    notify,
-                    None,
-                    vec![],
-                    vec![],
-                )
-            } else {
-                // Approval: advance stage using the new stage-based model.
-                {
-                    let req = inner
-                        .connection_requests
-                        .get_mut(request_id)
-                        .ok_or(Error::BadRequest)?;
-                    match req.stage {
-                        ConnectionStage::PendingGovernor => {
-                            if is_governor {
-                                req.approving_governor = Some(token_str.to_string());
-                                req.stage = ConnectionStage::PendingRecipient;
-                            } else {
-                                return Ok(RespondStatus::WaitingForOther);
-                            }
-                        }
-                        ConnectionStage::PendingRecipient => {
-                            if !is_governor && !is_recipient {
-                                return Err(Error::Forbidden);
-                            }
-                            // Both sides have now approved — fall through to grant creation.
-                        }
-                    }
-                }
-
-                let both = matches!(
-                    inner.connection_requests[request_id].stage,
-                    ConnectionStage::PendingRecipient
-                ) && (is_recipient || is_governor)
-                    && inner.connection_requests[request_id]
-                        .approving_governor
-                        .is_some();
-
-                if !both {
-                    return Ok(RespondStatus::WaitingForOther);
-                }
-
-                // Both approved: establish the grant using the stored governor token.
-                let (gov_tok_str, _reason) = {
-                    let req = inner
-                        .connection_requests
-                        .get(request_id)
-                        .ok_or(Error::BadRequest)?;
-                    (
-                        req.approving_governor.clone().ok_or(Error::BadRequest)?,
-                        req.reason.clone(),
-                    )
-                };
-
-                let gov_tok = GovernorToken(gov_tok_str.clone());
-                // Call inner.trust directly (we hold the lock; persist happens outside via db_write).
-                // FP1 fix: pass stable names so the grant survives identity rotation on reconnect.
-                let grant_req = ApproveGrantRequest {
-                    name_a: Some(from_name.clone()),
-                    name_b: Some(to_name.clone()),
-                    ..ApproveGrantRequest::default()
-                };
-                let grant_id = match inner.trust.approve_grant_req(
-                    &gov_tok,
-                    &from_identity,
-                    &to_identity,
-                    None,
-                    grant_req,
-                ) {
-                    Ok(id) => id,
-                    Err(e) => {
-                        inner.connection_requests.remove(request_id);
-                        return Err(e);
-                    }
-                };
-
-                // No payload to deliver in the new flow — grant is established,
-                // Bob gets notified via grant_established in approve_grant_request.
-                inner.kick_pending.insert(to_name.clone());
-                let notify = inner.agents.get(&to_name).map(|s| Arc::clone(&s.notify));
-
-                // AC-T2: set ever_granted for any listen tokens in from/to identities and collect
-                // their SSE senders so we can emit identity_persisted after the lock releases.
-                let mut identity_senders: Vec<mpsc::UnboundedSender<String>> = Vec::new();
-                for identity in [&from_identity, &to_identity] {
-                    if let Some(st) = inner.listen_tokens.get_mut(identity.as_str()) {
-                        if !st.ever_granted {
-                            st.ever_granted = true;
-                        }
-                        if let Some(ref sender) = st.sse_sender {
-                            identity_senders.push(sender.clone());
-                        }
-                    }
-                }
-
-                // AC-T3: collect token strings for both agents (by name) so we can
-                // persist them to DB after the lock releases.
-                let mut listen_to_persist: Vec<(String, String)> = Vec::new();
-                for name in [&from_name, &to_name] {
-                    if let Some(tok) = inner.name_to_token.get(name.as_str()).cloned() {
-                        listen_to_persist.push((tok, name.clone()));
-                    }
-                }
-
-                inner.connection_requests.remove(request_id);
-
-                let to_name_for_grant = to_name.clone();
-                let from_name_for_grant = from_name.clone();
-                (
-                    RespondStatus::Established { to_name },
-                    notify,
-                    Some((
-                        grant_id,
-                        from_identity,
-                        to_identity,
-                        gov_tok_str,
-                        from_name_for_grant,
-                        to_name_for_grant,
-                    )),
-                    identity_senders,
-                    listen_to_persist,
-                )
-            }
-        }; // lock released
-
-        // Notify outside lock (matches established codebase pattern).
-        if let Some(n) = notify_opt {
-            n.notify_one();
-        }
-
-        // Fire identity_persisted SERVICE event on any listen SSE streams involved in the grant.
-        for sender in identity_senders {
-            let event = r#"{"type":"service","event":"identity_persisted"}"#.to_string();
-            let _ = sender.send(event);
-        }
-
-        // Persist the newly established grant (mirrors DeliveryHub::approve_grant_req pattern).
-        if let Some((grant_id, id_a, id_b, gov_id, na, nb)) = persist_grant
-            && let Some(store) = self.token_store.clone()
-        {
-            let gid = grant_id.clone();
-            self.db_write(async move {
-                if let Err(e) = store
-                    .upsert_grant(
-                        &gid,
-                        &id_a,
-                        &id_b,
-                        "symmetric",
-                        "bypass",
-                        None,
-                        0,
-                        None,
-                        true,
-                        None,
-                        &gov_id,
-                        Some(&na),
-                        Some(&nb),
-                    )
-                    .await
-                {
-                    eprintln!("WARNING: token store write failed: {e}");
-                }
-            });
-        }
-
-        // AC-T3: persist listen tokens that gained their first grant.
-        if !listen_to_persist.is_empty()
-            && let Some(store) = self.token_store.clone()
-        {
-            for (tok, name) in listen_to_persist {
-                let store2 = store.clone();
-                self.db_write(async move {
-                    // 15-0029: participant rows write identity=name (never identity=token).
-                    if let Err(e) = store2
-                        .upsert_token(&tok, &name, "participant", None, None)
-                        .await
-                    {
-                        eprintln!("WARNING: token store write failed: {e}");
-                    }
-                });
-            }
-        }
-
-        Ok(status)
-    }
-
     // ── Grant request flow ────────────────────────────────────────────────────
 
     /// Bob calls this after getting a NO_GRANT 403. Creates (or updates a held) grant request,
@@ -3023,32 +2411,19 @@ impl DeliveryHub {
             };
 
             // Resolve sender.
-            let (from_identity, from_name) =
-                if let Some(st) = inner.listen_tokens.get(from_token_str) {
-                    if st.revoked {
-                        return Err(Error::TokenRevoked);
-                    }
-                    let name = inner
-                        .token_to_name
-                        .get(from_token_str)
-                        .cloned()
-                        .unwrap_or_default();
-                    (from_token_str.to_string(), name)
-                } else {
-                    let tok = ParticipantToken(from_token_str.to_string());
-                    inner.trust.validate_participant_token(&tok)?;
-                    let identity = inner
-                        .trust
-                        .participant_identity(&tok)
-                        .ok_or(Error::AuthFailed)?
-                        .to_string();
-                    let name = inner
-                        .token_to_name
-                        .get(from_token_str)
-                        .cloned()
-                        .unwrap_or_default();
-                    (identity, name)
-                };
+            let st = inner
+                .listen_tokens
+                .get(from_token_str)
+                .ok_or(Error::AuthFailed)?;
+            if st.revoked {
+                return Err(Error::TokenRevoked);
+            }
+            let from_name = inner
+                .token_to_name
+                .get(from_token_str)
+                .cloned()
+                .unwrap_or_default();
+            let from_identity = from_token_str.to_string();
 
             // Fix 5: check for an active denial block on this sender→recipient pair.
             {
@@ -3229,18 +2604,9 @@ impl DeliveryHub {
                     }
                 }
                 ConnectionStage::PendingRecipient => {
-                    // Recipient is valid if their token IS their identity (listen-flow) or trust-chain agent.
-                    let is_recipient = if inner.listen_tokens.contains_key(token_str) {
-                        token_str == to_identity.as_str()
-                    } else {
-                        let tok = ParticipantToken(token_str.to_string());
-                        inner.trust.validate_participant_token(&tok).is_ok()
-                            && inner
-                                .trust
-                                .participant_identity(&tok)
-                                .map(|id| id == to_identity.as_str())
-                                .unwrap_or(false)
-                    };
+                    // Recipient is valid if their token IS their identity (listen-flow).
+                    let is_recipient = inner.listen_tokens.contains_key(token_str)
+                        && token_str == to_identity.as_str();
                     if !is_governor && !is_recipient {
                         return Err(Error::Forbidden);
                     }
@@ -3490,19 +2856,9 @@ impl DeliveryHub {
                 .validate_governor_token(&GovernorToken(token_str.to_string()))
                 .is_ok();
             let to_identity = req.to_identity.clone();
-            let is_recipient = !is_governor && {
-                if inner.listen_tokens.contains_key(token_str) {
-                    token_str == to_identity.as_str()
-                } else {
-                    let tok = ParticipantToken(token_str.to_string());
-                    inner.trust.validate_participant_token(&tok).is_ok()
-                        && inner
-                            .trust
-                            .participant_identity(&tok)
-                            .map(|id| id == to_identity.as_str())
-                            .unwrap_or(false)
-                }
-            };
+            let is_recipient = !is_governor
+                && inner.listen_tokens.contains_key(token_str)
+                && token_str == to_identity.as_str();
             if !is_governor && !is_recipient {
                 return Err(Error::Forbidden);
             }
@@ -3720,19 +3076,9 @@ impl DeliveryHub {
                 .validate_governor_token(&GovernorToken(token_str.to_string()))
                 .is_ok();
             let to_identity = req.to_identity.clone();
-            let is_recipient = !is_governor && {
-                if inner.listen_tokens.contains_key(token_str) {
-                    token_str == to_identity.as_str()
-                } else {
-                    let tok = ParticipantToken(token_str.to_string());
-                    inner.trust.validate_participant_token(&tok).is_ok()
-                        && inner
-                            .trust
-                            .participant_identity(&tok)
-                            .map(|id| id == to_identity.as_str())
-                            .unwrap_or(false)
-                }
-            };
+            let is_recipient = !is_governor
+                && inner.listen_tokens.contains_key(token_str)
+                && token_str == to_identity.as_str();
             if !is_governor && !is_recipient {
                 return Err(Error::Forbidden);
             }
@@ -3779,73 +3125,10 @@ impl DeliveryHub {
         Ok(())
     }
 
-    /// Non-blocking dequeue: pops one message from the agent's queue, or returns None.
-    /// Clears kick_pending when the queue becomes empty.
-    pub fn pop_queued_message(
-        &self,
-        token: &ParticipantToken,
-    ) -> Result<Option<QueuedMessage>, Error> {
-        let mut inner = self.lock();
-        inner.trust.validate_participant_token(token)?;
-        let agent_name = inner
-            .token_to_name
-            .get(&token.0)
-            .cloned()
-            .ok_or(Error::AuthFailed)?;
-        let msg = inner.pop_message(&agent_name);
-        Ok(msg)
-    }
-
     /// Returns true if this agent has at least one queued message (kick pending).
     /// Used by the SSE handler to fire an immediate kick on reconnect.
     pub fn kick_pending_for(&self, name: &str) -> bool {
         self.lock().kick_pending.contains(name)
-    }
-
-    /// Long-poll dequeue (§5.2). Blocks up to `max_wait`, returns Empty on timeout or no messages.
-    pub async fn long_poll_dequeue(
-        &self,
-        token: &ParticipantToken,
-        max_wait: Duration,
-    ) -> Result<DequeueOutcome, Error> {
-        // Validate token and get the agent's notify handle under the lock.
-        let (agent_name, notify_arc) = {
-            let inner = self.lock();
-            inner.trust.validate_participant_token(token)?;
-            let name = inner
-                .token_to_name
-                .get(&token.0)
-                .cloned()
-                .ok_or(Error::AuthFailed)?;
-            let notify = inner
-                .agents
-                .get(&name)
-                .map(|s| Arc::clone(&s.notify))
-                .ok_or(Error::AuthFailed)?;
-            (name, notify)
-        };
-
-        // Fast path: message already queued.
-        {
-            let mut inner = self.lock();
-            if let Some(msg) = inner.pop_message(&agent_name) {
-                return Ok(DequeueOutcome::Message(msg));
-            }
-        }
-
-        // Slow path: wait for a notification (or timeout).
-        // tokio::sync::Notify stores a permit if notify_one() fires before we await,
-        // so there is no race between the fast-path check and the wait below.
-        match timeout(max_wait, notify_arc.notified()).await {
-            Ok(()) => {
-                let mut inner = self.lock();
-                match inner.pop_message(&agent_name) {
-                    Some(msg) => Ok(DequeueOutcome::Message(msg)),
-                    None => Ok(DequeueOutcome::Empty),
-                }
-            }
-            Err(_) => Ok(DequeueOutcome::Empty),
-        }
     }
 
     // ── Listen-flow methods ───────────────────────────────────────────────────
@@ -4944,19 +4227,14 @@ impl DeliveryHub {
         let inner = self.lock();
 
         // Resolve caller identity + announced name.
+        let Some(state) = inner.listen_tokens.get(from_token) else {
+            return false;
+        };
+        if state.revoked {
+            return false;
+        }
         let (from_id, from_name): (String, Option<String>) =
-            if let Some(state) = inner.listen_tokens.get(from_token) {
-                if state.revoked {
-                    return false;
-                }
-                (from_token.to_string(), state.name.clone())
-            } else {
-                let tok = ParticipantToken(from_token.to_string());
-                match inner.trust.participant_identity(&tok) {
-                    Some(id) => (id.to_string(), inner.token_to_name.get(from_token).cloned()),
-                    None => return false,
-                }
-            };
+            (from_token.to_string(), state.name.clone());
 
         // Resolve target: prefer the listen-token identity (which == token) if
         // the agent is a listen-flow agent; fall back to the minted identity.
@@ -5136,201 +4414,6 @@ impl DeliveryHub {
         let in_settle = inner.is_settle_pending(target_name);
         Ok(inner.is_online_effective(target_name) || in_settle)
     }
-
-    /// Check presence using any valid token.
-    /// Grant-gated: querier must have an active grant with target to see their presence.
-    pub fn presence_any_token(&self, token_str: &str, target_name: &str) -> Result<bool, Error> {
-        let inner = self.lock();
-
-        // Resolve target identity (listen token string if they're a listen-flow agent).
-        let target_tok = inner.name_to_token.get(target_name).cloned();
-
-        // Try listen token first.
-        if let Some(state) = inner.listen_tokens.get(token_str) {
-            if state.revoked {
-                return Err(Error::TokenRevoked);
-            }
-
-            // Resolve querier name for grant/room checks; identity = token for listen-flow.
-            let querier_name = state.name.clone();
-
-            // Deny-grant override: hard block regardless of grant or room.
-            if inner.is_denial_active(token_str, target_name) {
-                return Ok(false);
-            }
-
-            // Grant check: querier must have a grant with target.
-            let has_grant = match &target_tok {
-                Some(t_tok) => {
-                    inner
-                        .trust
-                        .check_grant_directed_with_names(
-                            token_str,
-                            t_tok.as_str(),
-                            querier_name.as_deref(),
-                            Some(target_name),
-                        )
-                        .is_ok()
-                        || inner
-                            .trust
-                            .check_grant_directed_with_names(
-                                t_tok.as_str(),
-                                token_str,
-                                Some(target_name),
-                                querier_name.as_deref(),
-                            )
-                            .is_ok()
-                }
-                None => {
-                    // Target might be a minted agent.
-                    if let Some(agent_state) = inner.agents.get(target_name) {
-                        inner
-                            .trust
-                            .check_grant_directed_with_names(
-                                token_str,
-                                &agent_state.identity,
-                                querier_name.as_deref(),
-                                Some(target_name),
-                            )
-                            .is_ok()
-                            || inner
-                                .trust
-                                .check_grant_directed_with_names(
-                                    &agent_state.identity,
-                                    token_str,
-                                    Some(target_name),
-                                    querier_name.as_deref(),
-                                )
-                                .is_ok()
-                    } else {
-                        false
-                    }
-                }
-            };
-
-            // Room membership: alternative to grant for co-present participants.
-            let shares_room = if let Some(ref qn) = querier_name {
-                inner.room_store.shares_room(qn, target_name)
-            } else {
-                false
-            };
-
-            if !has_grant && !shares_room {
-                return Ok(false);
-            }
-
-            // Check target.
-            if let Some(target_tok) = target_tok
-                && let Some(tgt) = inner.listen_tokens.get(&target_tok)
-            {
-                if tgt.hidden {
-                    return Ok(false);
-                }
-                let in_settle = inner.is_settle_pending(target_name);
-                return Ok(ListenTokenState::is_sse_alive_in_hub(
-                    &target_tok,
-                    &inner.sse_connections,
-                ) || in_settle);
-            }
-            // minted-agent target.
-            let in_settle = inner.is_settle_pending(target_name);
-            return Ok(inner.is_online_effective(target_name) || in_settle);
-        }
-
-        // Try minted agent token.
-        let participant_token = crate::types::ParticipantToken(token_str.to_string());
-        if inner
-            .trust
-            .validate_participant_token(&participant_token)
-            .is_ok()
-        {
-            // Get agent's identity for grant check.
-            let querier_identity = inner
-                .trust
-                .participant_identity(&participant_token)
-                .map(|s| s.to_string());
-
-            // Deny-grant override for minted-agent querier.
-            if let Some(ref q_id) = querier_identity
-                && inner.is_denial_active(q_id, target_name)
-            {
-                return Ok(false);
-            }
-
-            // Grant check for minted agent querier.
-            let has_grant = match (&target_tok, &querier_identity) {
-                (Some(t_tok), Some(q_id)) => {
-                    inner
-                        .trust
-                        .check_grant_directed_with_names(
-                            q_id,
-                            t_tok.as_str(),
-                            None,
-                            Some(target_name),
-                        )
-                        .is_ok()
-                        || inner
-                            .trust
-                            .check_grant_directed_with_names(
-                                t_tok.as_str(),
-                                q_id,
-                                Some(target_name),
-                                None,
-                            )
-                            .is_ok()
-                }
-                (None, Some(q_id)) => {
-                    // Both are minted agents.
-                    if let Some(agent_state) = inner.agents.get(target_name) {
-                        inner
-                            .trust
-                            .check_grant_directed_with_names(
-                                q_id,
-                                &agent_state.identity,
-                                None,
-                                Some(target_name),
-                            )
-                            .is_ok()
-                            || inner
-                                .trust
-                                .check_grant_directed_with_names(
-                                    &agent_state.identity,
-                                    q_id,
-                                    Some(target_name),
-                                    None,
-                                )
-                                .is_ok()
-                    } else {
-                        false
-                    }
-                }
-                _ => false,
-            };
-
-            if !has_grant {
-                return Ok(false);
-            }
-
-            // Check listen-flow target.
-            if let Some(target_tok) = target_tok
-                && let Some(tgt) = inner.listen_tokens.get(&target_tok)
-            {
-                if tgt.hidden {
-                    return Ok(false);
-                }
-                let in_settle = inner.is_settle_pending(target_name);
-                return Ok(ListenTokenState::is_sse_alive_in_hub(
-                    &target_tok,
-                    &inner.sse_connections,
-                ) || in_settle);
-            }
-            // minted-agent target.
-            let in_settle = inner.is_settle_pending(target_name);
-            return Ok(inner.is_online_effective(target_name) || in_settle);
-        }
-
-        Err(Error::AuthFailed)
-    }
 }
 
 #[cfg(test)]
@@ -5343,12 +4426,90 @@ mod tests {
         DeliveryHub::new(lapse)
     }
 
+    /// Test-only: register + announce a listen-flow participant with the given name,
+    /// Test-only replacement for the deleted `mint_participant_token`: mints a raw
+    /// listen-flow token via the live `register_participant()`, unbound to any name.
+    ///
+    /// IMPORTANT: unlike the deleted minted-agent path (where identity was an arbitrary
+    /// string decoupled from the token, e.g. "id-alice"), listen-flow identity == token.
+    /// Any grant approved for a participant produced by this helper must key on the
+    /// returned token's string (`tok.0`), not a synthetic "id-alice"-style identity, or
+    /// `send()`'s grant check will not match.
+    /// Returns `Result` (even though registration cannot fail) so existing
+    /// `.unwrap()`-suffixed call sites (a holdover from the old fallible
+    /// `mint_participant_token`) keep compiling unchanged.
+    fn test_mint(hub: &DeliveryHub) -> Result<ParticipantToken, Error> {
+        Ok(ParticipantToken(hub.register_participant()))
+    }
+
+    /// Test-only replacement for the deleted `DeliveryHub::register`: binds `name` to a
+    /// listen-flow token via the live `announce()`, then applies `scope`.
+    ///
+    /// NOTE: the live presence path (`presence_for_token`, 15-0028 / operator-final-rule)
+    /// gates visibility uniformly by grant-or-shared-room for every agent, and separately
+    /// consults only the listen token's `hidden` flag (set via `hide()`/`show()`) — it does
+    /// NOT consult `Registry`'s stored `PresenceScope`, which only still matters for the
+    /// pre-listen-flow (minted-agent) branch of `list_participants`/`presence_scope_effective`.
+    /// So `Public` and `GrantScoped` are behaviorally identical here (both "not hidden";
+    /// visibility still requires a grant or shared room) — only `Hidden` changes behavior.
+    fn test_bind(
+        hub: &DeliveryHub,
+        name: &str,
+        tok: &ParticipantToken,
+        scope: PresenceScope,
+    ) -> Result<(), Error> {
+        hub.announce(&tok.0, name)?;
+        match scope {
+            PresenceScope::Hidden => hub.hide(&tok.0)?,
+            PresenceScope::Public | PresenceScope::GrantScoped => hub.show(&tok.0)?,
+        }
+        Ok(())
+    }
+
+    /// Test-only long-poll dequeue built on the live listen-flow primitives (`dequeue()` +
+    /// the per-name `Notify` handle). Production has no long-poll dequeue route (only the
+    /// non-blocking `handle_dequeue` / `dequeue()`); this preserves pre-existing test
+    /// timing/assertions without reintroducing the dead trust-only `long_poll_dequeue`
+    /// that used to serve them (it validated only against `TrustChain.agents`, never
+    /// `listen_tokens`, and had no HTTP route).
+    async fn test_long_poll_dequeue(
+        hub: &DeliveryHub,
+        token: &ParticipantToken,
+        max_wait: Duration,
+    ) -> Result<DequeueOutcome, Error> {
+        // Fetch the notify handle BEFORE the fast-path check: tokio::sync::Notify stores a
+        // wake permit if notify_one() fires before we await, so no message is lost even if
+        // it arrives between the fast-path check and the slow-path wait below.
+        let notify_arc = {
+            let inner = hub.lock();
+            inner
+                .token_to_name
+                .get(&token.0)
+                .and_then(|name| inner.agents.get(name))
+                .map(|s| Arc::clone(&s.notify))
+        };
+        let (msg, _remaining) = hub.dequeue(&token.0, None)?;
+        if let Some(msg) = msg {
+            return Ok(DequeueOutcome::Message(msg));
+        }
+        if let Some(notify) = notify_arc {
+            let _ = tokio::time::timeout(max_wait, notify.notified()).await;
+        } else {
+            tokio::time::sleep(max_wait).await;
+        }
+        let (msg, _remaining) = hub.dequeue(&token.0, None)?;
+        Ok(match msg {
+            Some(m) => DequeueOutcome::Message(m),
+            None => DequeueOutcome::Empty,
+        })
+    }
+
     fn setup_hub_ab() -> (DeliveryHub, ParticipantToken, ParticipantToken) {
         let hub = make_hub(Duration::from_secs(30));
         let gov = hub.install_governor(None);
-        let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
-        let tok_b = hub.mint_participant_token(&gov, "id-bob", None).unwrap();
-        hub.approve_grant(&gov, "id-alice", "id-bob", None).unwrap();
+        let tok_a = test_mint(&hub).unwrap();
+        let tok_b = test_mint(&hub).unwrap();
+        hub.approve_grant(&gov, &tok_a.0, &tok_b.0, None).unwrap();
         (hub, tok_a, tok_b)
     }
 
@@ -5356,16 +4517,13 @@ mod tests {
     #[tokio::test]
     async fn ac_msg_1_send_accepted_dequeue_returns_payload_once() {
         let (hub, tok_a, tok_b) = setup_hub_ab();
-        hub.register("alice", &tok_a, PresenceScope::GrantScoped)
-            .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
-            .unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::GrantScoped).unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::GrantScoped).unwrap();
 
         let ack = hub.send(&tok_a, "bob", Payload(b"hi".to_vec()), None, None);
         assert!(matches!(ack, Ok(Ack::Accepted)));
 
-        let outcome = hub
-            .long_poll_dequeue(&tok_b, Duration::from_millis(100))
+        let outcome = test_long_poll_dequeue(&hub, &tok_b, Duration::from_millis(100))
             .await
             .unwrap();
         match outcome {
@@ -5373,8 +4531,7 @@ mod tests {
             DequeueOutcome::Empty => panic!("expected a message"),
         }
 
-        let second = hub
-            .long_poll_dequeue(&tok_b, Duration::from_millis(20))
+        let second = test_long_poll_dequeue(&hub, &tok_b, Duration::from_millis(20))
             .await
             .unwrap();
         assert!(matches!(second, DequeueOutcome::Empty));
@@ -5384,16 +4541,13 @@ mod tests {
     #[tokio::test]
     async fn ac_msg_2_recipient_unknown() {
         let (hub, tok_a, tok_b) = setup_hub_ab();
-        hub.register("alice", &tok_a, PresenceScope::GrantScoped)
-            .unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::GrantScoped).unwrap();
 
         let result = hub.send(&tok_a, "bob", Payload(b"hi".to_vec()), None, None);
         assert!(matches!(result, Err(Error::RecipientUnknown)));
 
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
-            .unwrap();
-        let empty = hub
-            .long_poll_dequeue(&tok_b, Duration::from_millis(20))
+        test_bind(&hub, "bob", &tok_b, PresenceScope::GrantScoped).unwrap();
+        let empty = test_long_poll_dequeue(&hub, &tok_b, Duration::from_millis(20))
             .await
             .unwrap();
         assert!(matches!(empty, DequeueOutcome::Empty));
@@ -5405,13 +4559,11 @@ mod tests {
     async fn ac1_ac2_send_to_offline_registered_queues_message() {
         let hub = make_hub(Duration::from_millis(10));
         let gov = hub.install_governor(None);
-        let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
-        let tok_b = hub.mint_participant_token(&gov, "id-bob", None).unwrap();
-        hub.approve_grant(&gov, "id-alice", "id-bob", None).unwrap();
-        hub.register("alice", &tok_a, PresenceScope::GrantScoped)
-            .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
-            .unwrap();
+        let tok_a = test_mint(&hub).unwrap();
+        let tok_b = test_mint(&hub).unwrap();
+        hub.approve_grant(&gov, &tok_a.0, &tok_b.0, None).unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::GrantScoped).unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::GrantScoped).unwrap();
 
         // Let liveness lapse so bob is "offline"
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -5430,12 +4582,10 @@ mod tests {
         );
 
         // Re-register bob (refreshes liveness), messages survive
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
-            .unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::GrantScoped).unwrap();
 
         // AC2: message is in queue with correct from field
-        let outcome = hub
-            .long_poll_dequeue(&tok_b, Duration::from_millis(100))
+        let outcome = test_long_poll_dequeue(&hub, &tok_b, Duration::from_millis(100))
             .await
             .unwrap();
         match outcome {
@@ -5451,13 +4601,11 @@ mod tests {
     #[test]
     fn ac3_send_to_unregistered_returns_unknown() {
         let hub = make_hub(Duration::from_secs(30));
-        let gov = hub.install_governor(None);
-        let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
-        hub.mint_participant_token(&gov, "id-bob", None).unwrap();
-        hub.approve_grant(&gov, "id-alice", "id-bob", None).unwrap();
-        hub.register("alice", &tok_a, PresenceScope::GrantScoped)
-            .unwrap();
-        // bob is NOT registered
+        let _gov = hub.install_governor(None);
+        let tok_a = test_mint(&hub).unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::GrantScoped).unwrap();
+        // bob is NOT registered — RecipientUnknown fires before any grant check, so no
+        // grant/second participant is needed to exercise this path.
 
         assert!(matches!(
             hub.send(&tok_a, "bob", Payload(b"hi".to_vec()), None, None),
@@ -5471,13 +4619,11 @@ mod tests {
     async fn ac5_ac6_multiple_offline_messages_returned_in_fifo_order() {
         let hub = make_hub(Duration::from_millis(10));
         let gov = hub.install_governor(None);
-        let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
-        let tok_b = hub.mint_participant_token(&gov, "id-bob", None).unwrap();
-        hub.approve_grant(&gov, "id-alice", "id-bob", None).unwrap();
-        hub.register("alice", &tok_a, PresenceScope::GrantScoped)
-            .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
-            .unwrap();
+        let tok_a = test_mint(&hub).unwrap();
+        let tok_b = test_mint(&hub).unwrap();
+        hub.approve_grant(&gov, &tok_a.0, &tok_b.0, None).unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::GrantScoped).unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::GrantScoped).unwrap();
 
         // Let liveness lapse
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -5491,23 +4637,18 @@ mod tests {
             .unwrap();
 
         // Re-register bob
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
-            .unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::GrantScoped).unwrap();
 
-        let m1 = hub
-            .long_poll_dequeue(&tok_b, Duration::from_millis(50))
+        let m1 = test_long_poll_dequeue(&hub, &tok_b, Duration::from_millis(50))
             .await
             .unwrap();
-        let m2 = hub
-            .long_poll_dequeue(&tok_b, Duration::from_millis(50))
+        let m2 = test_long_poll_dequeue(&hub, &tok_b, Duration::from_millis(50))
             .await
             .unwrap();
-        let m3 = hub
-            .long_poll_dequeue(&tok_b, Duration::from_millis(50))
+        let m3 = test_long_poll_dequeue(&hub, &tok_b, Duration::from_millis(50))
             .await
             .unwrap();
-        let empty = hub
-            .long_poll_dequeue(&tok_b, Duration::from_millis(20))
+        let empty = test_long_poll_dequeue(&hub, &tok_b, Duration::from_millis(20))
             .await
             .unwrap();
 
@@ -5530,10 +4671,8 @@ mod tests {
     #[test]
     fn ac7_kick_pending_set_on_queue_cleared_on_drain() {
         let (hub, tok_a, tok_b) = setup_hub_ab();
-        hub.register("alice", &tok_a, PresenceScope::GrantScoped)
-            .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
-            .unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::GrantScoped).unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::GrantScoped).unwrap();
 
         assert!(!hub.kick_pending_for("bob"));
 
@@ -5545,7 +4684,7 @@ mod tests {
         );
 
         // Pop message
-        let msg = hub.pop_queued_message(&tok_b).unwrap();
+        let (msg, _remaining) = hub.dequeue(&tok_b.0, None).unwrap();
         assert!(msg.is_some());
         assert!(
             !hub.kick_pending_for("bob"),
@@ -5557,13 +4696,10 @@ mod tests {
     #[tokio::test]
     async fn ac_msg_5_dequeue_blocks_then_returns_empty() {
         let (hub, _tok_a, tok_b) = setup_hub_ab();
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
-            .unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::GrantScoped).unwrap();
 
         let start = tokio::time::Instant::now();
-        let result = hub
-            .long_poll_dequeue(&tok_b, Duration::from_millis(50))
-            .await;
+        let result = test_long_poll_dequeue(&hub, &tok_b, Duration::from_millis(50)).await;
         let elapsed = start.elapsed();
 
         assert!(matches!(result, Ok(DequeueOutcome::Empty)));
@@ -5571,38 +4707,39 @@ mod tests {
         assert!(elapsed < Duration::from_millis(200));
     }
 
-    /// AC-MSG-6: dequeue with invalid token → AuthFailed.
+    /// AC-MSG-6: dequeue with invalid token → TokenRejected.
+    ///
+    /// Updated for 15-0030: the deleted trust-only `long_poll_dequeue` validated via
+    /// `TrustChain.validate_participant_token`, which returned `AuthFailed` for an unknown
+    /// token. The live listen-flow `dequeue()` (which `test_long_poll_dequeue` is built on)
+    /// returns `TokenRejected` for an unknown token instead — the same error an unknown
+    /// token gets everywhere else on the listen-flow path (`pending_count`,
+    /// `latest_message_id`, `drain_queue`, etc.).
     #[tokio::test]
-    async fn ac_msg_6_dequeue_invalid_token_returns_auth_failed() {
+    async fn ac_msg_6_dequeue_invalid_token_returns_token_rejected() {
         let hub = make_hub(Duration::from_secs(30));
         let bad_token = ParticipantToken("not-a-real-token".into());
 
-        let result = hub
-            .long_poll_dequeue(&bad_token, Duration::from_millis(10))
-            .await;
-        assert!(matches!(result, Err(Error::AuthFailed)));
+        let result = test_long_poll_dequeue(&hub, &bad_token, Duration::from_millis(10)).await;
+        assert!(matches!(result, Err(Error::TokenRejected)));
     }
 
     /// AC-MSG-7: two messages in order are dequeued in send order, each once.
     #[tokio::test]
     async fn ac_msg_7_messages_delivered_in_send_order() {
         let (hub, tok_a, tok_b) = setup_hub_ab();
-        hub.register("alice", &tok_a, PresenceScope::GrantScoped)
-            .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
-            .unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::GrantScoped).unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::GrantScoped).unwrap();
 
         hub.send(&tok_a, "bob", Payload(b"1".to_vec()), None, None)
             .unwrap();
         hub.send(&tok_a, "bob", Payload(b"2".to_vec()), None, None)
             .unwrap();
 
-        let m1 = hub
-            .long_poll_dequeue(&tok_b, Duration::from_millis(50))
+        let m1 = test_long_poll_dequeue(&hub, &tok_b, Duration::from_millis(50))
             .await
             .unwrap();
-        let m2 = hub
-            .long_poll_dequeue(&tok_b, Duration::from_millis(50))
+        let m2 = test_long_poll_dequeue(&hub, &tok_b, Duration::from_millis(50))
             .await
             .unwrap();
 
@@ -5615,8 +4752,7 @@ mod tests {
             DequeueOutcome::Empty => panic!("expected second message"),
         }
 
-        let empty = hub
-            .long_poll_dequeue(&tok_b, Duration::from_millis(20))
+        let empty = test_long_poll_dequeue(&hub, &tok_b, Duration::from_millis(20))
             .await
             .unwrap();
         assert!(matches!(empty, DequeueOutcome::Empty));
@@ -5626,20 +4762,16 @@ mod tests {
     #[tokio::test]
     async fn queued_message_survives_reregistration() {
         let (hub, tok_a, tok_b) = setup_hub_ab();
-        hub.register("alice", &tok_a, PresenceScope::GrantScoped)
-            .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
-            .unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::GrantScoped).unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::GrantScoped).unwrap();
 
         hub.send(&tok_a, "bob", Payload(b"survive".to_vec()), None, None)
             .unwrap();
 
         // Bob re-registers (new notify, same queue)
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
-            .unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::GrantScoped).unwrap();
 
-        let outcome = hub
-            .long_poll_dequeue(&tok_b, Duration::from_millis(100))
+        let outcome = test_long_poll_dequeue(&hub, &tok_b, Duration::from_millis(100))
             .await
             .unwrap();
         match outcome {
@@ -5653,12 +4785,12 @@ mod tests {
     fn budget_decrements_on_delivery() {
         let hub = make_hub(Duration::from_secs(30));
         let gov = hub.install_governor(None);
-        let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
-        let tok_b = hub.mint_participant_token(&gov, "id-bob", None).unwrap();
+        let tok_a = test_mint(&hub).unwrap();
+        let tok_b = test_mint(&hub).unwrap();
         hub.approve_grant_req(
             &gov,
-            "id-alice",
-            "id-bob",
+            &tok_a.0,
+            &tok_b.0,
             None,
             ApproveGrantRequest {
                 max_messages: Some(3),
@@ -5666,8 +4798,10 @@ mod tests {
             },
         )
         .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
-            .unwrap();
+        // send() requires the sender to be announced (token_to_name), unlike the deleted
+        // minted-agent path where an unannounced sender's from_name simply defaulted to "".
+        test_bind(&hub, "alice", &tok_a, PresenceScope::GrantScoped).unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::GrantScoped).unwrap();
 
         assert!(
             hub.send(&tok_a, "bob", Payload(b"1".to_vec()), None, None)
@@ -5692,12 +4826,12 @@ mod tests {
     fn one_time_grant_exhausted_after_first_delivery() {
         let hub = make_hub(Duration::from_secs(30));
         let gov = hub.install_governor(None);
-        let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
-        let tok_b = hub.mint_participant_token(&gov, "id-bob", None).unwrap();
+        let tok_a = test_mint(&hub).unwrap();
+        let tok_b = test_mint(&hub).unwrap();
         hub.approve_grant_req(
             &gov,
-            "id-alice",
-            "id-bob",
+            &tok_a.0,
+            &tok_b.0,
             None,
             ApproveGrantRequest {
                 max_messages: Some(1),
@@ -5705,8 +4839,8 @@ mod tests {
             },
         )
         .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
-            .unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::GrantScoped).unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::GrantScoped).unwrap();
 
         assert!(
             hub.send(&tok_a, "bob", Payload(b"first".to_vec()), None, None)
@@ -5723,12 +4857,12 @@ mod tests {
     async fn ac_12_concurrent_sends_single_use_grant_exactly_one_succeeds() {
         let hub = Arc::new(make_hub(Duration::from_secs(30)));
         let gov = hub.install_governor(None);
-        let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
-        let tok_b = hub.mint_participant_token(&gov, "id-bob", None).unwrap();
+        let tok_a = test_mint(&hub).unwrap();
+        let tok_b = test_mint(&hub).unwrap();
         hub.approve_grant_req(
             &gov,
-            "id-alice",
-            "id-bob",
+            &tok_a.0,
+            &tok_b.0,
             None,
             ApproveGrantRequest {
                 max_messages: Some(1),
@@ -5736,8 +4870,8 @@ mod tests {
             },
         )
         .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
-            .unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::GrantScoped).unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::GrantScoped).unwrap();
 
         let tok_a2 = ParticipantToken(tok_a.0.clone());
 
@@ -5781,14 +4915,14 @@ mod tests {
         use crate::trust::GrantDirection;
         let hub = make_hub(Duration::from_secs(30));
         let gov = hub.install_governor(None);
-        let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
-        let tok_b = hub.mint_participant_token(&gov, "id-bob", None).unwrap();
+        let tok_a = test_mint(&hub).unwrap();
+        let tok_b = test_mint(&hub).unwrap();
         // AToB-only grant: only alice→bob is covered by a standing grant.
         // bob→alice has no grant, so bob must use reply windows to reach alice.
         hub.approve_grant_req(
             &gov,
-            "id-alice",
-            "id-bob",
+            &tok_a.0,
+            &tok_b.0,
             None,
             ApproveGrantRequest {
                 direction: Some(GrantDirection::AToB),
@@ -5805,10 +4939,8 @@ mod tests {
     #[tokio::test]
     async fn reply_window_opens_after_delivery() {
         let (hub, _gov, tok_a, tok_b) = setup_hub_ab_window();
-        hub.register("alice", &tok_a, PresenceScope::GrantScoped)
-            .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
-            .unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::GrantScoped).unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::GrantScoped).unwrap();
 
         // Alice → Bob (grant path), opens window (bob, alice)
         assert!(matches!(
@@ -5817,9 +4949,7 @@ mod tests {
         ));
 
         // Drain the message from bob's queue
-        let _ = hub
-            .long_poll_dequeue(&tok_b, Duration::from_millis(50))
-            .await;
+        let _ = test_long_poll_dequeue(&hub, &tok_b, Duration::from_millis(50)).await;
 
         // Bob → Alice via reply window
         assert!(matches!(
@@ -5827,8 +4957,7 @@ mod tests {
             Ok(Ack::Accepted)
         ));
 
-        let outcome = hub
-            .long_poll_dequeue(&tok_a, Duration::from_millis(50))
+        let outcome = test_long_poll_dequeue(&hub, &tok_a, Duration::from_millis(50))
             .await
             .unwrap();
         match outcome {
@@ -5841,10 +4970,8 @@ mod tests {
     #[tokio::test]
     async fn reply_window_consumed_on_use() {
         let (hub, _gov, tok_a, tok_b) = setup_hub_ab_window();
-        hub.register("alice", &tok_a, PresenceScope::GrantScoped)
-            .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
-            .unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::GrantScoped).unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::GrantScoped).unwrap();
 
         // Open window: alice → bob
         hub.send(&tok_a, "bob", Payload(b"msg".to_vec()), None, None)
@@ -5867,10 +4994,8 @@ mod tests {
     #[tokio::test]
     async fn reply_window_back_and_forth() {
         let (hub, _gov, tok_a, tok_b) = setup_hub_ab_window();
-        hub.register("alice", &tok_a, PresenceScope::GrantScoped)
-            .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
-            .unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::GrantScoped).unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::GrantScoped).unwrap();
 
         // Alice → Bob: opens window (bob, alice)
         hub.send(&tok_a, "bob", Payload(b"1".to_vec()), None, None)
@@ -5892,14 +5017,12 @@ mod tests {
     fn standing_grant_used_window_not_consumed() {
         let hub = make_hub(Duration::from_secs(30));
         let gov = hub.install_governor(None);
-        let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
-        let tok_b = hub.mint_participant_token(&gov, "id-bob", None).unwrap();
+        let tok_a = test_mint(&hub).unwrap();
+        let tok_b = test_mint(&hub).unwrap();
         // Symmetric grant with opens_reply_window=true
-        hub.approve_grant(&gov, "id-alice", "id-bob", None).unwrap();
-        hub.register("alice", &tok_a, PresenceScope::GrantScoped)
-            .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
-            .unwrap();
+        hub.approve_grant(&gov, &tok_a.0, &tok_b.0, None).unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::GrantScoped).unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::GrantScoped).unwrap();
 
         // Alice → Bob: opens window (bob, alice)
         hub.send(&tok_a, "bob", Payload(b"hi".to_vec()), None, None)
@@ -5938,13 +5061,11 @@ mod tests {
     #[tokio::test]
     async fn expired_window_not_used() {
         let hub = make_hub(Duration::from_secs(30));
-        let gov = hub.install_governor(None);
-        let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
-        let tok_b = hub.mint_participant_token(&gov, "id-bob", None).unwrap();
-        hub.register("alice", &tok_a, PresenceScope::GrantScoped)
-            .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
-            .unwrap();
+        let _gov = hub.install_governor(None);
+        let tok_a = test_mint(&hub).unwrap();
+        let tok_b = test_mint(&hub).unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::GrantScoped).unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::GrantScoped).unwrap();
 
         // Insert an already-expired window
         {
@@ -5970,13 +5091,13 @@ mod tests {
         use crate::trust::GrantDirection;
         let hub = Arc::new(make_hub(Duration::from_secs(30)));
         let gov = hub.install_governor(None);
-        let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
-        let tok_b = hub.mint_participant_token(&gov, "id-bob", None).unwrap();
+        let tok_a = test_mint(&hub).unwrap();
+        let tok_b = test_mint(&hub).unwrap();
         // AToB only: bob→alice has no standing grant, must use the reply window.
         hub.approve_grant_req(
             &gov,
-            "id-alice",
-            "id-bob",
+            &tok_a.0,
+            &tok_b.0,
             None,
             ApproveGrantRequest {
                 direction: Some(GrantDirection::AToB),
@@ -5985,10 +5106,8 @@ mod tests {
             },
         )
         .unwrap();
-        hub.register("alice", &tok_a, PresenceScope::GrantScoped)
-            .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
-            .unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::GrantScoped).unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::GrantScoped).unwrap();
 
         // Open window (bob, alice)
         hub.send(&tok_a, "bob", Payload(b"init".to_vec()), None, None)
@@ -6038,8 +5157,8 @@ mod tests {
     ) {
         let hub = make_hub(Duration::from_secs(30));
         let gov = hub.install_governor(None);
-        let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
-        let tok_b = hub.mint_participant_token(&gov, "id-bob", None).unwrap();
+        let tok_a = test_mint(&hub).unwrap();
+        let tok_b = test_mint(&hub).unwrap();
         // No grant between alice and bob
         (hub, gov, tok_a, tok_b)
     }
@@ -6048,6 +5167,9 @@ mod tests {
     #[test]
     fn no_grant_creates_connection_request() {
         let (hub, _gov, tok_a, _tok_b) = setup_hub_brief();
+        // send() requires the sender to be announced (token_to_name), unlike the deleted
+        // minted-agent path where an unannounced sender's from_name simply defaulted to "".
+        test_bind(&hub, "alice", &tok_a, PresenceScope::GrantScoped).unwrap();
         hub.inner.lock().unwrap().agents.insert(
             "bob".into(),
             ParticipantState {
@@ -6086,10 +5208,8 @@ mod tests {
     #[tokio::test]
     async fn no_grant_with_reason_creates_request() {
         let (hub, _gov, tok_a, tok_b) = setup_hub_brief();
-        hub.register("alice", &tok_a, PresenceScope::GrantScoped)
-            .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
-            .unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::GrantScoped).unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::GrantScoped).unwrap();
 
         let result = hub.send(
             &tok_a,
@@ -6117,17 +5237,15 @@ mod tests {
     fn no_grant_no_governor_still_creates_request() {
         let hub = make_hub(Duration::from_secs(30));
         let gov = hub.install_governor(None);
-        let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
-        let tok_b = hub.mint_participant_token(&gov, "id-bob", None).unwrap();
+        let tok_a = test_mint(&hub).unwrap();
+        let tok_b = test_mint(&hub).unwrap();
         hub.inner
             .lock()
             .unwrap()
             .trust
             .set_governor_online(&gov, false);
-        hub.register("alice", &tok_a, PresenceScope::GrantScoped)
-            .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
-            .unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::GrantScoped).unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::GrantScoped).unwrap();
 
         assert!(
             matches!(
@@ -6152,10 +5270,8 @@ mod tests {
     #[tokio::test]
     async fn connection_request_both_approve_delivers_message() {
         let (hub, gov, tok_a, tok_b) = setup_hub_brief();
-        hub.register("alice", &tok_a, PresenceScope::GrantScoped)
-            .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
-            .unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::GrantScoped).unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::GrantScoped).unwrap();
 
         let request_id = hub
             .request_grant(&tok_a.0, "bob", None, None)
@@ -6168,7 +5284,7 @@ mod tests {
         ));
 
         // Drain the grant_request event queued to Bob.
-        hub.long_poll_dequeue(&tok_b, Duration::from_millis(100))
+        test_long_poll_dequeue(&hub, &tok_b, Duration::from_millis(100))
             .await
             .unwrap();
 
@@ -6189,30 +5305,28 @@ mod tests {
     #[tokio::test]
     async fn connection_request_governor_deny_queues_denied_to_sender() {
         let (hub, gov, tok_a, tok_b) = setup_hub_brief();
-        hub.register("alice", &tok_a, PresenceScope::GrantScoped)
-            .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
-            .unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::GrantScoped).unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::GrantScoped).unwrap();
 
         let request_id = hub
             .request_grant(&tok_a.0, "bob", None, None)
             .expect("request_grant must succeed");
 
-        // Governor denies
-        let outcome = hub.respond_to_connection_request(&gov.0, &request_id, false);
-        assert!(matches!(outcome, Ok(RespondStatus::Denied { .. })));
+        // Governor denies (live path: respond_to_connection_request was superseded by the
+        // approve/deny/hold_grant_request trio operating on the same connection_requests map).
+        let outcome = hub.deny_grant_request(&gov.0, &request_id, "declined", None);
+        assert!(outcome.is_ok());
 
-        // Alice's queue should have a CONNECTION_DENIED system event
-        let msg = hub
-            .long_poll_dequeue(&tok_a, Duration::from_millis(100))
+        // Alice's queue should have a GRANT_DENIED system event.
+        let msg = test_long_poll_dequeue(&hub, &tok_a, Duration::from_millis(100))
             .await
             .unwrap();
         match msg {
             DequeueOutcome::Message(m) => {
                 assert_eq!(m.from_name, "system");
-                assert_eq!(m.event_type.as_deref(), Some("connection_denied"));
+                assert_eq!(m.event_type.as_deref(), Some("grant_denied"));
             }
-            DequeueOutcome::Empty => panic!("expected CONNECTION_DENIED message for sender"),
+            DequeueOutcome::Empty => panic!("expected GRANT_DENIED message for sender"),
         }
     }
 
@@ -6220,10 +5334,8 @@ mod tests {
     #[tokio::test]
     async fn hold_ttl_expiry_returns_mediation_unavailable() {
         let (hub, gov, tok_a, tok_b) = setup_hub_brief();
-        hub.register("alice", &tok_a, PresenceScope::GrantScoped)
-            .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
-            .unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::GrantScoped).unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::GrantScoped).unwrap();
 
         let mediation_id = "med-expired".to_string();
         {
@@ -6259,12 +5371,12 @@ mod tests {
         use crate::trust::{GrantDirection, GrantMediation};
         let hub = make_hub(Duration::from_secs(30));
         let gov = hub.install_governor(None);
-        let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
-        let tok_b = hub.mint_participant_token(&gov, "id-bob", None).unwrap();
+        let tok_a = test_mint(&hub).unwrap();
+        let tok_b = test_mint(&hub).unwrap();
         hub.approve_grant_req(
             &gov,
-            "id-alice",
-            "id-bob",
+            &tok_a.0,
+            &tok_b.0,
             None,
             ApproveGrantRequest {
                 mediation: Some(GrantMediation::Inspect),
@@ -6281,9 +5393,8 @@ mod tests {
     #[test]
     fn inspect_grant_holds_awaits_governor() {
         let (hub, _gov, tok_a, tok_b) = setup_hub_inspect();
-        hub.register("alice", &tok_a, PresenceScope::Public)
-            .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::Public).unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::Public).unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::Public).unwrap();
 
         let result = hub.send(&tok_a, "bob", Payload(b"hello".to_vec()), None, None);
         match result {
@@ -6298,9 +5409,8 @@ mod tests {
     #[tokio::test]
     async fn inspect_approve_delivers() {
         let (hub, gov, tok_a, tok_b) = setup_hub_inspect();
-        hub.register("alice", &tok_a, PresenceScope::Public)
-            .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::Public).unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::Public).unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::Public).unwrap();
 
         let mediation_id = match hub.send(&tok_a, "bob", Payload(b"hello".to_vec()), None, None) {
             Ok(Ack::PendingMediation { mediation_id }) => mediation_id,
@@ -6312,8 +5422,7 @@ mod tests {
             Ok(MediationResult::Delivered { .. })
         ));
 
-        let msg = hub
-            .long_poll_dequeue(&tok_b, Duration::from_millis(100))
+        let msg = test_long_poll_dequeue(&hub, &tok_b, Duration::from_millis(100))
             .await
             .unwrap();
         match msg {
@@ -6326,9 +5435,8 @@ mod tests {
     #[tokio::test]
     async fn inspect_block_returns_blocked() {
         let (hub, gov, tok_a, tok_b) = setup_hub_inspect();
-        hub.register("alice", &tok_a, PresenceScope::Public)
-            .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::Public).unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::Public).unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::Public).unwrap();
 
         let mediation_id = match hub.send(&tok_a, "bob", Payload(b"hello".to_vec()), None, None) {
             Ok(Ack::PendingMediation { mediation_id }) => mediation_id,
@@ -6340,8 +5448,7 @@ mod tests {
             Ok(MediationResult::Blocked)
         ));
 
-        let empty = hub
-            .long_poll_dequeue(&tok_b, Duration::from_millis(20))
+        let empty = test_long_poll_dequeue(&hub, &tok_b, Duration::from_millis(20))
             .await
             .unwrap();
         assert!(matches!(empty, DequeueOutcome::Empty));
@@ -6379,9 +5486,8 @@ mod tests {
     #[test]
     fn inspect_governor_offline_returns_mediation_unavailable() {
         let (hub, gov, tok_a, tok_b) = setup_hub_inspect();
-        hub.register("alice", &tok_a, PresenceScope::Public)
-            .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::Public).unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::Public).unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::Public).unwrap();
 
         hub.inner
             .lock()
@@ -6401,12 +5507,12 @@ mod tests {
         use crate::trust::{GrantDirection, GrantMediation};
         let hub = make_hub(Duration::from_secs(30));
         let gov = hub.install_governor(None);
-        let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
-        let tok_b = hub.mint_participant_token(&gov, "id-bob", None).unwrap();
+        let tok_a = test_mint(&hub).unwrap();
+        let tok_b = test_mint(&hub).unwrap();
         hub.approve_grant_req(
             &gov,
-            "id-alice",
-            "id-bob",
+            &tok_a.0,
+            &tok_b.0,
             None,
             ApproveGrantRequest {
                 mediation: Some(GrantMediation::Notify),
@@ -6415,17 +5521,15 @@ mod tests {
             },
         )
         .unwrap();
-        hub.register("alice", &tok_a, PresenceScope::Public)
-            .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::Public).unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::Public).unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::Public).unwrap();
 
         let mut events_rx = hub.subscribe_gov_events();
 
         let result = hub.send(&tok_a, "bob", Payload(b"hello".to_vec()), None, None);
         assert!(matches!(result, Ok(Ack::Accepted)));
 
-        let msg = hub
-            .long_poll_dequeue(&tok_b, Duration::from_millis(100))
+        let msg = test_long_poll_dequeue(&hub, &tok_b, Duration::from_millis(100))
             .await
             .unwrap();
         assert!(matches!(msg, DequeueOutcome::Message(_)));
@@ -6448,7 +5552,7 @@ mod tests {
 
         let hub = make_hub(Duration::from_secs(30));
         let gov = hub.install_governor(None);
-        let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
+        let tok_a = test_mint(&hub).unwrap();
 
         // Bob is a listen-flow client — register first, then open_listen.
         let bob_token = hub.register_participant();
@@ -6456,11 +5560,10 @@ mod tests {
             .open_listen(Some(&bob_token), None, Some("bob"), None, false, false)
             .unwrap();
         // Alice is a regular agent with a Notify grant to Bob.
-        hub.register("alice", &tok_a, PresenceScope::Public)
-            .unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::Public).unwrap();
         hub.approve_grant_req(
             &gov,
-            "id-alice",
+            &tok_a.0,
             &bob_token, // bob's identity is his token string
             None,
             ApproveGrantRequest {
@@ -6542,12 +5645,12 @@ mod tests {
         use crate::trust::{GrantDirection, GrantMediation};
         let hub = make_hub(Duration::from_secs(30));
         let gov = hub.install_governor(None);
-        let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
-        let tok_b = hub.mint_participant_token(&gov, "id-bob", None).unwrap();
+        let tok_a = test_mint(&hub).unwrap();
+        let tok_b = test_mint(&hub).unwrap();
         hub.approve_grant_req(
             &gov,
-            "id-alice",
-            "id-bob",
+            &tok_a.0,
+            &tok_b.0,
             None,
             ApproveGrantRequest {
                 mediation: Some(GrantMediation::Inspect),
@@ -6558,9 +5661,8 @@ mod tests {
             },
         )
         .unwrap();
-        hub.register("alice", &tok_a, PresenceScope::Public)
-            .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::Public).unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::Public).unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::Public).unwrap();
 
         let mut events_rx = hub.subscribe_gov_events();
 
@@ -6581,12 +5683,12 @@ mod tests {
         use crate::trust::GrantMediation;
         let hub = make_hub(Duration::from_secs(30));
         let gov = hub.install_governor(None);
-        let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
-        let tok_b = hub.mint_participant_token(&gov, "id-bob", None).unwrap();
+        let tok_a = test_mint(&hub).unwrap();
+        let tok_b = test_mint(&hub).unwrap();
         hub.approve_grant_req(
             &gov,
-            "id-alice",
-            "id-bob",
+            &tok_a.0,
+            &tok_b.0,
             None,
             ApproveGrantRequest {
                 mediation: Some(GrantMediation::Bypass),
@@ -6594,9 +5696,8 @@ mod tests {
             },
         )
         .unwrap();
-        hub.register("alice", &tok_a, PresenceScope::Public)
-            .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::Public).unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::Public).unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::Public).unwrap();
 
         assert!(matches!(
             hub.send(&tok_a, "bob", Payload(b"hello".to_vec()), None, None),
@@ -6608,16 +5709,13 @@ mod tests {
     #[tokio::test]
     async fn normal_message_omits_reason() {
         let (hub, tok_a, tok_b) = setup_hub_ab();
-        hub.register("alice", &tok_a, PresenceScope::GrantScoped)
-            .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
-            .unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::GrantScoped).unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::GrantScoped).unwrap();
 
         hub.send(&tok_a, "bob", Payload(b"hello".to_vec()), None, None)
             .unwrap();
 
-        let msg = hub
-            .long_poll_dequeue(&tok_b, Duration::from_millis(50))
+        let msg = test_long_poll_dequeue(&hub, &tok_b, Duration::from_millis(50))
             .await
             .unwrap();
         match msg {
@@ -6632,16 +5730,14 @@ mod tests {
     #[test]
     fn grant_scoped_querier_without_grant_sees_offline() {
         let hub = make_hub(Duration::from_secs(30));
-        let gov = hub.install_governor(None);
-        let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
-        let tok_b = hub.mint_participant_token(&gov, "id-bob", None).unwrap();
+        let _gov = hub.install_governor(None);
+        let tok_a = test_mint(&hub).unwrap();
+        let tok_b = test_mint(&hub).unwrap();
         // No grant between alice and bob
-        hub.register("alice", &tok_a, PresenceScope::GrantScoped)
-            .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
-            .unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::GrantScoped).unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::GrantScoped).unwrap();
 
-        let result = hub.presence_scoped(&tok_b, "alice");
+        let result = hub.presence_for_token(&tok_b.0, "alice");
         assert!(
             matches!(result, Ok(false)),
             "bob without grant should see alice as offline"
@@ -6653,15 +5749,13 @@ mod tests {
     fn grant_scoped_querier_with_grant_sees_online() {
         let hub = make_hub(Duration::from_secs(30));
         let gov = hub.install_governor(None);
-        let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
-        let tok_b = hub.mint_participant_token(&gov, "id-bob", None).unwrap();
-        hub.approve_grant(&gov, "id-alice", "id-bob", None).unwrap();
-        hub.register("alice", &tok_a, PresenceScope::GrantScoped)
-            .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
-            .unwrap();
+        let tok_a = test_mint(&hub).unwrap();
+        let tok_b = test_mint(&hub).unwrap();
+        hub.approve_grant(&gov, &tok_a.0, &tok_b.0, None).unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::GrantScoped).unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::GrantScoped).unwrap();
 
-        let result = hub.presence_scoped(&tok_b, "alice");
+        let result = hub.presence_for_token(&tok_b.0, "alice");
         assert!(
             matches!(result, Ok(true)),
             "bob with grant should see alice as online"
@@ -6673,14 +5767,13 @@ mod tests {
     fn hidden_agent_sends_and_receives_successfully() {
         let hub = make_hub(Duration::from_secs(30));
         let gov = hub.install_governor(None);
-        let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
-        let tok_b = hub.mint_participant_token(&gov, "id-bob", None).unwrap();
-        hub.approve_grant(&gov, "id-alice", "id-bob", None).unwrap();
-        hub.register("alice", &tok_a, PresenceScope::GrantScoped)
-            .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::Hidden).unwrap();
+        let tok_a = test_mint(&hub).unwrap();
+        let tok_b = test_mint(&hub).unwrap();
+        hub.approve_grant(&gov, &tok_a.0, &tok_b.0, None).unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::GrantScoped).unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::Hidden).unwrap();
 
-        let presence = hub.presence_scoped(&tok_a, "bob");
+        let presence = hub.presence_for_token(&tok_a.0, "bob");
         assert!(
             matches!(presence, Ok(false)),
             "hidden agent appears offline to grant-holder"
@@ -6693,21 +5786,13 @@ mod tests {
         );
     }
 
-    /// Self-query always returns true is_online regardless of scope.
-    #[test]
-    fn self_query_always_returns_true_status() {
-        let hub = make_hub(Duration::from_secs(30));
-        let gov = hub.install_governor(None);
-        let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
-        hub.register("alice", &tok_a, PresenceScope::Hidden)
-            .unwrap();
-
-        let result = hub.presence_scoped(&tok_a, "alice");
-        assert!(
-            matches!(result, Ok(true)),
-            "self-query on hidden agent should return true"
-        );
-    }
+    // NOTE: the old `self_query_always_returns_true_status` test (self-query on a hidden
+    // agent always reports online) tested a `TrustChain.agents`-era `presence_scoped`
+    // special case that has no live equivalent: `presence_for_token` (15-0028 /
+    // operator-final-rule) gates ALL presence queries — including self-queries — uniformly
+    // by grant-or-shared-room, with no self-query bypass. Removed rather than "fixed" since
+    // the behavior it asserted no longer exists on the reachable path (confirmed by reading
+    // presence_for_token in full: no querier==target special case).
 
     // ── SSE liveness tests (AC1–AC4) ─────────────────────────────────────────
 
@@ -6715,10 +5800,9 @@ mod tests {
     #[tokio::test]
     async fn ac_sse_1_active_sse_keeps_agent_online_after_liveness_lapse() {
         let hub = make_hub(Duration::from_millis(10));
-        let gov = hub.install_governor(None);
-        let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
-        hub.register("alice", &tok_a, PresenceScope::Public)
-            .unwrap();
+        let _gov = hub.install_governor(None);
+        let tok_a = test_mint(&hub).unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::Public).unwrap();
 
         hub.sse_open("alice");
 
@@ -6734,10 +5818,9 @@ mod tests {
     #[tokio::test]
     async fn ac_sse_2_closed_sse_lets_agent_go_offline() {
         let hub = make_hub(Duration::from_millis(10));
-        let gov = hub.install_governor(None);
-        let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
-        hub.register("alice", &tok_a, PresenceScope::Public)
-            .unwrap();
+        let _gov = hub.install_governor(None);
+        let tok_a = test_mint(&hub).unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::Public).unwrap();
 
         hub.sse_open("alice");
         hub.sse_close("alice");
@@ -6755,19 +5838,24 @@ mod tests {
     async fn ac_sse_3_active_sse_visible_to_presence_query() {
         let hub = make_hub(Duration::from_millis(10));
         let gov = hub.install_governor(None);
-        let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
-        let tok_b = hub.mint_participant_token(&gov, "id-bob", None).unwrap();
-        hub.approve_grant(&gov, "id-alice", "id-bob", None).unwrap();
-        hub.register("alice", &tok_a, PresenceScope::GrantScoped)
-            .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
-            .unwrap();
+        let tok_a = test_mint(&hub).unwrap();
+        let tok_b = test_mint(&hub).unwrap();
+        hub.approve_grant(&gov, &tok_a.0, &tok_b.0, None).unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::GrantScoped).unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::GrantScoped).unwrap();
 
-        hub.sse_open("alice");
+        // presence_for_token's listen-flow branch checks the token-keyed `sse_connections`
+        // map (populated by open_listen), not the name-keyed `active_sse_connections` that
+        // `sse_open()`/`presence()` use — so simulate an active SSE stream the same way
+        // open_listen does, directly under the lock, rather than via a real SSE connection.
+        {
+            let mut inner = hub.lock();
+            *inner.sse_connections.entry(tok_a.0.clone()).or_insert(0) += 1;
+        }
 
         tokio::time::sleep(Duration::from_millis(30)).await;
 
-        let result = hub.presence_scoped(&tok_b, "alice");
+        let result = hub.presence_for_token(&tok_b.0, "alice");
         assert!(
             matches!(result, Ok(true)),
             "agent with active SSE should appear online to grant-holder"
@@ -6778,10 +5866,9 @@ mod tests {
     #[tokio::test]
     async fn ac_sse_4_no_sse_goes_offline_after_liveness_window() {
         let hub = make_hub(Duration::from_millis(10));
-        let gov = hub.install_governor(None);
-        let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
-        hub.register("alice", &tok_a, PresenceScope::Public)
-            .unwrap();
+        let _gov = hub.install_governor(None);
+        let tok_a = test_mint(&hub).unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::Public).unwrap();
 
         tokio::time::sleep(Duration::from_millis(30)).await;
 
@@ -6798,36 +5885,38 @@ mod tests {
     fn governor_list_participants() {
         let hub = make_hub(Duration::from_secs(30));
         let gov = hub.install_governor(None);
-        let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
-        let tok_b = hub.mint_participant_token(&gov, "id-bob", None).unwrap();
-        hub.register("alice", &tok_a, PresenceScope::GrantScoped)
-            .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
-            .unwrap();
+        let tok_a = test_mint(&hub).unwrap();
+        let tok_b = test_mint(&hub).unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::GrantScoped).unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::GrantScoped).unwrap();
 
         let agents = hub.list_participants(&gov).unwrap();
         assert_eq!(agents.len(), 2);
 
+        // Listen-flow identity == token (unlike the deleted minted-agent path).
         let alice = agents.iter().find(|a| a.name == "alice").unwrap();
-        assert_eq!(alice.identity, "id-alice");
+        assert_eq!(alice.identity, tok_a.0);
         assert_eq!(alice.status, "online");
 
         let bob = agents.iter().find(|a| a.name == "bob").unwrap();
-        assert_eq!(bob.identity, "id-bob");
+        assert_eq!(bob.identity, tok_b.0);
         assert_eq!(bob.status, "online");
     }
 
-    /// AC2: agent token → Forbidden (maps to 403 FORBIDDEN at HTTP layer).
+    /// AC2 (updated for 15-0030): participant token → AuthFailed (was Forbidden / 403
+    /// FORBIDDEN at the HTTP layer). See ac_gov_grants_6_7_8_auth_errors's AC8 comment — the
+    /// Forbidden-for-agent-token distinction was specific to the now-deleted
+    /// TrustChain.agents-backed minted agent token; a listen token here yields AuthFailed.
     #[test]
     fn list_participants_rejects_participant_token() {
         let hub = make_hub(Duration::from_secs(30));
-        let gov = hub.install_governor(None);
-        let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
+        let _gov = hub.install_governor(None);
+        let tok_a = test_mint(&hub).unwrap();
 
         let fake_gov = GovernorToken(tok_a.0.clone());
         assert!(
-            matches!(hub.list_participants(&fake_gov), Err(Error::Forbidden)),
-            "agent token must be rejected with Forbidden for list_participants"
+            matches!(hub.list_participants(&fake_gov), Err(Error::AuthFailed)),
+            "participant token must be rejected with AuthFailed for list_participants"
         );
     }
 
@@ -6836,9 +5925,8 @@ mod tests {
     fn list_participants_hidden_appears_offline() {
         let hub = make_hub(Duration::from_secs(30));
         let gov = hub.install_governor(None);
-        let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
-        hub.register("alice", &tok_a, PresenceScope::Hidden)
-            .unwrap();
+        let tok_a = test_mint(&hub).unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::Hidden).unwrap();
         hub.sse_open("alice"); // ensure truly "online" per SSE liveness
 
         let agents = hub.list_participants(&gov).unwrap();
@@ -6852,44 +5940,19 @@ mod tests {
     }
 
     // ── Token refresh tests (AC6–AC10 / Feature 2) ───────────────────────────
-
-    /// AC6 + AC7 + AC8: agent refresh returns new token; old invalidated; grants still valid.
-    #[test]
-    fn ac6_ac7_ac8_participant_token_refresh() {
-        let hub = make_hub(Duration::from_secs(30));
-        let gov = hub.install_governor(None);
-        let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
-        let tok_b = hub.mint_participant_token(&gov, "id-bob", None).unwrap();
-        hub.approve_grant(&gov, "id-alice", "id-bob", None).unwrap();
-        hub.register("alice", &tok_a, PresenceScope::GrantScoped)
-            .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
-            .unwrap();
-
-        let new_tok_a = hub.refresh_participant_token(&tok_a).unwrap();
-
-        // AC6: new token returned, different from old
-        assert_ne!(new_tok_a.0, tok_a.0);
-
-        // AC7: old token invalidated
-        assert!(
-            matches!(
-                hub.validate_participant_token(&tok_a),
-                Err(Error::AuthFailed)
-            ),
-            "old agent token must be invalidated after refresh"
-        );
-
-        // AC8: new token valid and grant still applies
-        assert!(hub.validate_participant_token(&new_tok_a).is_ok());
-        assert!(
-            matches!(
-                hub.send(&new_tok_a, "bob", Payload(b"hi".to_vec()), None, None),
-                Ok(Ack::Accepted)
-            ),
-            "grant must remain valid after token refresh"
-        );
-    }
+    //
+    // AC6-AC8 (self-service `refresh_participant_token`) and AC10 (governor
+    // `governor_refresh_participant_token`) tested the deleted minted-agent token-rotation
+    // methods. Self-service rotation has no live equivalent (listen-flow agents keep one
+    // token for the session; there is no "rotate my own token" primitive). The governor-forced
+    // case (AC10) IS live — as `issue_participant_token(gov, Some(name))`, the atomic
+    // invalidate-old / mint-new / rebind-to-name "governor rebind" — and it already has
+    // dedicated coverage below (test_grants_survive_rebind,
+    // test_rebind_invalidates_old_token_new_can_announce,
+    // test_issue_participant_token_unknown_name, test_issue_participant_token_requires_governor).
+    // So AC6-AC8, AC10, and the token-rotation-specific `agent_refresh_preserves_registration`
+    // are removed rather than converted: there is nothing left to convert them to that isn't
+    // already tested.
 
     /// AC9: governor refresh returns new token; old governor token invalidated.
     #[test]
@@ -6911,66 +5974,6 @@ mod tests {
         );
     }
 
-    /// AC10: governor force-refresh invalidates old agent token, returns new one.
-    #[test]
-    fn ac10_governor_force_refresh_participant_token() {
-        let hub = make_hub(Duration::from_secs(30));
-        let gov = hub.install_governor(None);
-        let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
-
-        let new_tok_a = hub
-            .governor_refresh_participant_token(&gov, "id-alice")
-            .unwrap();
-
-        assert_ne!(new_tok_a.0, tok_a.0);
-
-        assert!(
-            matches!(
-                hub.validate_participant_token(&tok_a),
-                Err(Error::AuthFailed)
-            ),
-            "old token must be invalidated after governor force-refresh"
-        );
-        assert!(
-            hub.validate_participant_token(&new_tok_a).is_ok(),
-            "new token must be valid after governor force-refresh"
-        );
-    }
-
-    /// Refresh keeps token_to_name mapping: dequeue still works with new token.
-    #[tokio::test]
-    async fn agent_refresh_preserves_registration() {
-        let hub = make_hub(Duration::from_secs(30));
-        let gov = hub.install_governor(None);
-        let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
-        let tok_b = hub.mint_participant_token(&gov, "id-bob", None).unwrap();
-        hub.approve_grant(&gov, "id-alice", "id-bob", None).unwrap();
-        hub.register("alice", &tok_a, PresenceScope::GrantScoped)
-            .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
-            .unwrap();
-
-        let new_tok_a = hub.refresh_participant_token(&tok_a).unwrap();
-
-        // Send from new token and verify bob can dequeue
-        hub.send(
-            &new_tok_a,
-            "bob",
-            Payload(b"after-refresh".to_vec()),
-            None,
-            None,
-        )
-        .unwrap();
-        let outcome = hub
-            .long_poll_dequeue(&tok_b, Duration::from_millis(100))
-            .await
-            .unwrap();
-        match outcome {
-            DequeueOutcome::Message(m) => assert_eq!(m.payload.0, b"after-refresh"),
-            DequeueOutcome::Empty => panic!("expected message after refresh"),
-        }
-    }
-
     // ── Bilateral consent tests (AC1–AC8 for task 20-9008) ───────────────────
 
     fn setup_hub_no_grant() -> (
@@ -6981,8 +5984,8 @@ mod tests {
     ) {
         let hub = make_hub(Duration::from_secs(30));
         let gov = hub.install_governor(None);
-        let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
-        let tok_b = hub.mint_participant_token(&gov, "id-bob", None).unwrap();
+        let tok_a = test_mint(&hub).unwrap();
+        let tok_b = test_mint(&hub).unwrap();
         (hub, gov, tok_a, tok_b)
     }
 
@@ -6990,13 +5993,9 @@ mod tests {
     #[test]
     fn ac_bilateral_1_send_to_unregistered_recipient_unknown() {
         let (hub, _gov, tok_a, _tok_b) = setup_hub_no_grant();
-        hub.inner.lock().unwrap().agents.insert(
-            "alice".into(),
-            ParticipantState {
-                identity: "id-alice".into(),
-                notify: Arc::new(tokio::sync::Notify::new()),
-            },
-        );
+        // Announce alice properly (rather than poking `inner.agents` directly) so
+        // token_to_name is populated too — send() requires the sender to be announced.
+        test_bind(&hub, "alice", &tok_a, PresenceScope::GrantScoped).unwrap();
         // bob is never registered
         assert!(matches!(
             hub.send(&tok_a, "bob", Payload(b"hi".to_vec()), None, None),
@@ -7010,10 +6009,8 @@ mod tests {
     #[tokio::test]
     async fn ac_bilateral_2_send_no_grant_queues_connection_request() {
         let (hub, gov, tok_a, tok_b) = setup_hub_no_grant();
-        hub.register("alice", &tok_a, PresenceScope::GrantScoped)
-            .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
-            .unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::GrantScoped).unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::GrantScoped).unwrap();
 
         let mut events_rx = hub.subscribe_gov_events();
 
@@ -7036,8 +6033,7 @@ mod tests {
         // After governor approves, Bob gets a grant_request message in his queue.
         hub.approve_grant_request(&gov.0, &request_id, None)
             .expect("governor approval must succeed");
-        let msg = hub
-            .long_poll_dequeue(&tok_b, Duration::from_millis(100))
+        let msg = test_long_poll_dequeue(&hub, &tok_b, Duration::from_millis(100))
             .await
             .unwrap();
         match msg {
@@ -7055,10 +6051,8 @@ mod tests {
     #[tokio::test]
     async fn ac_bilateral_3_both_approve_grant_established_message_delivered() {
         let (hub, gov, tok_a, tok_b) = setup_hub_no_grant();
-        hub.register("alice", &tok_a, PresenceScope::GrantScoped)
-            .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
-            .unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::GrantScoped).unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::GrantScoped).unwrap();
 
         let request_id = hub
             .request_grant(&tok_a.0, "bob", None, None)
@@ -7071,7 +6065,7 @@ mod tests {
         ));
 
         // Drain the grant_request event queued to Bob.
-        hub.long_poll_dequeue(&tok_b, Duration::from_millis(100))
+        test_long_poll_dequeue(&hub, &tok_b, Duration::from_millis(100))
             .await
             .unwrap();
 
@@ -7092,33 +6086,31 @@ mod tests {
     #[tokio::test]
     async fn ac_bilateral_4_governor_deny_connection_denied_to_sender() {
         let (hub, gov, tok_a, tok_b) = setup_hub_no_grant();
-        hub.register("alice", &tok_a, PresenceScope::GrantScoped)
-            .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
-            .unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::GrantScoped).unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::GrantScoped).unwrap();
 
         let request_id = hub
             .request_grant(&tok_a.0, "bob", None, None)
             .expect("request_grant must succeed");
 
-        assert!(matches!(
-            hub.respond_to_connection_request(&gov.0, &request_id, false),
-            Ok(RespondStatus::Denied { .. })
-        ));
+        // Live path: deny_grant_request supersedes respond_to_connection_request(approve=false).
+        assert!(
+            hub.deny_grant_request(&gov.0, &request_id, "declined", None)
+                .is_ok()
+        );
 
-        // Alice's queue has CONNECTION_DENIED
-        let msg = hub
-            .long_poll_dequeue(&tok_a, Duration::from_millis(100))
+        // Alice's queue has GRANT_DENIED
+        let msg = test_long_poll_dequeue(&hub, &tok_a, Duration::from_millis(100))
             .await
             .unwrap();
         match msg {
             DequeueOutcome::Message(m) => {
                 assert_eq!(m.from_name, "system");
-                assert_eq!(m.event_type.as_deref(), Some("connection_denied"));
+                assert_eq!(m.event_type.as_deref(), Some("grant_denied"));
                 let v: serde_json::Value = serde_json::from_slice(&m.payload.0).unwrap();
-                assert_eq!(v["type"], "connection_denied");
+                assert_eq!(v["type"], "grant_denied");
             }
-            DequeueOutcome::Empty => panic!("expected CONNECTION_DENIED for sender"),
+            DequeueOutcome::Empty => panic!("expected GRANT_DENIED for sender"),
         }
     }
 
@@ -7126,31 +6118,29 @@ mod tests {
     #[tokio::test]
     async fn ac_bilateral_5_alice_deny_connection_denied_to_sender() {
         let (hub, _gov, tok_a, tok_b) = setup_hub_no_grant();
-        hub.register("alice", &tok_a, PresenceScope::GrantScoped)
-            .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
-            .unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::GrantScoped).unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::GrantScoped).unwrap();
 
         let request_id = hub
             .request_grant(&tok_a.0, "bob", None, None)
             .expect("request_grant must succeed");
 
-        // Bob (recipient) denies
-        assert!(matches!(
-            hub.respond_to_connection_request(&tok_b.0, &request_id, false),
-            Ok(RespondStatus::Denied { .. })
-        ));
+        // Bob (recipient) denies (live path: deny_grant_request accepts either the governor
+        // or the recipient's listen token as caller — see its is_recipient check).
+        assert!(
+            hub.deny_grant_request(&tok_b.0, &request_id, "declined", None)
+                .is_ok()
+        );
 
-        // Alice gets CONNECTION_DENIED
-        let msg = hub
-            .long_poll_dequeue(&tok_a, Duration::from_millis(100))
+        // Alice gets GRANT_DENIED
+        let msg = test_long_poll_dequeue(&hub, &tok_a, Duration::from_millis(100))
             .await
             .unwrap();
         match msg {
             DequeueOutcome::Message(m) => {
-                assert_eq!(m.event_type.as_deref(), Some("connection_denied"));
+                assert_eq!(m.event_type.as_deref(), Some("grant_denied"));
             }
-            DequeueOutcome::Empty => panic!("expected CONNECTION_DENIED for sender"),
+            DequeueOutcome::Empty => panic!("expected GRANT_DENIED for sender"),
         }
     }
 
@@ -7158,10 +6148,8 @@ mod tests {
     #[tokio::test]
     async fn ac_bilateral_6_reason_included_in_event() {
         let (hub, _gov, tok_a, tok_b) = setup_hub_no_grant();
-        hub.register("alice", &tok_a, PresenceScope::GrantScoped)
-            .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
-            .unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::GrantScoped).unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::GrantScoped).unwrap();
 
         let mut gov_rx = hub.subscribe_gov_events();
 
@@ -7192,10 +6180,8 @@ mod tests {
     #[test]
     fn ac_bilateral_r7_dedup_second_send_returns_existing_request() {
         let (hub, _gov, tok_a, tok_b) = setup_hub_no_grant();
-        hub.register("alice", &tok_a, PresenceScope::GrantScoped)
-            .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
-            .unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::GrantScoped).unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::GrantScoped).unwrap();
 
         // First request_grant creates the connection request.
         let id1 = hub
@@ -7557,12 +6543,9 @@ mod tests {
             );
         }
         // A message addressed to Alice must route (not RecipientUnknown).
-        let gov = hub2.install_governor(None);
-        let sender = hub2
-            .mint_participant_token(&gov, "id-sender", None)
-            .unwrap();
-        hub2.register("sender", &sender, PresenceScope::GrantScoped)
-            .unwrap();
+        let _gov = hub2.install_governor(None);
+        let sender = test_mint(&hub2).unwrap();
+        test_bind(&hub2, "sender", &sender, PresenceScope::GrantScoped).unwrap();
         let res = hub2.send(&sender, "Alice", Payload(b"hi".to_vec()), None, None);
         assert!(
             !matches!(res, Err(Error::RecipientUnknown)),
@@ -8059,13 +7042,11 @@ mod tests {
     ) {
         let hub = make_persisted_hub(db, Duration::from_secs(30)).await;
         let gov = hub.install_governor(None);
-        let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
-        let tok_b = hub.mint_participant_token(&gov, "id-bob", None).unwrap();
-        hub.approve_grant(&gov, "id-alice", "id-bob", None).unwrap();
-        hub.register("alice", &tok_a, PresenceScope::GrantScoped)
-            .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
-            .unwrap();
+        let tok_a = test_mint(&hub).unwrap();
+        let tok_b = test_mint(&hub).unwrap();
+        hub.approve_grant(&gov, &tok_a.0, &tok_b.0, None).unwrap();
+        test_bind(&hub, "alice", &tok_a, PresenceScope::GrantScoped).unwrap();
+        test_bind(&hub, "bob", &tok_b, PresenceScope::GrantScoped).unwrap();
         (hub, tok_a, tok_b, gov)
     }
 
@@ -8092,8 +7073,7 @@ mod tests {
         assert_eq!(meta.size, 7);
 
         // Recipient receives metadata only — NOT the bytes (FR3).
-        match hub
-            .long_poll_dequeue(&tok_b, Duration::from_millis(100))
+        match test_long_poll_dequeue(&hub, &tok_b, Duration::from_millis(100))
             .await
             .unwrap()
         {
@@ -8123,10 +7103,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ac_attach_2_access_control() {
         let db = unique_test_db();
-        let (hub, tok_a, _tok_b, gov) = setup_persisted_ab(&db).await;
-        let tok_c = hub.mint_participant_token(&gov, "id-carol", None).unwrap();
-        hub.register("carol", &tok_c, PresenceScope::GrantScoped)
-            .unwrap();
+        let (hub, tok_a, _tok_b, _gov) = setup_persisted_ab(&db).await;
+        let tok_c = test_mint(&hub).unwrap();
+        test_bind(&hub, "carol", &tok_c, PresenceScope::GrantScoped).unwrap();
 
         let meta = hub
             .attach(
@@ -8152,10 +7131,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ac_attach_3_requires_grant() {
         let db = unique_test_db();
-        let (hub, tok_a, _tok_b, gov) = setup_persisted_ab(&db).await;
-        let tok_c = hub.mint_participant_token(&gov, "id-carol", None).unwrap();
-        hub.register("carol", &tok_c, PresenceScope::GrantScoped)
-            .unwrap();
+        let (hub, tok_a, _tok_b, _gov) = setup_persisted_ab(&db).await;
+        let tok_c = test_mint(&hub).unwrap();
+        test_bind(&hub, "carol", &tok_c, PresenceScope::GrantScoped).unwrap();
         let r = hub
             .attach(
                 &tok_a.0,
@@ -8280,8 +7258,7 @@ mod tests {
             "AC3: governor must be valid after restart"
         );
         assert!(
-            hub2.mint_participant_token(&gov_tok, "new-agent", None)
-                .is_ok(),
+            test_mint(&hub2).is_ok(),
             "AC3: governor can mint after restart"
         );
         assert!(
@@ -8292,31 +7269,13 @@ mod tests {
         let _ = std::fs::remove_file(&db);
     }
 
-    /// AC4: expired tokens past expires_at do NOT work after restart.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ac4_expired_tokens_not_loaded() {
-        let db = unique_test_db();
-
-        let expired_agent = {
-            let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
-            let gov = hub.install_governor(None);
-            // 100ms expiry
-            hub.mint_participant_token(&gov, "expiring", Some(Duration::from_millis(100)))
-                .unwrap()
-        };
-
-        // Wait for expiry
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        let hub2 = make_persisted_hub(&db, Duration::from_secs(30)).await;
-        let result = hub2.validate_participant_token(&expired_agent);
-        assert!(
-            result.is_err(),
-            "AC4: expired agent token must not work after restart"
-        );
-
-        let _ = std::fs::remove_file(&db);
-    }
+    // NOTE: the old `ac4_expired_tokens_not_loaded` test asserted that a minted agent token
+    // with a fixed `expires_at` does not survive past its expiry after a restart. Listen
+    // tokens have no `expiry: Option<Duration>` mint parameter at all — staleness is handled
+    // entirely by GC aging (age/unlisten/no-grant TTLs), which already has dedicated
+    // live-path coverage below (ac_t4_gc_unlisten_ttl_removes_never_listened_token,
+    // ac_t5_gc_no_grant_ttl_removes_listened_never_granted_token, test_abandoned_token_gcd).
+    // Removed rather than converted: there is no fixed-expiry mechanism left to test.
 
     /// AC5: revoking a token removes it from store immediately; does not return after restart.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -8427,16 +7386,18 @@ mod tests {
         let existing_ids: Vec<String> = {
             let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
             let gov = hub.install_governor(None);
-            let a1 = hub.mint_participant_token(&gov, "a1", None).unwrap().0;
-            let a2 = hub.mint_participant_token(&gov, "a2", None).unwrap().0;
-            hub.approve_grant(&gov, "a1", "a2", None).unwrap();
+            let a1 = test_mint(&hub).unwrap().0;
+            let a2 = test_mint(&hub).unwrap().0;
+            // Also advance the counter via a grant ID (next_id is shared across governor,
+            // agent, and grant IDs — this exercises grant-ID counter seeding on reload too).
+            hub.approve_grant(&gov, &a1, &a2, None).unwrap();
             vec![gov.0, a1, a2]
         };
 
         // Phase 2: reload and mint new tokens — IDs must not collide
         let hub2 = make_persisted_hub(&db, Duration::from_secs(30)).await;
         let gov2 = hub2.install_governor(None);
-        let new_agent = hub2.mint_participant_token(&gov2, "a3", None).unwrap();
+        let new_agent = test_mint(&hub2).unwrap();
 
         assert!(
             !existing_ids.contains(&gov2.0),
@@ -8780,7 +7741,7 @@ mod tests {
         let listen_tok = {
             let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
             let gov = hub.install_governor(None);
-            let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
+            let tok_a = test_mint(&hub).unwrap();
 
             // Issue token for bob and announce its name.
             let reg_bob = hub.register_participant();
@@ -8790,8 +7751,7 @@ mod tests {
             hub.announce(&listen_tok, "bob").unwrap();
 
             // Register alice so request_grant() can route by name.
-            hub.register("alice", &tok_a, PresenceScope::GrantScoped)
-                .unwrap();
+            test_bind(&hub, "alice", &tok_a, PresenceScope::GrantScoped).unwrap();
 
             // Alice has no grant yet — request it explicitly.
             let _ = hub.send(&tok_a, "bob", Payload(b"hello".to_vec()), None, None);
@@ -8851,12 +7811,8 @@ mod tests {
         let hub2 = make_persisted_hub(&db, Duration::from_secs(30)).await;
 
         // Create a fresh sender on hub2 (original governor/agent tokens are not persisted).
-        let gov2 = hub2.install_governor(None);
-        let tok_a2 = hub2
-            .mint_participant_token(&gov2, "id-alice", None)
-            .unwrap();
-        hub2.register("alice", &tok_a2, PresenceScope::GrantScoped)
-            .unwrap();
+        let tok_a2 = test_mint(&hub2).unwrap();
+        test_bind(&hub2, "alice", &tok_a2, PresenceScope::GrantScoped).unwrap();
 
         // bob's token was announced before restart; routing entry must have been restored.
         let result = hub2.send(&tok_a2, "bob", Payload(b"ac1-probe".to_vec()), None, None);
@@ -9100,8 +8056,8 @@ mod tests {
     #[test]
     fn ac_gov_grants_6_7_8_auth_errors() {
         let hub = make_hub(Duration::from_secs(30));
-        let gov = hub.install_governor(None);
-        let participant_tok = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
+        let _gov = hub.install_governor(None);
+        let participant_tok = test_mint(&hub).unwrap();
 
         // AC6: empty/absent token string
         let no_token = GovernorToken("".into());
@@ -9123,14 +8079,21 @@ mod tests {
             "AC7: invalid token must yield AuthFailed"
         );
 
-        // AC8: a valid agent token presented in the governor slot → Forbidden
-        let agent_as_gov = GovernorToken(participant_tok.0.clone());
+        // AC8 (updated for 15-0030): a valid participant (listen) token presented in the
+        // governor slot → AuthFailed. The original AC8 expected Forbidden specifically for a
+        // TrustChain.agents-backed minted agent token — `verify_governor`'s
+        // `self.agents.contains_key(...)` branch distinguished "valid-but-wrong-type" (403)
+        // from "unknown" (401) for that now-deleted token category. Listen tokens were never
+        // in `TrustChain.agents`, so a listen token here already fell through to AuthFailed
+        // pre-15-0030 too — this assertion now matches that reality instead of an
+        // unreachable minted-agent path.
+        let participant_as_gov = GovernorToken(participant_tok.0.clone());
         assert!(
             matches!(
-                hub.list_all_grants_gov(&agent_as_gov, None),
-                Err(Error::Forbidden)
+                hub.list_all_grants_gov(&participant_as_gov, None),
+                Err(Error::AuthFailed)
             ),
-            "AC8: agent token in governor slot must yield Forbidden"
+            "AC8: participant token in governor slot must yield AuthFailed"
         );
     }
 
@@ -9236,54 +8199,13 @@ mod tests {
         );
     }
 
-    /// presence_any_token: same grant-gating applies to minted agent tokens.
-    #[test]
-    fn test_presence_any_token_no_grant_returns_offline() {
-        let hub = make_hub(Duration::from_secs(30));
-        let gov = hub.install_governor(None);
-
-        // Mint tokens (no grant).
-        let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
-        let tok_b = hub.mint_participant_token(&gov, "id-bob", None).unwrap();
-
-        // Register both.
-        hub.register("alice", &tok_a, PresenceScope::GrantScoped)
-            .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
-            .unwrap();
-
-        // A uses presence_any_token with minted agent token → no grant → false.
-        let result = hub.presence_any_token(&tok_a.0, "bob");
-        assert!(
-            matches!(result, Ok(false)),
-            "Minted agent without grant should see target as not visible"
-        );
-    }
-
-    /// presence_any_token: with grant, returns real status.
-    #[test]
-    fn test_presence_any_token_with_grant_returns_online() {
-        let hub = make_hub(Duration::from_secs(30));
-        let gov = hub.install_governor(None);
-
-        // Mint tokens and create grant.
-        let tok_a = hub.mint_participant_token(&gov, "id-alice", None).unwrap();
-        let tok_b = hub.mint_participant_token(&gov, "id-bob", None).unwrap();
-        hub.approve_grant(&gov, "id-alice", "id-bob", None).unwrap();
-
-        // Register both.
-        hub.register("alice", &tok_a, PresenceScope::GrantScoped)
-            .unwrap();
-        hub.register("bob", &tok_b, PresenceScope::GrantScoped)
-            .unwrap();
-
-        // A with grant → sees bob's real status.
-        let result = hub.presence_any_token(&tok_a.0, "bob");
-        assert!(
-            matches!(result, Ok(true)),
-            "Minted agent with grant should see target's real status"
-        );
-    }
+    // NOTE: `test_presence_any_token_no_grant_returns_offline` /
+    // `test_presence_any_token_with_grant_returns_online` tested `presence_any_token`'s
+    // now-deleted minted-agent branch specifically. `presence_any_token` itself was dead
+    // (no HTTP route; superseded by `presence_for_token`, which is exercised by
+    // `test_presence_no_grant_returns_offline` / `test_presence_with_grant_returns_online`
+    // above) — removed along with it rather than converted, since the listen-flow behavior
+    // they'd otherwise duplicate is already covered.
 
     /// 15-0039: presence_for_token for a name that was NEVER registered must return
     /// RecipientUnknown (404) — indistinguishable-from-offline is a leak of registration

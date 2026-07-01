@@ -3276,23 +3276,23 @@ async fn ac_pp4_no_grant_no_presence_event_to_non_peer() {
     );
 }
 
-// AC5 (15-0002F): minted-agent deregisters → listen-flow grant-peer receives offline event.
+// AC5 (15-0002F), converted for 15-0030: governor-forced deregister (revoke_by_name) of a
+// listen-flow participant → grant-peer with an active SSE stream and presence_push receives
+// an offline event.
 //
-// This tests the identity-keyed grant path: the grant is approved using the minted agent's
-// identity string (not their token), so the FP1 name lookup in approve_grant_req sets name_a=None.
-// Before the fix, list_grants_for_name("bob") found no grant and alice never received the event.
-// After the fix, grant_counterparties_for("bob", "bob-id") finds the grant via identity_a match.
-//
-// Note: register() does NOT call grant_peer_senders, so there is intentionally no corresponding
-// online test — minted agents have no announce() path and no "online" presence push.
+// This replaces the deleted ac_pp5_minted_agent_deregister_sends_offline_to_listen_peer,
+// which exercised the SAME begin_settle_offline()-triggered notification but through the
+// now-removed minted-agent mint_participant_token/register/deregister trio (dead code per
+// 15-0030 — no HTTP route ever reached it). revoke_by_name is the live governor-forced
+// deregister path (DELETE /participants/{name}); it calls begin_settle_offline() exactly
+// like the old deregister() did. Confirmed before deleting the old test that no other test
+// already covered this notification on the live path (grep for revoke_by_name across the
+// test suite turned up zero call sites).
 #[tokio::test]
-async fn ac_pp5_minted_agent_deregister_sends_offline_to_listen_peer() {
-    use simple_im::registry::PresenceScope;
-    use simple_im::types::ParticipantToken;
-
+async fn ac_pp5_governor_revoke_sends_offline_to_listen_peer() {
     let (hub, gov) = make_presence_hub();
 
-    // Alice: V2 listen-flow agent (observer — will receive presence events).
+    // Alice: listen-flow agent (observer — will receive presence events).
     let tok_a = hub.register_participant();
 
     let (_, mut rx_a) = hub
@@ -3300,22 +3300,20 @@ async fn ac_pp5_minted_agent_deregister_sends_offline_to_listen_peer() {
         .unwrap();
     hub.announce(&tok_a, "PpA5").unwrap();
 
-    // Bob: minted participant with a stable identity distinct from his token.
-    let bob_tok: ParticipantToken = hub.mint_participant_token(&gov, "bob-id-5", None).unwrap();
-    hub.register("PpB5", &bob_tok, PresenceScope::Public)
-        .unwrap();
+    // Bob: listen-flow participant. No SSE stream of his own is needed for this test —
+    // revoke_by_name works whether or not the target has an active listen connection.
+    let bob_tok = hub.register_participant();
+    hub.announce(&bob_tok, "PpB5").unwrap();
 
-    // Grant approved via the governor API using Bob's IDENTITY ("bob-id-5"), not his token.
-    // This mirrors the real-world path where the governor resolves identities, not tokens.
-    // FP1's name lookup (token_to_name.get("bob-id-5")) returns None, so name_a = None.
-    // The grant is stored as: name_a=None, name_b="PpA5", identity_a="bob-id-5", identity_b=tok_a.
-    hub.approve_grant(&gov, "bob-id-5", &tok_a, None).unwrap();
+    // Grant approved on the tokens themselves — listen-flow identity == token (unlike the
+    // deleted minted-agent path, where identity was a separate string from the token).
+    hub.approve_grant(&gov, &bob_tok, &tok_a, None).unwrap();
 
     // Drain setup events from alice's stream.
     drain_receiver(&mut rx_a);
 
-    // Bob deregisters — should trigger an offline presence event to Alice.
-    hub.deregister("PpB5", &bob_tok).unwrap();
+    // Governor force-deregisters Bob — should trigger an offline presence event to Alice.
+    hub.revoke_by_name("PpB5", &gov).unwrap();
 
     let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
     let ev = wait_for_event_containing(
@@ -3326,7 +3324,7 @@ async fn ac_pp5_minted_agent_deregister_sends_offline_to_listen_peer() {
     .await;
     assert!(
         ev.is_some(),
-        "Alice must receive presence offline event when minted participant PpB5 deregisters; got nothing"
+        "Alice must receive presence offline event when PpB5 is governor-revoked; got nothing"
     );
 }
 
