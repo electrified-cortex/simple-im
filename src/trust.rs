@@ -6,7 +6,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::error::Error;
 use crate::persistence::{PersistedGrant, PersistedToken};
-use crate::types::{GovernorToken, ParticipantToken};
+use crate::types::GovernorToken;
 
 // ── Public enums ──────────────────────────────────────────────────────────────
 
@@ -83,11 +83,6 @@ struct PendingTransfer {
     to_identity: Option<String>,
 }
 
-struct ParticipantRecord {
-    identity: String,
-    expires: Option<Instant>,
-}
-
 struct Grant {
     id: String,
     identity_a: String,
@@ -113,7 +108,6 @@ where
     F: Fn() -> Instant,
 {
     governors: HashMap<String, GovernorRecord>,
-    agents: HashMap<String, ParticipantRecord>,
     grants: Vec<Grant>,
     pending_transfers: HashMap<String, PendingTransfer>,
     counter: u64,
@@ -138,7 +132,6 @@ impl<F: Fn() -> Instant> TrustChain<F> {
     pub fn with_clock(now: F) -> Self {
         Self {
             governors: HashMap::new(),
-            agents: HashMap::new(),
             grants: vec![],
             pending_transfers: HashMap::new(),
             counter: 0,
@@ -160,8 +153,6 @@ impl<F: Fn() -> Instant> TrustChain<F> {
                 return Err(Error::TokenExpired);
             }
             Ok(())
-        } else if self.agents.contains_key(&token.0) {
-            Err(Error::Forbidden)
         } else {
             Err(Error::AuthFailed)
         }
@@ -225,27 +216,6 @@ impl<F: Fn() -> Instant> TrustChain<F> {
         if let Some(record) = self.governors.get_mut(&governor.0) {
             record.online = online;
         }
-    }
-
-    /// Issues a new agent token under governor authority.
-    pub fn mint_participant_token(
-        &mut self,
-        governor: &GovernorToken,
-        participant_identity: &str,
-        expiry: Option<Duration>,
-    ) -> Result<ParticipantToken, Error> {
-        self.verify_governor(governor)?;
-        let now = (self.now)();
-        let expires = expiry.map(|d| now + d.min(crate::types::MAX_EXPIRY));
-        let id = self.next_id("agent");
-        self.agents.insert(
-            id.clone(),
-            ParticipantRecord {
-                identity: participant_identity.to_string(),
-                expires,
-            },
-        );
-        Ok(ParticipantToken(id))
     }
 
     /// Backward-compatible wrapper: Symmetric, no budget, opens_reply_window=true.
@@ -327,22 +297,6 @@ impl<F: Fn() -> Instant> TrustChain<F> {
             conditions: req.conditions,
         });
         Ok(id)
-    }
-
-    /// Returns `Ok` if the token is a current, non-expired agent token.
-    pub fn validate_participant_token(&self, token: &ParticipantToken) -> Result<(), Error> {
-        let record = self.agents.get(&token.0).ok_or(Error::AuthFailed)?;
-        if let Some(expires) = record.expires
-            && (self.now)() >= expires
-        {
-            return Err(Error::TokenExpired);
-        }
-        Ok(())
-    }
-
-    /// Returns the identity string bound to an agent token, if any.
-    pub fn participant_identity<'a>(&'a self, token: &ParticipantToken) -> Option<&'a str> {
-        self.agents.get(&token.0).map(|r| r.identity.as_str())
     }
 
     /// Backward-compat wrapper around `check_grant_directed` (symmetric check only).
@@ -625,19 +579,6 @@ impl<F: Fn() -> Instant> TrustChain<F> {
         })
     }
 
-    /// Rotate an agent token atomically: move the record to a fresh ID, invalidate the old one.
-    /// Returns the new token. Identity and expiry are unchanged.
-    pub fn rotate_participant_token(
-        &mut self,
-        old_token: &ParticipantToken,
-    ) -> Result<ParticipantToken, Error> {
-        self.validate_participant_token(old_token)?;
-        let record = self.agents.remove(&old_token.0).ok_or(Error::AuthFailed)?;
-        let new_id = self.next_id("agent");
-        self.agents.insert(new_id.clone(), record);
-        Ok(ParticipantToken(new_id))
-    }
-
     /// Rotate a governor token atomically: move the record to a fresh ID, invalidate the old one.
     /// Returns the new token. All record fields (expiry, online, revoked) are unchanged.
     pub fn rotate_governor_token(
@@ -652,37 +593,6 @@ impl<F: Fn() -> Instant> TrustChain<F> {
         let new_id = self.next_id("gov");
         self.governors.insert(new_id.clone(), record);
         Ok(GovernorToken(new_id))
-    }
-
-    /// Governor force-rotate: invalidate all agent tokens with the given identity, mint one fresh
-    /// token. Returns `(old_token_ids, new_token)` so the caller can update `token_to_name`.
-    pub fn governor_rotate_participant_token(
-        &mut self,
-        gov: &GovernorToken,
-        identity: &str,
-    ) -> Result<(Vec<String>, ParticipantToken), Error> {
-        self.verify_governor(gov)?;
-        let old_ids: Vec<String> = self
-            .agents
-            .iter()
-            .filter(|(_, r)| r.identity == identity)
-            .map(|(k, _)| k.clone())
-            .collect();
-        if old_ids.is_empty() {
-            return Err(Error::RecipientUnknown);
-        }
-        let record = self.agents.remove(&old_ids[0]).unwrap();
-        for id in &old_ids[1..] {
-            self.agents.remove(id);
-        }
-        let new_id = self.next_id("agent");
-        self.agents.insert(new_id.clone(), record);
-        Ok((old_ids, ParticipantToken(new_id)))
-    }
-
-    /// Returns the expiry Instant for an agent token, or None if permanent or not found.
-    pub fn participant_expiry(&self, token: &ParticipantToken) -> Option<Instant> {
-        self.agents.get(&token.0).and_then(|r| r.expires)
     }
 
     /// Returns the expiry Instant for a governor token, or None if permanent or not found.
@@ -804,30 +714,21 @@ impl<F: Fn() -> Instant> TrustChain<F> {
                 self.counter = n;
             }
 
-            match t.token_type.as_str() {
-                "governor" => {
-                    // Governors have no session registration flow — they are always
-                    // considered online once minted (and not revoked/expired).
-                    self.governors.insert(
-                        t.token,
-                        GovernorRecord {
-                            expires,
-                            online: true,
-                            revoked: false,
-                            listen_token: None,
-                        },
-                    );
-                }
-                "agent" => {
-                    self.agents.insert(
-                        t.token,
-                        ParticipantRecord {
-                            identity: t.identity,
-                            expires,
-                        },
-                    );
-                }
-                _ => {}
+            // Only "governor" rows are loaded here — migration Step 5 purges legacy
+            // "agent" rows before this runs (src/persistence.rs), and "participant"
+            // (listen) rows are loaded separately by DeliveryHub.
+            if t.token_type.as_str() == "governor" {
+                // Governors have no session registration flow — they are always
+                // considered online once minted (and not revoked/expired).
+                self.governors.insert(
+                    t.token,
+                    GovernorRecord {
+                        expires,
+                        online: true,
+                        revoked: false,
+                        listen_token: None,
+                    },
+                );
             }
         }
 
@@ -971,42 +872,6 @@ mod tests {
         ));
     }
 
-    /// AC-TOK-2: governor mints agent token with 60-second expiry; valid at T+0, TokenExpired at T+61.
-    #[test]
-    fn ac_tok_2_agent_token_expires() {
-        let (mut chain, offset) = controlled_chain();
-        let gov = chain.install_governor(None);
-        let token = chain
-            .mint_participant_token(&gov, "alice", Some(Duration::from_secs(60)))
-            .unwrap();
-
-        assert!(chain.validate_participant_token(&token).is_ok());
-
-        offset.set(Duration::from_secs(61));
-        assert!(matches!(
-            chain.validate_participant_token(&token),
-            Err(Error::TokenExpired)
-        ));
-    }
-
-    /// AC-TOK-3: agent token used for governor-only action (mint/approve) → Forbidden.
-    #[test]
-    fn ac_tok_3_agent_token_rejected_for_governor_action() {
-        let (mut chain, _) = controlled_chain();
-        let gov = chain.install_governor(None);
-        let agent_token = chain.mint_participant_token(&gov, "alice", None).unwrap();
-
-        let fake_gov = GovernorToken(agent_token.0.clone());
-        assert!(matches!(
-            chain.mint_participant_token(&fake_gov, "bob", None),
-            Err(Error::Forbidden)
-        ));
-        assert!(matches!(
-            chain.approve_grant(&fake_gov, "alice", "bob", None),
-            Err(Error::Forbidden)
-        ));
-    }
-
     /// AC-TOK-5: check_grant with no covering grant → NoGrant.
     #[test]
     fn ac_tok_5_no_grant_returns_no_grant() {
@@ -1051,10 +916,6 @@ mod tests {
         chain.revoke_all_governors();
 
         assert!(matches!(
-            chain.mint_participant_token(&gov, "carol", None),
-            Err(Error::AuthFailed)
-        ));
-        assert!(matches!(
             chain.approve_grant(&gov, "alice", "carol", None),
             Err(Error::AuthFailed)
         ));
@@ -1069,10 +930,6 @@ mod tests {
 
         chain.set_governor_online(&gov, false);
 
-        assert!(matches!(
-            chain.mint_participant_token(&gov, "alice", None),
-            Err(Error::AuthFailed)
-        ));
         assert!(matches!(
             chain.approve_grant(&gov, "alice", "bob", None),
             Err(Error::AuthFailed)
