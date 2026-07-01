@@ -4316,6 +4316,12 @@ impl DeliveryHub {
         // Resolve querier name for grant/room checks.
         let querier_name = querier_state.name.clone();
 
+        // Existence check: a name that was never registered at all must 404,
+        // not be indistinguishable from a real participant who is offline.
+        if !inner.identities.contains(target_name) {
+            return Err(Error::RecipientUnknown);
+        }
+
         // Deny-grant override: hard block regardless of grant or room.
         // Key: (querier_identity → target_name); for listen-flow, identity == token.
         if inner.is_denial_active(token, target_name) {
@@ -8200,6 +8206,29 @@ mod tests {
     // `test_presence_no_grant_returns_offline` / `test_presence_with_grant_returns_online`
     // above) — removed along with it rather than converted, since the listen-flow behavior
     // they'd otherwise duplicate is already covered.
+
+    /// 15-0039: presence_for_token for a name that was NEVER registered must return
+    /// RecipientUnknown (404) — indistinguishable-from-offline is a leak of registration
+    /// status; the guard must fire before any grant/room/deny-override logic runs.
+    #[test]
+    fn test_presence_never_registered_returns_recipient_unknown() {
+        let hub = make_hub(Duration::from_secs(30));
+        let _gov = hub.install_governor(None);
+
+        // Register and announce only the querier; the target name is never registered.
+        let reg_a = hub.register_participant();
+        let (listen_a, _rx_a) = hub
+            .open_listen(Some(&reg_a), None, None, None, false, false)
+            .unwrap();
+        hub.announce(&listen_a, "alice").unwrap();
+
+        let result = hub.presence_for_token(&listen_a, "never-registered-name");
+        assert!(
+            matches!(result, Err(Error::RecipientUnknown)),
+            "presence query for a never-registered name must be RecipientUnknown, got: {:?}",
+            result
+        );
+    }
 
     /// AC9: Second open_listen without force=true returns Error::ActiveSubscription.
     #[test]
