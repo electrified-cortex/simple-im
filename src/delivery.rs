@@ -4595,12 +4595,11 @@ mod tests {
     #[test]
     fn ac3_send_to_unregistered_returns_unknown() {
         let hub = make_hub(Duration::from_secs(30));
-        let gov = hub.install_governor(None);
+        let _gov = hub.install_governor(None);
         let tok_a = test_mint(&hub).unwrap();
-        test_mint(&hub).unwrap();
-        hub.approve_grant(&gov, &tok_a.0, "id-bob", None).unwrap();
         test_bind(&hub, "alice", &tok_a, PresenceScope::GrantScoped).unwrap();
-        // bob is NOT registered
+        // bob is NOT registered — RecipientUnknown fires before any grant check, so no
+        // grant/second participant is needed to exercise this path.
 
         assert!(matches!(
             hub.send(&tok_a, "bob", Payload(b"hi".to_vec()), None, None),
@@ -4711,7 +4710,7 @@ mod tests {
     /// token gets everywhere else on the listen-flow path (`pending_count`,
     /// `latest_message_id`, `drain_queue`, etc.).
     #[tokio::test]
-    async fn ac_msg_6_dequeue_invalid_token_returns_auth_failed() {
+    async fn ac_msg_6_dequeue_invalid_token_returns_token_rejected() {
         let hub = make_hub(Duration::from_secs(30));
         let bad_token = ParticipantToken("not-a-real-token".into());
 
@@ -5898,12 +5897,12 @@ mod tests {
         assert_eq!(bob.status, "online");
     }
 
-    /// AC2: agent token → Forbidden (maps to 403 FORBIDDEN at HTTP layer).
+    /// AC2 (updated for 15-0030): participant token → AuthFailed (was Forbidden / 403
+    /// FORBIDDEN at the HTTP layer). See ac_gov_grants_6_7_8_auth_errors's AC8 comment — the
+    /// Forbidden-for-agent-token distinction was specific to the now-deleted
+    /// TrustChain.agents-backed minted agent token; a listen token here yields AuthFailed.
     #[test]
     fn list_participants_rejects_participant_token() {
-        // Updated for 15-0030: see ac_gov_grants_6_7_8_auth_errors's AC8 comment — the
-        // Forbidden-for-agent-token distinction was specific to the now-deleted
-        // TrustChain.agents-backed minted agent token; a listen token here yields AuthFailed.
         let hub = make_hub(Duration::from_secs(30));
         let _gov = hub.install_governor(None);
         let tok_a = test_mint(&hub).unwrap();
@@ -7383,7 +7382,9 @@ mod tests {
             let gov = hub.install_governor(None);
             let a1 = test_mint(&hub).unwrap().0;
             let a2 = test_mint(&hub).unwrap().0;
-            hub.approve_grant(&gov, "a1", "a2", None).unwrap();
+            // Also advance the counter via a grant ID (next_id is shared across governor,
+            // agent, and grant IDs — this exercises grant-ID counter seeding on reload too).
+            hub.approve_grant(&gov, &a1, &a2, None).unwrap();
             vec![gov.0, a1, a2]
         };
 
