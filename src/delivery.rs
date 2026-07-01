@@ -373,8 +373,8 @@ impl HubInner {
     fn grant_peer_senders(&self, name: &str) -> Vec<mpsc::UnboundedSender<String>> {
         // Resolve the identity for this named agent.
         // INVARIANT: grant_peer_senders is always called before removing the agent from
-        // `self.agents` (see deregister, governor_deregister, revoke_by_name, revoke_token,
-        // cancel_listen, close_listen, announce — all collect senders before cleanup).
+        // `self.agents` (see revoke_by_name, revoke_token, cancel_listen, close_listen,
+        // announce — all collect senders before cleanup).
         // Falls back to `name` to avoid panicking on unexpected call ordering.
         let identity = self
             .agents
@@ -2131,7 +2131,7 @@ impl DeliveryHub {
             // Begin settle BEFORE removing name from maps (presence push AC4 / TR4).
             let settle_opt = inner.begin_settle_offline(name);
             let settle_window = inner.settle_window;
-            // minted-agent deregister
+            // registry + presence-map cleanup
             inner.registry.force_deregister(name);
             inner.agents.remove(name);
             inner.token_to_name.retain(|_, n| n != name);
@@ -2141,7 +2141,7 @@ impl DeliveryHub {
             inner
                 .connection_requests
                 .retain(|_, r| r.from_name != name && r.to_name != name);
-            // listen-token revoke
+            // revoke listen token, if any
             let sse_sender = if let Some(listen_tok) = inner.name_to_token.remove(name) {
                 if let Some(state) = inner.listen_tokens.get_mut(&listen_tok) {
                     state.revoked = true;
