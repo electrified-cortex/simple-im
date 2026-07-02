@@ -2435,11 +2435,18 @@ impl DeliveryHub {
     }
 
     /// List all registered agents with their identity and effective status.
-    /// Requires a valid governor token; returns Forbidden for agent tokens.
-    /// Hidden agents always appear offline even to governors.
-    pub fn list_participants(&self, gov: &GovernorToken) -> Result<Vec<ParticipantInfo>, Error> {
+    ///
+    /// 15-0040 (security model change): flattened from governor-only to ANY valid participant
+    /// token — a deliberate loosening, named and scoped explicitly in the spec (closed-fleet
+    /// roster visibility is accepted risk; this does NOT extend to any other endpoint — see
+    /// OQ3). `token` is checked as a live, non-revoked participant bearer, nothing more; an
+    /// unknown/revoked bearer is `AuthFailed`. Hidden agents always appear offline regardless of
+    /// who is asking.
+    pub fn list_participants(&self, token: &str) -> Result<Vec<ParticipantInfo>, Error> {
         let inner = self.lock();
-        inner.validate_governor_token(gov)?;
+        if inner.listen_tokens.get(token).map(|s| s.revoked).unwrap_or(true) {
+            return Err(Error::AuthFailed);
+        }
         let mut result: Vec<ParticipantInfo> = inner
             .agents
             .iter()
@@ -6107,7 +6114,7 @@ mod tests {
         test_bind(&hub, "alice", &tok_a, PresenceScope::GrantScoped).unwrap();
         test_bind(&hub, "bob", &tok_b, PresenceScope::GrantScoped).unwrap();
 
-        let agents = hub.list_participants(&gov).unwrap();
+        let agents = hub.list_participants(&gov.0).unwrap();
         assert_eq!(agents.len(), 3, "alice, bob, and the governor's own identity");
 
         // Listen-flow identity == token (unlike the deleted minted-agent path).
@@ -6127,21 +6134,28 @@ mod tests {
         );
     }
 
-    /// AC2 (updated again for 15-0040 AC-2): a valid participant token without the governor flag
-    /// is rejected with Forbidden (403), not AuthFailed. This flips the 15-0030 update once more —
-    /// under FR1/FR2 a listen token IS a real, live credential (just not the governor's), which is
-    /// exactly the Forbidden case AC-2 specifies; only a wholly unknown/revoked bearer is
-    /// AuthFailed now (see `HubInner::validate_governor_token`).
+    /// AC-10 (15-0040 security model change): `list_participants` is flattened from
+    /// governor-only to ANY valid participant token — a non-governor token now SUCCEEDS (this
+    /// replaces the pre-15-0040 `list_participants_rejects_participant_token` test, which tested
+    /// the opposite of what AC-10 now requires). Only a wholly unknown/revoked bearer is
+    /// rejected, and that rejection is AuthFailed, not Forbidden (there's no "wrong role" left to
+    /// distinguish once the check is just "is this a valid participant token at all").
     #[test]
-    fn list_participants_rejects_participant_token() {
+    fn ac10_list_participants_accepts_any_valid_participant_token() {
         let hub = make_hub(Duration::from_secs(30));
         let _gov = hub.install_governor(None);
         let tok_a = test_mint(&hub).unwrap();
 
-        let fake_gov = GovernorToken(tok_a.0.clone());
         assert!(
-            matches!(hub.list_participants(&fake_gov), Err(Error::Forbidden)),
-            "participant token must be rejected with Forbidden for list_participants"
+            hub.list_participants(&tok_a.0).is_ok(),
+            "a non-governor participant token must be accepted for list_participants (AC-10)"
+        );
+        assert!(
+            matches!(
+                hub.list_participants("not-a-real-token-xyz"),
+                Err(Error::AuthFailed)
+            ),
+            "an unknown bearer must still be rejected"
         );
     }
 
@@ -6154,7 +6168,7 @@ mod tests {
         test_bind(&hub, "alice", &tok_a, PresenceScope::Hidden).unwrap();
         hub.sse_open("alice"); // ensure truly "online" per SSE liveness
 
-        let agents = hub.list_participants(&gov).unwrap();
+        let agents = hub.list_participants(&gov.0).unwrap();
         let alice = agents.iter().find(|a| a.name == "alice").unwrap();
         assert_eq!(
             alice.status, "offline",

@@ -288,7 +288,10 @@ paths:
     get:
       tags: [participant]
       summary: List participants
-      description: List all announced participants (governor only)
+      description: |
+        List all announced participants. Any valid participant token, not just the governor's
+        (15-0040 security model change — a deliberate, named loosening for the current
+        closed-fleet deployment; see the project spec for the risk assessment).
       operationId: listParticipants
       security:
         - bearerAuth: []

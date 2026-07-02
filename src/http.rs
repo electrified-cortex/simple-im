@@ -307,6 +307,23 @@ fn auth_failed() -> Response {
         .into_response()
 }
 
+/// FR5 (15-0040): `POST /listen` with no bearer at all gets an actionable message instead of the
+/// generic `auth_failed()` — naming the token requirement and how to obtain one. P1: this only
+/// changes the MESSAGE; a token is still required to open /listen (a real DDoS/resource-exhaustion
+/// control, preserved unchanged) and every other endpoint's no-token case is untouched.
+fn listen_auth_required() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "error": "AUTH_FAILED",
+            "message": "a participant token is required to open /listen",
+            "hint": "obtain one via POST /register (open, no auth, while no governor exists yet) \
+                     or have the governor issue you one via POST /register with a governor bearer",
+        })),
+    )
+        .into_response()
+}
+
 // ── ISO 8601 timestamp helpers ────────────────────────────────────────────────
 
 fn is_leap_year(year: u32) -> bool {
@@ -446,7 +463,11 @@ struct GrantBlockBody {
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
-// GET /participants  — governor-only participant list
+// GET /participants — any valid participant token (15-0040 security model change: flattened
+// from governor-only). See DeliveryHub::list_participants for the scope/risk note; this is the
+// ONLY endpoint this task flattens — GET /participants/{name}/presence, GET /messages/*, and
+// GET /grants are explicitly left as-is (OQ3), and every mutating/governance endpoint stays
+// governor-flag-gated.
 async fn handle_list_participants(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -455,8 +476,7 @@ async fn handle_list_participants(
         Some(t) => t,
         None => return auth_failed(),
     };
-    let gov = GovernorToken(tok_str);
-    match state.hub.list_participants(&gov) {
+    match state.hub.list_participants(&tok_str) {
         Ok(agents) => {
             let participants_json: Vec<_> = agents
                 .iter()
@@ -1219,7 +1239,7 @@ async fn handle_discovery() -> Response {
                     "DELETE /listen": {"auth": "participant", "body": null, "hint": "Close SSE stream, unbind name (identity + token survive; re-listen to resume)"},
                     "DELETE /identity": {"auth": "participant", "body": null, "hint": "Self-service: permanently delete your own identity, token, and grants — no undo"},
                     "POST /announce": {"auth": "participant", "body": "{name}", "hint": "Claim a name for this token (optional — /listen can do this in one step instead)"},
-                    "GET /participants": {"auth": "governor", "body": null, "hint": "List all announced participants"},
+                    "GET /participants": {"auth": "participant", "body": null, "hint": "List all announced participants (15-0040: any valid token, not governor-only)"},
                     "DELETE /participants/{name}": {"auth": "governor", "body": null, "hint": "Force-revoke participant by name"},
                     "GET /participants/{name}/presence": {"auth": "participant", "body": null, "hint": "Check if participant is online"},
                     "POST /participants/{name}/presence-scope": {"auth": "participant", "body": "{presence_scope}", "hint": "Set presence visibility (hidden/visible)"}
@@ -1471,10 +1491,11 @@ async fn handle_listen(
     Query(params): Query<ListenQueryParams>,
     body: Option<Json<ListenBody>>,
 ) -> Response {
-    // Token is required — no anonymous /listen.
+    // Token is required — no anonymous /listen (P1: unchanged, a real DDoS/resource-exhaustion
+    // control). FR5: only the no-token failure MESSAGE changes, here — to something actionable.
     let token = match bearer_token(&headers) {
         Some(t) => t,
-        None => return auth_failed(),
+        None => return listen_auth_required(),
     };
     let force = params.force.unwrap_or(false);
 

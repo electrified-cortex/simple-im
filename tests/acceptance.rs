@@ -180,6 +180,52 @@ async fn listen_and_get_welcome(
     (token, welcome_json)
 }
 
+// ── 15-0040 AC-9 / FR5: graceful no-token /listen failure ──────────────────────
+
+/// AC-9: `POST /listen` with no Authorization header at all returns an actionable error naming
+/// the token requirement — distinct from the generic `authentication required` — while the
+/// requirement itself (P1) is unchanged: no token still means no stream, and a `/listen` WITH a
+/// valid token still succeeds with one-live-listener-per-token still enforced.
+#[tokio::test]
+async fn ac9_listen_no_token_returns_actionable_error() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+
+    let r = client.post(server.url("/listen")).send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["error"], "AUTH_FAILED");
+    assert_ne!(
+        body["message"], "authentication required",
+        "no-token /listen must get an actionable message, not the generic one: {:?}",
+        body
+    );
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or("")
+            .to_lowercase()
+            .contains("token"),
+        "message must name the token requirement: {:?}",
+        body
+    );
+
+    // P1 is unchanged: a valid token still succeeds, and one-live-listener-per-token still holds.
+    let tok = register_participant_tok(&server, &client).await;
+    let (_tok, _handle) = listen_get_token(&server, &client, Some(&tok)).await;
+    let second = client
+        .post(server.url("/listen"))
+        .header("Authorization", format!("Bearer {}", tok))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        second.status(),
+        StatusCode::CONFLICT,
+        "second concurrent listen without force=true must still be rejected"
+    );
+}
+
 // ── AC-T1: POST /register returns 8-12 digit token; welcome has no token ──
 
 #[tokio::test]
@@ -5336,6 +5382,58 @@ async fn test_s3_discovery_governor_auth_hint() {
     assert!(
         !announce_body.contains("force"),
         "announce discovery body must not mention force: {announce_body}"
+    );
+}
+
+// ── 15-0040 AC-10: security model change — GET /participants flattened ─────────
+
+/// AC-10: the discovery doc's auth hint for `GET /participants` is no longer "governor".
+#[tokio::test]
+async fn ac10_discovery_participants_auth_hint_is_not_governor_only() {
+    let server = TestServer::spawn().await;
+    let r = server.client().get(server.url("/")).send().await.unwrap();
+    let body: Value = r.json().await.unwrap();
+    assert_ne!(
+        body["routes"]["participant"]["GET /participants"]["auth"],
+        "governor",
+        "GET /participants must no longer be advertised as governor-only: {:?}",
+        body["routes"]["participant"]["GET /participants"]
+    );
+}
+
+/// AC-10: `GET /participants` succeeds for ANY valid participant token, not just the governor's
+/// — and the same non-governor token still gets 403 on a mutating governance endpoint
+/// (regression check: flattening read access must not have over-flattened write access too).
+#[tokio::test]
+async fn ac10_get_participants_accepts_any_valid_token_but_mutations_stay_gated() {
+    let (server, _gov) = TestServer::spawn_with_governor().await;
+    let client = server.client();
+
+    let participant_tok = register_participant_tok(&server, &client).await;
+
+    let list = client
+        .get(server.url("/participants"))
+        .header("Authorization", format!("Bearer {}", participant_tok))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        list.status(),
+        StatusCode::OK,
+        "a non-governor participant token must be accepted for GET /participants"
+    );
+
+    // Same token, mutating governance endpoint → still 403, not flattened.
+    let deregister = client
+        .delete(server.url("/participants/nobody"))
+        .header("Authorization", format!("Bearer {}", participant_tok))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        deregister.status(),
+        StatusCode::FORBIDDEN,
+        "DELETE /participants/{{name}} must remain governor-flag-gated"
     );
 }
 
