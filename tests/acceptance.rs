@@ -180,6 +180,52 @@ async fn listen_and_get_welcome(
     (token, welcome_json)
 }
 
+// ── 15-0040 AC-9 / FR5: graceful no-token /listen failure ──────────────────────
+
+/// AC-9: `POST /listen` with no Authorization header at all returns an actionable error naming
+/// the token requirement — distinct from the generic `authentication required` — while the
+/// requirement itself (P1) is unchanged: no token still means no stream, and a `/listen` WITH a
+/// valid token still succeeds with one-live-listener-per-token still enforced.
+#[tokio::test]
+async fn ac9_listen_no_token_returns_actionable_error() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+
+    let r = client.post(server.url("/listen")).send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["error"], "AUTH_FAILED");
+    assert_ne!(
+        body["message"], "authentication required",
+        "no-token /listen must get an actionable message, not the generic one: {:?}",
+        body
+    );
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or("")
+            .to_lowercase()
+            .contains("token"),
+        "message must name the token requirement: {:?}",
+        body
+    );
+
+    // P1 is unchanged: a valid token still succeeds, and one-live-listener-per-token still holds.
+    let tok = register_participant_tok(&server, &client).await;
+    let (_tok, _handle) = listen_get_token(&server, &client, Some(&tok)).await;
+    let second = client
+        .post(server.url("/listen"))
+        .header("Authorization", format!("Bearer {}", tok))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        second.status(),
+        StatusCode::CONFLICT,
+        "second concurrent listen without force=true must still be rejected"
+    );
+}
+
 // ── AC-T1: POST /register returns 8-12 digit token; welcome has no token ──
 
 #[tokio::test]
@@ -1283,6 +1329,245 @@ async fn ac_s3_send_by_token_routes_to_recipient() {
     drop(stream);
 }
 
+// ── 15-0040 FR3 / AC-5, AC-6: collapsed listen+announce over HTTP ──────────────
+
+/// AC-5: a single `POST /listen` call with `{"name": ...}` in the body makes the participant
+/// reachable — `send()` succeeds with NO separate `/announce` round-trip. The welcome SSE event
+/// also reports `name_in_use: false` and the bound `name` directly, so the client learns the
+/// bind succeeded without a second request.
+#[tokio::test]
+async fn ac5_listen_with_name_body_no_announce_needed() {
+    let (server, gov) = TestServer::spawn_with_governor().await;
+    let client = server.client();
+
+    // Receiver: POST /listen with {"name": ...} — single step, no /announce.
+    let recv_tok = register_participant_tok(&server, &client).await;
+    let r = client
+        .post(server.url("/listen"))
+        .header("Authorization", format!("Bearer {}", recv_tok))
+        .json(&json!({"name": "Fr3Receiver"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK, "POST /listen failed");
+    let mut recv_stream = r.bytes_stream();
+    let mut buf = String::new();
+    let welcome_json = loop {
+        let chunk = tokio::time::timeout(Duration::from_secs(5), recv_stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+        if let Some(line) = buf.lines().find(|l| l.starts_with("data:")) {
+            break line.trim_start_matches("data:").trim().to_string();
+        }
+    };
+    let welcome: Value = serde_json::from_str(&welcome_json).unwrap();
+    assert_eq!(welcome["event"], "welcome");
+    assert_eq!(
+        welcome["name"], "Fr3Receiver",
+        "welcome must report the name bound inline at listen time: {:?}",
+        welcome
+    );
+    assert_eq!(
+        welcome["name_in_use"], false,
+        "welcome must confirm the bind succeeded, no follow-up /announce needed: {:?}",
+        welcome
+    );
+
+    // Sender: same single-step listen-with-name.
+    let sender_tok = register_participant_tok(&server, &client).await;
+    let sr = client
+        .post(server.url("/listen"))
+        .header("Authorization", format!("Bearer {}", sender_tok))
+        .json(&json!({"name": "Fr3Sender"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sr.status(), StatusCode::OK);
+    let sender_stream = sr.bytes_stream();
+
+    // Governor approves the grant — no /announce call was ever made by either party.
+    let approve = client
+        .post(server.url("/grants/approve"))
+        .header("Authorization", format!("Bearer {}", gov))
+        .json(&json!({"identity_a": sender_tok, "identity_b": recv_tok}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(approve.status(), StatusCode::OK, "grant approve failed");
+
+    let send = client
+        .post(server.url("/messages/send"))
+        .header("Authorization", format!("Bearer {}", sender_tok))
+        .json(&json!({"to": "Fr3Receiver", "payload": "no-announce-needed"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        send.status(),
+        StatusCode::ACCEPTED,
+        "send must succeed after listen-with-name alone, with no /announce ever called"
+    );
+
+    let pop = client
+        .post(server.url("/messages/queue/pop"))
+        .header("Authorization", format!("Bearer {}", recv_tok))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = pop.json().await.unwrap();
+    assert_eq!(body["message"]["payload"], "no-announce-needed");
+
+    drop(recv_stream);
+    drop(sender_stream);
+}
+
+/// AC-6 over HTTP: a name already live-bound via listen-with-name cannot be taken by a
+/// different token's listen-with-name call either — the welcome event reports
+/// `name_in_use: true` with a `resolution_stream`, and the subscription still opens (the TOKEN
+/// is valid) but the NAME is not reassigned.
+#[tokio::test]
+async fn ac6_listen_with_name_body_conflict_reports_name_in_use() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+
+    let tok_a = register_participant_tok(&server, &client).await;
+    let ra = client
+        .post(server.url("/listen"))
+        .header("Authorization", format!("Bearer {}", tok_a))
+        .json(&json!({"name": "Fr3Contested"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ra.status(), StatusCode::OK);
+    let stream_a = ra.bytes_stream();
+
+    let tok_b = register_participant_tok(&server, &client).await;
+    let rb = client
+        .post(server.url("/listen"))
+        .header("Authorization", format!("Bearer {}", tok_b))
+        .json(&json!({"name": "Fr3Contested"}))
+        .send()
+        .await
+        .unwrap();
+    // The subscription itself still opens — only the name claim is rejected.
+    assert_eq!(rb.status(), StatusCode::OK);
+    let mut stream_b = rb.bytes_stream();
+    let mut buf = String::new();
+    let welcome_json = loop {
+        let chunk = tokio::time::timeout(Duration::from_secs(5), stream_b.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+        if let Some(line) = buf.lines().find(|l| l.starts_with("data:")) {
+            break line.trim_start_matches("data:").trim().to_string();
+        }
+    };
+    let welcome: Value = serde_json::from_str(&welcome_json).unwrap();
+    assert_eq!(
+        welcome["name_in_use"], true,
+        "second token's listen-with-name must report the conflict: {:?}",
+        welcome
+    );
+    assert!(
+        welcome["resolution_stream"].is_string(),
+        "conflict welcome must include a resolution_stream: {:?}",
+        welcome
+    );
+
+    drop(stream_a);
+    drop(stream_b);
+}
+
+// ── 15-0040 FR4a: DELETE /identity — self-service delete-me ────────────────────
+
+/// AC-7 over HTTP: a participant deletes its own identity; the token is then rejected on any
+/// subsequent authenticated call, and the name becomes claimable again by a fresh registration
+/// (identity actually left the permanent roster, not just went offline).
+#[tokio::test]
+async fn ac7_delete_identity_removes_self_and_frees_name() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+
+    let tok = register_participant_tok(&server, &client).await;
+    let r = client
+        .post(server.url("/listen"))
+        .header("Authorization", format!("Bearer {}", tok))
+        .json(&json!({"name": "SelfDeleter"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let stream = r.bytes_stream();
+
+    let del = client
+        .delete(server.url("/identity"))
+        .header("Authorization", format!("Bearer {}", tok))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.status(), StatusCode::NO_CONTENT);
+
+    // The deleted token is rejected on a subsequent authenticated call.
+    let dequeue = client
+        .post(server.url("/messages/queue/pop"))
+        .header("Authorization", format!("Bearer {}", tok))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        dequeue.status(),
+        StatusCode::UNAUTHORIZED,
+        "deleted token must no longer authenticate"
+    );
+
+    // Deleting again is rejected, not silently repeated.
+    let del_again = client
+        .delete(server.url("/identity"))
+        .header("Authorization", format!("Bearer {}", tok))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del_again.status(), StatusCode::UNAUTHORIZED);
+
+    // The name actually left the roster: a fresh registration can claim it (no NAME_IN_USE).
+    let new_tok = register_participant_tok(&server, &client).await;
+    let relisten = client
+        .post(server.url("/listen"))
+        .header("Authorization", format!("Bearer {}", new_tok))
+        .json(&json!({"name": "SelfDeleter"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(relisten.status(), StatusCode::OK);
+    let mut relisten_stream = relisten.bytes_stream();
+    let mut buf = String::new();
+    let welcome_json = loop {
+        let chunk = tokio::time::timeout(Duration::from_secs(5), relisten_stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+        if let Some(line) = buf.lines().find(|l| l.starts_with("data:")) {
+            break line.trim_start_matches("data:").trim().to_string();
+        }
+    };
+    let welcome: Value = serde_json::from_str(&welcome_json).unwrap();
+    assert_eq!(
+        welcome["name_in_use"], false,
+        "the deleted name must be freely claimable again: {:?}",
+        welcome
+    );
+
+    drop(stream);
+    drop(relisten_stream);
+}
+
 // ── AC-L2: Revoked token → POST /listen returns 401 TOKEN_REVOKED ─────────────
 
 #[tokio::test]
@@ -2111,14 +2396,18 @@ async fn ac_claim_autogrant_first_governor() {
     );
     let body: Value = r.json().await.unwrap();
     assert_eq!(body["status"], "granted", "status must be 'granted'");
-    assert!(
-        body["governor_token"].is_string(),
-        "governor_token must be present"
+    // 15-0040 (FR2): no new credential is minted — governance is a flag set on the claimant's OWN
+    // existing identity, so the response reports that identity, never a token.
+    assert_eq!(
+        body["governor"], "ClaimAgent",
+        "response must confirm the claimant's own identity, not a new token: {:?}",
+        body
     );
 }
 
 /// AC: Two agents; agent A claims governorship → election; agent B approves → established.
-/// Then A dequeues and sees the governorship_granted governance message with a governor_token.
+/// Then A dequeues and sees the governorship_granted governance message naming its own identity
+/// (15-0040 FR2: no new credential is minted on grant/election/transfer).
 #[tokio::test]
 async fn ac_claim_election_unanimous() {
     let server = TestServer::spawn().await;
@@ -2188,7 +2477,8 @@ async fn ac_claim_election_unanimous() {
     let vote_body: Value = vote.json().await.unwrap();
     assert_eq!(vote_body["status"], "established");
 
-    // Agent A dequeues and should receive a governorship_granted message with governor_token.
+    // Agent A dequeues and should receive a governorship_granted message naming their OWN
+    // identity — no new credential is minted (FR2).
     let pop_a = client
         .post(server.url("/messages/queue/pop"))
         .header("Authorization", format!("Bearer {}", tok_a))
@@ -2203,11 +2493,12 @@ async fn ac_claim_election_unanimous() {
         payload_a.contains("governorship_granted"),
         "A should receive governorship_granted, got: {pop_a}"
     );
-    // Parse the payload to check governor_token is present.
+    // Parse the payload to check the identity is present (never a governor_token).
     let inner: Value = serde_json::from_str(payload_a).unwrap();
-    assert!(
-        inner["governor_token"].is_string(),
-        "governor_token must be in payload"
+    assert_eq!(
+        inner["identity"], "ElAlice",
+        "payload must name A's own identity, not a new token: {:?}",
+        inner
     );
 
     _sa.abort();
@@ -2535,31 +2826,34 @@ async fn ac_pr3_absent_participant_shows_offline_after_ttl_expires() {
     );
 }
 
-// ── AC-GOV-BREADCRUMB: governor gets role breadcrumb on listen+announce ────────
+// ── AC-GOV-BREADCRUMB: governor gets role breadcrumb on connect ────────────────
 
+// 15-0040 (FR2/FR3): `spawn_with_governor()`'s `install_governor()` call already mints the
+// governor's participant token AND binds its (synthetic) name in one step — there is no separate
+// "governor session-link" mint-a-new-token path left, and no separate /announce call is needed
+// (FR3 folds name-binding into /listen). The breadcrumb is enqueued the moment the identity is
+// bound, so it is already sitting in the governor's queue before this test's HTTP client even
+// connects. Reconnecting via `/listen?force=true` (the governor's server-side session counts as
+// already "active" from `install_governor`'s internal open_listen call) picks it up via the
+// existing catch-up-notify path — no explicit /announce round-trip required.
 #[tokio::test]
 async fn ac_gov_breadcrumb_on_connect() {
     let (server, gov_token) = TestServer::spawn_with_governor().await;
     let client = server.client();
 
-    // Governor: POST /listen with their governor token as bearer.
-    // The server detects this is a governor token, mints a linked listen token,
-    // and records the session link so announce() can enqueue the governor_role breadcrumb.
-    let (listen_tok, _stream) = listen_get_token(&server, &client, Some(&gov_token)).await;
-
-    // Governor: POST /announce — this triggers the governor-role breadcrumb to be enqueued.
     let r = client
-        .post(server.url("/announce"))
-        .header("Authorization", format!("Bearer {}", listen_tok))
-        .json(&json!({"name": "Governor"}))
+        .post(server.url("/listen?force=true"))
+        .header("Authorization", format!("Bearer {}", gov_token))
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        r.status(),
-        StatusCode::NO_CONTENT,
-        "announce must return 204"
-    );
+    assert_eq!(r.status(), StatusCode::OK, "POST /listen failed");
+    let stream = r.bytes_stream();
+    // Spawn a task that holds the stream open until dropped (mirrors listen_get_token).
+    let _stream = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        drop(stream);
+    });
 
     // Small yield so the async SSE NOTIFY delivery can process.
     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -2567,7 +2861,7 @@ async fn ac_gov_breadcrumb_on_connect() {
     // Dequeue: must receive the governor_role service message.
     let r = client
         .post(server.url("/messages/queue/pop"))
-        .header("Authorization", format!("Bearer {}", listen_tok))
+        .header("Authorization", format!("Bearer {}", gov_token))
         .send()
         .await
         .unwrap();
@@ -3031,9 +3325,12 @@ async fn ac_gt1_accept_transfer_requires_participant_bearer() {
         StatusCode::OK,
         "accept-transfer should succeed"
     );
-    assert!(
-        accept.json::<Value>().await.unwrap()["token"].is_string(),
-        "response must contain new governor token"
+    // 15-0040 (FR2): the governor flag moves to Alice's OWN existing token — no new credential is
+    // minted or returned.
+    assert_eq!(
+        accept.json::<Value>().await.unwrap()["status"],
+        "accepted",
+        "response must confirm acceptance, not return a new token"
     );
 }
 
@@ -3091,7 +3388,7 @@ async fn ac_pp1_announce_sends_online_to_grant_peer_sse() {
     // Agent A: open listen stream (observer).
     let tok_a = hub.register_participant();
 
-    let (_, mut rx_a) = hub
+    let (_, mut rx_a, _) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
     hub.announce(&tok_a, "PpA").unwrap();
@@ -3099,7 +3396,7 @@ async fn ac_pp1_announce_sends_online_to_grant_peer_sse() {
     // Agent B: open listen stream but do NOT announce yet.
     let tok_b = hub.register_participant();
 
-    let (_, _rx_b) = hub
+    let (_, _rx_b, _) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
 
@@ -3145,14 +3442,14 @@ async fn ac_pp2_cancel_listen_sends_offline_to_grant_peer_sse() {
 
     let tok_a = hub.register_participant();
 
-    let (_, mut rx_a) = hub
+    let (_, mut rx_a, _) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
     hub.announce(&tok_a, "PpA2").unwrap();
 
     let tok_b = hub.register_participant();
 
-    let (_, _rx_b) = hub
+    let (_, _rx_b, _) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
     hub.announce(&tok_b, "PpB2").unwrap();
@@ -3198,14 +3495,14 @@ async fn ac_pp3_sse_drop_sends_offline_to_grant_peer_sse() {
 
     let tok_a = hub.register_participant();
 
-    let (_, mut rx_a) = hub
+    let (_, mut rx_a, _) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
     hub.announce(&tok_a, "PpA3").unwrap();
 
     let tok_b = hub.register_participant();
 
-    let (_, _rx_b) = hub
+    let (_, _rx_b, _) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
     hub.announce(&tok_b, "PpB3").unwrap();
@@ -3253,14 +3550,14 @@ async fn ac_pp4_no_grant_no_presence_event_to_non_peer() {
     // A and B have a grant (A is the observer with active SSE).
     let tok_a = hub.register_participant();
 
-    let (_, mut rx_a) = hub
+    let (_, mut rx_a, _) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
     hub.announce(&tok_a, "PpA4").unwrap();
 
     let tok_b = hub.register_participant();
 
-    let (_, _rx_b) = hub
+    let (_, _rx_b, _) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
     hub.announce(&tok_b, "PpB4").unwrap();
@@ -3281,7 +3578,7 @@ async fn ac_pp4_no_grant_no_presence_event_to_non_peer() {
     // C has NO grant with A.
     let tok_c = hub.register_participant();
 
-    let (_, _rx_c) = hub
+    let (_, _rx_c, _) = hub
         .open_listen(Some(&tok_c), None, None, None, false, false)
         .unwrap();
 
@@ -3324,7 +3621,7 @@ async fn ac_pp5_governor_revoke_sends_offline_to_listen_peer() {
     // Alice: listen-flow agent (observer — will receive presence events).
     let tok_a = hub.register_participant();
 
-    let (_, mut rx_a) = hub
+    let (_, mut rx_a, _) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
     hub.announce(&tok_a, "PpA5").unwrap();
@@ -3369,7 +3666,7 @@ async fn ac_pp6_live_holder_not_evicted_no_offline() {
     // Agent A: the observer — has an active SSE stream and a grant with B.
     let tok_a = hub.register_participant();
 
-    let (_, mut rx_a) = hub
+    let (_, mut rx_a, _) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
     hub.announce(&tok_a, "PpA6").unwrap();
@@ -3377,7 +3674,7 @@ async fn ac_pp6_live_holder_not_evicted_no_offline() {
     // Agent B: announces "PpB6" with a live SSE stream.
     let tok_b = hub.register_participant();
 
-    let (_, _rx_b) = hub
+    let (_, _rx_b, _) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
     hub.announce(&tok_b, "PpB6").unwrap();
@@ -3402,7 +3699,7 @@ async fn ac_pp6_live_holder_not_evicted_no_offline() {
     // Agent C attempts to claim B's live name — force is gone, so this is NAME_IN_USE.
     let tok_c = hub.register_participant();
 
-    let (_, _rx_c) = hub
+    let (_, _rx_c, _) = hub
         .open_listen(Some(&tok_c), None, None, None, false, false)
         .unwrap();
     assert!(
@@ -3439,7 +3736,7 @@ async fn ac_pp6b_stale_holder_cross_token_not_evicted() {
     // Agent A: the observer.
     let tok_a = hub.register_participant();
 
-    let (_, mut _rx_a) = hub
+    let (_, mut _rx_a, _) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
     hub.announce(&tok_a, "PpA6b").unwrap();
@@ -3447,7 +3744,7 @@ async fn ac_pp6b_stale_holder_cross_token_not_evicted() {
     // Agent B: announces "PpB6b" then its SSE drops without cancel_listen.
     let tok_b = hub.register_participant();
 
-    let (_, _rx_b) = hub
+    let (_, _rx_b, _) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
     hub.announce(&tok_b, "PpB6b").unwrap();
@@ -3472,7 +3769,7 @@ async fn ac_pp6b_stale_holder_cross_token_not_evicted() {
     // Agent C attempts to reclaim B's stale name — BLOCKER-4 blocks cross-token eviction.
     let tok_c = hub.register_participant();
 
-    let (_, _rx_c) = hub
+    let (_, _rx_c, _) = hub
         .open_listen(Some(&tok_c), None, None, None, false, false)
         .unwrap();
     assert!(
@@ -3499,14 +3796,14 @@ async fn ac_pp_default_listener_no_events() {
 
     // A: open with presence_push=false (default, opt-out).
     let tok_a = hub.register_participant();
-    let (_, mut rx_a) = hub
+    let (_, mut rx_a, _) = hub
         .open_listen(Some(&tok_a), None, None, None, false, false)
         .unwrap();
     hub.announce(&tok_a, "PpOptA").unwrap();
 
     // B: open and announce.
     let tok_b = hub.register_participant();
-    let (_, _rx_b) = hub
+    let (_, _rx_b, _) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
     hub.announce(&tok_b, "PpOptB").unwrap();
@@ -3529,7 +3826,7 @@ async fn ac_pp_default_listener_no_events() {
     // B goes offline then comes back online.
     hub.cancel_listen(&tok_b).unwrap();
     let tok_b2 = hub.register_participant();
-    let (_, _rx_b2) = hub
+    let (_, _rx_b2, _) = hub
         .open_listen(Some(&tok_b2), None, None, None, false, false)
         .unwrap();
     hub.announce(&tok_b2, "PpOptB").unwrap();
@@ -3556,13 +3853,13 @@ async fn ac_pp_timer_cancellation() {
     // 50 ms settle window (set by make_presence_hub).
 
     let tok_a = hub.register_participant();
-    let (_, mut rx_a) = hub
+    let (_, mut rx_a, _) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
     hub.announce(&tok_a, "PpTcA").unwrap();
 
     let tok_b = hub.register_participant();
-    let (_, _rx_b) = hub
+    let (_, _rx_b, _) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
     hub.announce(&tok_b, "PpTcB").unwrap();
@@ -3591,7 +3888,7 @@ async fn ac_pp_timer_cancellation() {
 
     // B reconnects with the SAME token and re-announces — this cancels the settle timer.
     // Re-announce is idempotent (flap-free, FR4): no spurious online event is emitted.
-    let (_, _rx_b2) = hub
+    let (_, _rx_b2, _) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
     hub.announce(&tok_b, "PpTcB").unwrap();
@@ -3620,13 +3917,13 @@ async fn ac_pp_flap_collapse() {
     let (hub, gov) = make_presence_hub();
 
     let tok_a = hub.register_participant();
-    let (_, mut rx_a) = hub
+    let (_, mut rx_a, _) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
     hub.announce(&tok_a, "PpFlA").unwrap();
 
     let tok_b = hub.register_participant();
-    let (_, _rx_b) = hub
+    let (_, _rx_b, _) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
     hub.announce(&tok_b, "PpFlB").unwrap();
@@ -3652,7 +3949,7 @@ async fn ac_pp_flap_collapse() {
     for _ in 0u32..3 {
         hub.close_listen(&tok_b);
         // Reconnect immediately — well within the 50 ms window — with the same token.
-        let (_, _rx_bx) = hub
+        let (_, _rx_bx, _) = hub
             .open_listen(Some(&tok_b), None, None, None, false, false)
             .unwrap();
         hub.announce(&tok_b, "PpFlB").unwrap();
@@ -3700,13 +3997,13 @@ async fn ac_pp_pull_during_settle() {
     let (hub, gov) = make_presence_hub();
 
     let tok_a = hub.register_participant();
-    let (_, _rx_a) = hub
+    let (_, _rx_a, _) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
     hub.announce(&tok_a, "PpPsA").unwrap();
 
     let tok_b = hub.register_participant();
-    let (_, _rx_b) = hub
+    let (_, _rx_b, _) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
     hub.announce(&tok_b, "PpPsB").unwrap();
@@ -3747,13 +4044,13 @@ async fn ac_pp_opt_in_not_persisted() {
 
     let tok_a = hub.register_participant();
     // First session: opt-in.
-    let (_, _rx_a1) = hub
+    let (_, _rx_a1, _) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
     hub.announce(&tok_a, "PpNpA").unwrap();
 
     let tok_b = hub.register_participant();
-    let (_, _rx_b) = hub
+    let (_, _rx_b, _) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
     hub.announce(&tok_b, "PpNpB").unwrap();
@@ -3775,7 +4072,7 @@ async fn ac_pp_opt_in_not_persisted() {
     hub.close_listen(&tok_a);
 
     // Re-open A's listen WITHOUT presence_push (opt-out for the new session).
-    let (_, mut rx_a2) = hub
+    let (_, mut rx_a2, _) = hub
         .open_listen(Some(&tok_a), None, None, None, false, false)
         .unwrap();
 
@@ -3784,7 +4081,7 @@ async fn ac_pp_opt_in_not_persisted() {
     // B goes offline and comes back — both events should NOT reach A.
     hub.cancel_listen(&tok_b).unwrap();
     let tok_b2 = hub.register_participant();
-    let (_, _rx_b2) = hub
+    let (_, _rx_b2, _) = hub
         .open_listen(Some(&tok_b2), None, None, None, false, false)
         .unwrap();
     hub.announce(&tok_b2, "PpNpB").unwrap();
@@ -3813,13 +4110,13 @@ async fn ac_ppv1_permissive_grant_sees_presence() {
     let (hub, gov) = make_presence_hub();
 
     let tok_a = hub.register_participant();
-    let (_, mut rx_a) = hub
+    let (_, mut rx_a, _) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
     hub.announce(&tok_a, "PpA7a").unwrap();
 
     let tok_b = hub.register_participant();
-    let (_, _rx_b) = hub
+    let (_, _rx_b, _) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
 
@@ -3874,13 +4171,13 @@ async fn ac_ppv2_no_grant_no_room_returns_recipient_unknown() {
     let (hub, _gov) = make_presence_hub();
 
     let tok_a = hub.register_participant();
-    let (_, mut rx_a) = hub
+    let (_, mut rx_a, _) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
     hub.announce(&tok_a, "PpA7b").unwrap();
 
     let tok_b = hub.register_participant();
-    let (_, _rx_b) = hub
+    let (_, _rx_b, _) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
     // No grant, no shared room.
@@ -3910,7 +4207,7 @@ async fn ac_ppv3_shared_room_no_grant_sees_presence() {
     let (hub, _gov) = make_presence_hub();
 
     let tok_a = hub.register_participant();
-    let (_, mut rx_a) = hub
+    let (_, mut rx_a, _) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
     hub.announce(&tok_a, "PpA7c").unwrap();
@@ -3961,7 +4258,7 @@ async fn ac_ppv4_deny_grant_returns_recipient_unknown_even_in_room() {
     let (hub, gov) = make_presence_hub();
 
     let tok_a = hub.register_participant();
-    let (_, mut rx_a) = hub
+    let (_, mut rx_a, _) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
     hub.announce(&tok_a, "PpA7d").unwrap();
@@ -4017,7 +4314,7 @@ async fn ac_startup_announce_first_sub_only() {
     // AC1: first subscriber gets sim_online
     let _tok1 = hub.register_participant();
 
-    let (_, mut rx1) = hub
+    let (_, mut rx1, _) = hub
         .open_listen(Some(&_tok1), None, None, None, false, false)
         .unwrap();
     let mut events1 = vec![];
@@ -4037,7 +4334,7 @@ async fn ac_startup_announce_first_sub_only() {
     // AC2: second subscriber does NOT get sim_online
     let _tok2 = hub.register_participant();
 
-    let (_, mut rx2) = hub
+    let (_, mut rx2, _) = hub
         .open_listen(Some(&_tok2), None, None, None, false, false)
         .unwrap();
     let mut events2 = vec![];
@@ -5088,6 +5385,58 @@ async fn test_s3_discovery_governor_auth_hint() {
     );
 }
 
+// ── 15-0040 AC-10: security model change — GET /participants flattened ─────────
+
+/// AC-10: the discovery doc's auth hint for `GET /participants` is no longer "governor".
+#[tokio::test]
+async fn ac10_discovery_participants_auth_hint_is_not_governor_only() {
+    let server = TestServer::spawn().await;
+    let r = server.client().get(server.url("/")).send().await.unwrap();
+    let body: Value = r.json().await.unwrap();
+    assert_ne!(
+        body["routes"]["participant"]["GET /participants"]["auth"],
+        "governor",
+        "GET /participants must no longer be advertised as governor-only: {:?}",
+        body["routes"]["participant"]["GET /participants"]
+    );
+}
+
+/// AC-10: `GET /participants` succeeds for ANY valid participant token, not just the governor's
+/// — and the same non-governor token still gets 403 on a mutating governance endpoint
+/// (regression check: flattening read access must not have over-flattened write access too).
+#[tokio::test]
+async fn ac10_get_participants_accepts_any_valid_token_but_mutations_stay_gated() {
+    let (server, _gov) = TestServer::spawn_with_governor().await;
+    let client = server.client();
+
+    let participant_tok = register_participant_tok(&server, &client).await;
+
+    let list = client
+        .get(server.url("/participants"))
+        .header("Authorization", format!("Bearer {}", participant_tok))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        list.status(),
+        StatusCode::OK,
+        "a non-governor participant token must be accepted for GET /participants"
+    );
+
+    // Same token, mutating governance endpoint → still 403, not flattened.
+    let deregister = client
+        .delete(server.url("/participants/nobody"))
+        .header("Authorization", format!("Bearer {}", participant_tok))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        deregister.status(),
+        StatusCode::FORBIDDEN,
+        "DELETE /participants/{{name}} must remain governor-flag-gated"
+    );
+}
+
 // ── 15-0029 S5: governor transfer security + operator-anchored admin reset ───────
 
 /// Spawn a server with a governor AND an admin secret (injected, not via env to avoid races).
@@ -5208,7 +5557,10 @@ async fn test_governor_transfer_identity_verified_against_bearer() {
     assert_eq!(r.status(), StatusCode::OK);
 }
 
-/// EPIC-AC-13 / S5-AC-1: admin reset with the correct secret → 200 {governor_token}.
+/// EPIC-AC-13 / S5-AC-1 (adapted for 15-0040 FR1): admin reset with the correct secret → 200
+/// {status: "cleared"}. FR1 forbids minting a fresh, nameless credential here (there is no
+/// participant identity to attach it to) — reset now only clears the governor pointer; a
+/// participant claims fresh afterward via `POST /governors/claim`.
 #[tokio::test]
 async fn test_admin_reset_returns_governor_token() {
     let (server, _gov) = spawn_with_governor_and_admin(Some("anchor-secret")).await;
@@ -5220,7 +5572,11 @@ async fn test_admin_reset_returns_governor_token() {
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::OK);
-    assert!(r.json::<Value>().await.unwrap()["governor_token"].is_string());
+    assert_eq!(
+        r.json::<Value>().await.unwrap()["status"],
+        "cleared",
+        "reset must confirm the governor pointer was cleared, not return a new token"
+    );
 }
 
 /// EPIC-AC-14 / S5-AC-2: admin reset with a wrong/missing secret → 401.
@@ -5255,14 +5611,18 @@ async fn test_admin_reset_invalidates_old_governor() {
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::OK);
-    // Old governor token on a governor-only endpoint → 401.
-    let participants = client
-        .get(server.url("/participants"))
+    // 15-0040 (FR1): the old governor's participant token is untouched by reset (permanent,
+    // never revoked) — it just no longer carries the governor flag. Exercise a governance-only
+    // (mutating) endpoint, which stays governor-flag-gated even after the security-model change
+    // flattens `GET /participants` to any valid token — a valid-but-not-governor token is
+    // Forbidden (403), not AuthFailed (401).
+    let deregister = client
+        .delete(server.url("/participants/nobody"))
         .header("Authorization", format!("Bearer {}", old_gov))
         .send()
         .await
         .unwrap();
-    assert_eq!(participants.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(deregister.status(), StatusCode::FORBIDDEN);
 }
 
 /// EPIC-AC-26 / S5-AC-4: admin reset with the secret unset/empty → 501.

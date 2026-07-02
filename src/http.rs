@@ -156,6 +156,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/register", post(handle_register))
         .route("/listen", post(handle_listen))
         .route("/listen", delete(handle_cancel_listen))
+        .route("/identity", delete(handle_delete_self))
         .route("/announce", post(handle_announce))
         .route("/skills/participant", get(handle_skill_participant))
         .route(
@@ -179,7 +180,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/messages/latest", get(handle_latest_message))
         .route("/governors/claim", post(handle_claim_governorship))
         .route("/governors/elections/{id}", post(handle_election_vote))
-        .route("/governors/refresh", post(handle_refresh_governor_token))
         .route("/governors/transfer", post(handle_transfer_governor))
         .route(
             "/governors/accept-transfer",
@@ -303,6 +303,23 @@ fn auth_failed() -> Response {
     (
         StatusCode::UNAUTHORIZED,
         Json(json!({"error": "AUTH_FAILED", "message": "authentication required"})),
+    )
+        .into_response()
+}
+
+/// FR5 (15-0040): `POST /listen` with no bearer at all gets an actionable message instead of the
+/// generic `auth_failed()` — naming the token requirement and how to obtain one. P1: this only
+/// changes the MESSAGE; a token is still required to open /listen (a real DDoS/resource-exhaustion
+/// control, preserved unchanged) and every other endpoint's no-token case is untouched.
+fn listen_auth_required() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "error": "AUTH_FAILED",
+            "message": "a participant token is required to open /listen",
+            "hint": "obtain one via POST /register (open, no auth, while no governor exists yet) \
+                     or have the governor issue you one via POST /register with a governor bearer",
+        })),
     )
         .into_response()
 }
@@ -446,7 +463,11 @@ struct GrantBlockBody {
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
-// GET /participants  — governor-only participant list
+// GET /participants — any valid participant token (15-0040 security model change: flattened
+// from governor-only). See DeliveryHub::list_participants for the scope/risk note; this is the
+// ONLY endpoint this task flattens — GET /participants/{name}/presence, GET /messages/*, and
+// GET /grants are explicitly left as-is (OQ3), and every mutating/governance endpoint stays
+// governor-flag-gated.
 async fn handle_list_participants(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -455,8 +476,7 @@ async fn handle_list_participants(
         Some(t) => t,
         None => return auth_failed(),
     };
-    let gov = GovernorToken(tok_str);
-    match state.hub.list_participants(&gov) {
+    match state.hub.list_participants(&tok_str) {
         Ok(agents) => {
             let participants_json: Vec<_> = agents
                 .iter()
@@ -468,22 +488,6 @@ async fn handle_list_participants(
             )
                 .into_response()
         }
-        Err(e) => err_response(e),
-    }
-}
-
-// POST /governors/refresh  — governor self-rotates their token
-async fn handle_refresh_governor_token(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Response {
-    let tok_str = match bearer_token(&headers) {
-        Some(t) => t,
-        None => return auth_failed(),
-    };
-    let old_token = GovernorToken(tok_str);
-    match state.hub.refresh_governor_token(&old_token) {
-        Ok(new_token) => (StatusCode::OK, Json(json!({"token": new_token.0}))).into_response(),
         Err(e) => err_response(e),
     }
 }
@@ -515,7 +519,8 @@ async fn handle_transfer_governor(
 //   Authorization: Bearer <participant-token>   (the claimer; its name is the verified identity)
 //   Body: {"transfer_token": "<transfer-token>"}
 //
-//   200 → {token}                       new governor token
+//   200 → {status: "accepted"}           governor flag moved to the claimer's OWN existing token
+//                                       (FR2: no new credential is minted or returned)
 //   401 → no bearer or bearer fails participant validation
 //   403 → bearer is a governor token (must be a participant)
 //   403 → transfer's to_identity is set and does not match the bearer's name
@@ -555,7 +560,7 @@ async fn handle_accept_governor_transfer(
         }
     };
     match state.hub.accept_governor_transfer(&bearer, &transfer_token) {
-        Ok(new_token) => (StatusCode::OK, Json(json!({"token": new_token.0}))).into_response(),
+        Ok(()) => (StatusCode::OK, Json(json!({"status": "accepted"}))).into_response(),
         // transfer token not found / consumed → 404.
         Err(Error::RecipientUnknown) => (
             StatusCode::NOT_FOUND,
@@ -576,8 +581,13 @@ async fn handle_accept_governor_transfer(
 // POST /admin/governor/reset  — operator-anchored governor recovery (15-0029). Not advertised in
 // the discovery document. Requires the `X-Admin-Secret` header to equal `SIMPLE_IM_ADMIN_SECRET`.
 //
-//   200 → {governor_token}              new governor installed (old governors revoked, pending
-//                                       transfers cleared, committed in one transaction)
+// 15-0040 (FR1): a fresh, nameless credential can no longer be minted here — there is no
+// participant identity to attach it to, and FR1 forbids a second credential type existing at
+// all. This is now purely a "clear the governor pointer, re-open bootstrap" escape hatch; a
+// legitimate participant then claims governorship fresh via `POST /governors/claim`.
+//
+//   200 → {status: "cleared"}           governor pointer cleared + pending transfers dropped,
+//                                       committed in one transaction; bootstrap mode reopens
 //   401 → missing or wrong secret
 //   501 → SIMPLE_IM_ADMIN_SECRET unset or empty
 async fn handle_admin_governor_reset(
@@ -599,8 +609,8 @@ async fn handle_admin_governor_reset(
     if provided != Some(secret.as_str()) {
         return auth_failed();
     }
-    let new_token = state.hub.admin_reset_governor();
-    (StatusCode::OK, Json(json!({"governor_token": new_token.0}))).into_response()
+    state.hub.admin_reset_governor();
+    (StatusCode::OK, Json(json!({"status": "cleared"}))).into_response()
 }
 
 // DELETE /participants/{name}  — governor force-revokes any participant by name
@@ -678,9 +688,9 @@ async fn handle_claim_governorship(
     };
     let expiry = body.and_then(|b| b.expiry_secs).map(Duration::from_secs);
     match state.hub.claim_governorship(&token, expiry) {
-        Ok(ClaimOutcome::Granted { governor_token }) => (
+        Ok(ClaimOutcome::Granted { identity }) => (
             StatusCode::OK,
-            Json(json!({"status": "granted", "governor_token": governor_token})),
+            Json(json!({"status": "granted", "governor": identity})),
         )
             .into_response(),
         Ok(ClaimOutcome::Election { claim_id, voters }) => (
@@ -1225,10 +1235,11 @@ async fn handle_discovery() -> Response {
                 },
                 "participant": {
                     "POST /register": {"auth": "governor", "body": "{name?}", "hint": "Governor issues a participant token; with {name} atomically rebinds an existing identity. Open during bootstrap (no governor)."},
-                    "POST /listen": {"auth": "participant", "body": "{name?}", "hint": "Open SSE stream; optional name to auto-announce"},
-                    "DELETE /listen": {"auth": "participant", "body": null, "hint": "Close SSE stream, unbind name"},
-                    "POST /announce": {"auth": "participant", "body": "{name}", "hint": "Claim a name for this token"},
-                    "GET /participants": {"auth": "governor", "body": null, "hint": "List all announced participants"},
+                    "POST /listen": {"auth": "participant", "body": "{name?}", "hint": "Open SSE stream; optional name makes you reachable in this same call, no separate /announce needed"},
+                    "DELETE /listen": {"auth": "participant", "body": null, "hint": "Close SSE stream, unbind name (identity + token survive; re-listen to resume)"},
+                    "DELETE /identity": {"auth": "participant", "body": null, "hint": "Self-service: permanently delete your own identity, token, and grants — no undo"},
+                    "POST /announce": {"auth": "participant", "body": "{name}", "hint": "Claim a name for this token (optional — /listen can do this in one step instead)"},
+                    "GET /participants": {"auth": "participant", "body": null, "hint": "List all announced participants (15-0040: any valid token, not governor-only)"},
                     "DELETE /participants/{name}": {"auth": "governor", "body": null, "hint": "Force-revoke participant by name"},
                     "GET /participants/{name}/presence": {"auth": "participant", "body": null, "hint": "Check if participant is online"},
                     "POST /participants/{name}/presence-scope": {"auth": "participant", "body": "{presence_scope}", "hint": "Set presence visibility (hidden/visible)"}
@@ -1252,9 +1263,8 @@ async fn handle_discovery() -> Response {
                     "DELETE /grants/{id}": {"auth": "governor", "body": null, "hint": "Revoke a grant by ID"}
                 },
                 "governor": {
-                    "POST /governors/claim": {"auth": "participant", "body": "{expiry_secs?}", "hint": "Claim governorship (may trigger election)"},
+                    "POST /governors/claim": {"auth": "participant", "body": "{expiry_secs?}", "hint": "Claim governorship (may trigger election) — sets the governor flag on your own participant identity, no new credential is issued"},
                     "POST /governors/elections/{id}": {"auth": "participant", "body": "{action}", "hint": "Vote on a pending election/transfer"},
-                    "POST /governors/refresh": {"auth": "governor", "body": null, "hint": "Rotate governor token"},
                     "POST /governors/transfer": {"auth": "governor", "body": "{to?}", "hint": "Initiate governor transfer"},
                     "POST /governors/accept-transfer": {"auth": "participant", "body": "{transfer_token}", "hint": "Accept governor transfer (claimer identity derived from the participant bearer)"},
                     "POST /governors/mediate": {"auth": "governor", "body": "{mediation_id, decision, payload?}", "hint": "Resolve a mediation hold"},
@@ -1428,17 +1438,13 @@ async fn handle_register(
         Some(b) => b,
         None => return auth_failed(),
     };
-    // 403 (not 401) when the presenter is a participant token (completeness-M3).
-    if state.hub.is_participant_token(&bearer) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "error": "FORBIDDEN",
-                "message": "a participant token cannot register participants; present the governor token"
-            })),
-        )
-            .into_response();
-    }
+    // 15-0040 (FR1/FR2): the old pre-check here (`is_participant_token(&bearer)` → 403) assumed
+    // "participant token" and "governor token" were mutually exclusive credential types. Under
+    // the flag model they are NOT — a governor's bearer IS an ordinary participant token — so
+    // that check would incorrectly 403 the actual governor. `issue_participant_token` itself
+    // already resolves the bearer's identity and distinguishes "not a valid token at all"
+    // (AuthFailed → 401) from "a valid participant token that just isn't the governor"
+    // (Forbidden → 403); the match arms below rely on that distinction directly.
     let gov = GovernorToken(bearer);
     match state.hub.issue_participant_token(&gov, name.as_deref()) {
         Ok((token, Some(name))) => {
@@ -1452,7 +1458,10 @@ async fn handle_register(
             .into_response(),
         Err(Error::Forbidden) => (
             StatusCode::FORBIDDEN,
-            Json(json!({"error": "FORBIDDEN", "message": "governor token required"})),
+            Json(json!({
+                "error": "FORBIDDEN",
+                "message": "a participant token cannot register participants; present the governor token"
+            })),
         )
             .into_response(),
         // Invalid/expired governor bearer → 401.
@@ -1482,10 +1491,11 @@ async fn handle_listen(
     Query(params): Query<ListenQueryParams>,
     body: Option<Json<ListenBody>>,
 ) -> Response {
-    // Token is required — no anonymous /listen.
+    // Token is required — no anonymous /listen (P1: unchanged, a real DDoS/resource-exhaustion
+    // control). FR5: only the no-token failure MESSAGE changes, here — to something actionable.
     let token = match bearer_token(&headers) {
         Some(t) => t,
-        None => return auth_failed(),
+        None => return listen_auth_required(),
     };
     let force = params.force.unwrap_or(false);
 
@@ -1507,7 +1517,11 @@ async fn handle_listen(
         .and_then(|b| b.0.presence_push)
         .unwrap_or(false);
 
-    let (token, rx) = match state.hub.open_listen(
+    // The name-bind outcome (FR3: NAME_IN_USE vs Bound) is already reported to the client via the
+    // welcome SSE event on the stream itself (`name_in_use`/`resolution_stream` fields) — the
+    // subscription always opens with 200 as long as the token itself is valid, so there is
+    // nothing further to branch on here.
+    let (token, rx, _name_bind_outcome) = match state.hub.open_listen(
         Some(&token),
         peer_ip,
         name_to_bind,
@@ -1515,7 +1529,7 @@ async fn handle_listen(
         force,
         presence_push,
     ) {
-        Ok(pair) => pair,
+        Ok(triple) => triple,
         Err(e) => return err_response(e),
     };
 
@@ -1557,6 +1571,25 @@ async fn handle_cancel_listen(State(state): State<Arc<AppState>>, headers: Heade
             Json(json!({"error": "NOT_FOUND", "message": "no active subscription"})),
         )
             .into_response(),
+    }
+}
+
+// ── DELETE /identity — self-service "delete me" (15-0040 FR4a) ────────────────
+//
+// A NEW, stronger operation than `DELETE /listen`: permanently removes the caller's own
+// identity, invalidates its token, and purges its grants and denial blocks. There is no
+// undo — a fresh registration is required afterward to participate again.
+//
+//   204 → deleted (identity, token, grants, and denial blocks removed)
+//   401 → no bearer, unknown token, or token already revoked/deleted
+async fn handle_delete_self(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let token = match bearer_token(&headers) {
+        Some(t) => t,
+        None => return auth_failed(),
+    };
+    match state.hub.delete_self(&token) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => err_response(e),
     }
 }
 
@@ -1903,6 +1936,7 @@ fn router_routes() -> Vec<String> {
         "POST /register".to_string(),
         "POST /listen".to_string(),
         "DELETE /listen".to_string(),
+        "DELETE /identity".to_string(),
         "POST /announce".to_string(),
         "GET /skills/participant".to_string(),
         "GET /skills/participant/listen.sh".to_string(),
@@ -1920,7 +1954,6 @@ fn router_routes() -> Vec<String> {
         "GET /messages/latest".to_string(),
         "POST /governors/claim".to_string(),
         "POST /governors/elections/{id}".to_string(),
-        "POST /governors/refresh".to_string(),
         "POST /governors/transfer".to_string(),
         "POST /governors/accept-transfer".to_string(),
         "POST /governors/mediate".to_string(),

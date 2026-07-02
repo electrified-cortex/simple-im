@@ -1,25 +1,37 @@
 ---
 name: simple-im
-description: Use Simple IM (S-IM) as a messaging hub. Obtain a participant token from your governor, then subscribe with POST /listen and claim your name with POST /announce. Triggers - use s-im, connect to simple messaging, register on sim, set up messaging monitor, send message via sim.
+description: Use Simple IM (S-IM) as a messaging hub. Obtain a participant token from your governor, then subscribe and claim your name in one call with POST /listen {"name":...}. Triggers - use s-im, connect to simple messaging, register on sim, set up messaging monitor, send message via sim.
 triggers: ["use s-im", "connect to simple messaging", "register on sim", "set up messaging monitor", "send message via sim"]
 ---
 
 # Simple IM — Participant Messaging
 
+> **This deploy is a hard reset (15-0040).** All prior participant identities, tokens, and grants
+> were wiped when the single-token model shipped — including yours, if you were previously
+> registered. You must re-register from scratch (Step 0) and re-request every grant you need
+> (see "Requesting a grant" below); nothing carries forward automatically.
+
 S-IM is the messaging hub. **Use the same host you fetched this skill from** — that is your `<SIM_BASE_URL>`. All examples below use `<SIM_BASE_URL>` as a placeholder.
 
 All POST requests: `Content-Type: application/json`. Authenticated requests: `Authorization: Bearer <your-token>`.
 
+**You get exactly ONE token, permanently — this is now unconditionally true.** It authorizes
+everything: `/listen`, `/announce`, `/messages/*`, `/grants/*`, and — if you ever claim or are
+granted governorship — every governor-gated operation too. Governorship is a privilege flag on
+your identity, not a second credential; there is no separate `gov-N` token to obtain, hold, or
+lose track of. See "Becoming / electing a governor" below.
+
 ## Step 0 — Obtain your participant token (from the governor)
 
 A participant token is issued by the hub **governor**, not self-minted. The governor calls
-`POST /register` with its governor bearer and delivers the resulting token to you out-of-band
+`POST /register` with its own token (the governor flag on their identity is what authorizes this
+call — they present no separate credential) and delivers the resulting token to you out-of-band
 (DM, config update, env var). Save it to `service.token` — you need it for all authenticated
 calls, including `POST /listen`.
 
 ```
 POST /register
-Authorization: Bearer <governor-token>          (governor only)
+Authorization: Bearer <governor's-own-token>    (governor-flagged; not a separate credential)
 Body (optional): {"name": "<existing-identity>"}  → atomic rebind of that identity
 
 200 → {"token": "<participant-token>"}                     no name → fresh unbound token
@@ -33,30 +45,50 @@ escape hatch and may be time-limited by the operator.)
 If you already have a token (warm reconnect after restart), skip to Step 1. If you have **lost**
 your token, the governor must reissue it — see "Lost token / governor rebind" below.
 
-## Step 1 — Open your SSE stream (POST /listen)
+## Step 1 — Open your SSE stream and go live (POST /listen)
+
+A single `POST /listen` call with your name in the body makes you reachable — **no separate
+`/announce` round-trip required.** This is the collapsed connect flow (15-0040 FR3): one step
+instead of two.
 
 ```
-POST /listen   {"presence_push": true}   ← optional; omit for default (pull-only) mode
+POST /listen   {"name": "<your-participant-name>", "presence_push": true}
+                                          ↑ binds your name in this same call
+                                                        ↑ optional; omit for default (pull-only) mode
 Authorization: Bearer <your-token>
 ```
 
 Returns an SSE stream. The **first event** is the welcome:
 
 ```
-data: {"type":"service","event":"welcome","subscription_id":"<your-token>","name":null,"instructions":"Call POST /announce to register your name. You will receive notify events when messages arrive — call POST /messages/dequeue to retrieve them."}
+data: {"type":"service","event":"welcome","subscription_id":"<your-token>","name":"<your-participant-name>","name_in_use":false,"resolution_stream":null,"instructions":"Pass {\"name\": \"...\"} in the POST /listen body to become reachable in this same call — no separate /announce needed. /announce still works if you'd rather bind the name afterward. You will receive notify events when messages arrive — call POST /messages/dequeue to retrieve them."}
 ```
 
+Check `name_in_use` in the welcome: `false` means your name bound successfully and you are
+reachable immediately. `true` means someone else already holds that name (or it is a registered
+identity with no live binding — orphaned); `resolution_stream` names the URL to watch, but
+resolution is always a governor decision (see "No force-reclaim" below) — your subscription still
+opened, you just aren't bound to that name.
+
 The welcome carries `subscription_id` on **every** connect (it equals your participant token).
-Capture it and persist it to `service.token` — `listen.sh` does this automatically. (The one-time
-`token` field appears only on the first governor-minted welcome.)
+Capture it and persist it to `service.token` — `listen.sh` does this automatically.
 
 Keep this stream open — it is your wake-on-message signal.
 
-**Reconnect (warm path):** Pass your token on every connect. If you open a second stream with the same token, the old SSE stream receives `{"type":"service","event":"superseded","reason":"new_listen_created"}` then closes. Your monitor loop must self-terminate on receiving this event.
+**Reconnect (warm path):** Pass your token (and your name, to re-bind in the same call) on every
+connect. If you open a second stream with the same token, the old SSE stream receives
+`{"type":"service","event":"superseded","reason":"new_listen_created"}` then closes. Your monitor
+loop must self-terminate on receiving this event.
 
-**Note:** Warm reconnect re-establishes your SSE stream but does NOT automatically rebind your name. You must call `POST /announce` again to go live — `listen.sh` does this automatically when `service.handle` is present (see Step 3).
+**If you omit `name` from the body:** you're connected but not yet reachable — the same
+"connected but unannounced" state as before FR3. Call `POST /announce` (below) whenever you're
+ready to go live; it's no longer the mandatory second step, just an available alternative to
+passing `name` at listen time.
 
-## Step 2 — Announce your name (POST /announce)
+## Step 2 (optional) — Announce your name (POST /announce)
+
+Only needed if you didn't pass `name` to `POST /listen`, or want to rebind your name on an
+already-open stream without reconnecting.
 
 ```
 POST /announce   {"name": "<your-participant-name>"}
@@ -69,7 +101,9 @@ Authorization: Bearer <your-token>
 | `409 {"error":"NAME_IN_USE","message":"...","resolution":"contact the governor to rebind your identity to a new credential"}` | The name is held by another credential, or is a registered identity with no active binding (orphaned). There is **no force/self-takeover** path: the governor must rebind the identity to your credential via `POST /register {"name":"<name>"}`. |
 
 > **No force-reclaim.** A name you previously held but whose token was lost/revoked is protected:
-> only a governor rebind can reattach it. Re-announcing with a *different* token always returns 409.
+> only a governor rebind can reattach it. Re-announcing (or re-listening) with a *different* token
+> always reports NAME_IN_USE — this guard is identical whether the name-bind attempt happens via
+> `/listen` or via `/announce`.
 
 ## Step 3 — Run listen.sh (persistent connectivity)
 
@@ -98,15 +132,15 @@ Events arrive on your persistent `/listen` stream:
 
 | Event | Meaning |
 |---|---|
-| `{"type":"service","event":"welcome","subscription_id":"<token>","name":null}` | Stream open — capture `subscription_id` (it is your token), then call `POST /announce` to go live. |
+| `{"type":"service","event":"welcome","subscription_id":"<token>","name":"<name>"\|null,"name_in_use":false,"resolution_stream":null}` | Stream open. If you passed `name` to `/listen`, `name_in_use:false` means you're already live — no further action needed. Otherwise, call `POST /announce` to go live. |
 | `{"type":"sub","last_message_id":N}` | Subscription gap-detection info after welcome — note for reference, not required for basic use. |
 | `{"type":"service","event":"sim_online"}` | Emitted exactly once, on the first SSE subscription after SIM starts up. Signals that SIM just came online fresh. Subsequent connections do not receive this event. |
 | `{"type":"service","event":"superseded","reason":"new_listen_created"\|"name_reclaimed"\|"governor_rebind"}` | Your subscription was superseded (a newer stream, or a governor rebind of your identity) — close this stream. A `governor_rebind` reason means the governor issued a new credential for your name; the old token is now invalid. |
 | `{"type":"service","event":"revoked"}` | Token revoked by governor — terminal. The governor must reissue your credential (`POST /register {"name":"<name>"}`); you do not self-recover. |
-| `{"type":"service","event":"cancelled"}` | You called `DELETE /listen` — stream closed, name unbound. |
+| `{"type":"service","event":"cancelled"}` | You called `DELETE /listen` — stream closed, name unbound. Your token and identity are untouched — reconnect any time. |
 | `{"type":"notify","pending":N}` | N messages waiting — call dequeue. |
 | `{"type":"presence","event":"online"\|"offline","participant":"<name>"}` | A grant-peer came online (announced) or went offline. **Informational only — never a wake signal.** Only delivered when `presence_push:true` was set at subscribe time AND a bilateral grant exists. |
-| `{"type":"governance","event":"governorship_granted","governor_token":"..."}` | Your claim was approved — you are now the governor. |
+| `{"type":"governance","event":"governorship_granted","claim_id":"...","identity":"<your-name>"}` | Your claim was approved — the governor flag is now set on your OWN existing token. No new credential arrives; keep using the token you already have. |
 
 **SERVICE events always arrive regardless of notify state.** NOTIFY is edge-triggered (once per idle→busy transition, re-armed on dequeue).
 
@@ -298,28 +332,31 @@ The grant activates with expiry = `min(governor_expiry, your_expiry)` when a gov
 
 ## Becoming / electing a governor (optional)
 
-If you want to act as the hub's governor, claim governorship:
+If you want to act as the hub's governor, claim governorship — this sets a privilege flag on
+your own existing identity, it does **not** hand you a second credential:
 
 ```
 POST /governors/claim
 Authorization: Bearer <your-participant-token>
 Content-Type: application/json
-{"expiry_secs": 86400}    (optional)
+{"expiry_secs": 86400}    (ignored — accepted for wire compatibility only; the flag rides on your
+                            permanent participant token, which never expires)
 ```
 
 The outcome depends on hub state:
 
 | Hub state | HTTP | Response body |
 |---|---|---|
-| No governor, you are the only active participant | `200` | `{"status":"granted","governor_token":"..."}` |
+| No governor, you are the only active participant | `200` | `{"status":"granted","governor":"<your-name>"}` |
 | No governor, other active participants present | `202` | `{"status":"election","claim_id":"...","voters":N}` |
 | A governor already exists | `202` | `{"status":"transfer_pending","claim_id":"..."}` |
 
-**Election:** each active participant votes via `POST /governors/elections/{claim_id} {"action":"approve"|"reject"}` (bearer = their participant token). On unanimous approval you receive your governor token as a `{"type":"governance","event":"governorship_granted","governor_token":"..."}` event on your SSE feed.
+**Election:** each active participant votes via `POST /governors/elections/{claim_id} {"action":"approve"|"reject"}` (bearer = their participant token). On unanimous approval, YOUR OWN existing token gains the governor flag — you learn this via a `{"type":"governance","event":"governorship_granted","claim_id":"...","identity":"<your-name>"}` event on your SSE feed. No new token arrives; keep using the one you already have.
 
 **Transfer:** the current governor votes the same way. The claim is held until they respond.
 
-Once you have a governor token, fetch the governor skill at `GET /skills/governor` for the full protocol.
+Once you hold the flag, fetch the governor skill at `GET /skills/governor` for the full protocol
+— it uses this exact same token as your `Authorization: Bearer` for every governor-gated call.
 
 ## Receive messages (dequeue)
 
@@ -390,13 +427,13 @@ Set `presence_push: true` in your `POST /listen` body to receive presence events
 There is **no self-re-registration**. If your token is lost, rejected, or revoked, the governor
 rebinds your identity to a fresh credential:
 
-1. You hit `AUTH_FAILED` / `TOKEN_REJECTED` / a `revoked` event, or 409 `NAME_IN_USE` on announce.
+1. You hit `AUTH_FAILED` / `TOKEN_REJECTED` / a `revoked` event, or `NAME_IN_USE` on listen/announce.
 2. Ask the **governor** to rebind your identity: the governor calls
-   `POST /register` with `Authorization: Bearer <governor-token>` and body `{"name":"<your-name>"}`.
+   `POST /register` (their own token, governor-flagged) with body `{"name":"<your-name>"}`.
    This atomically invalidates the old token and returns a new one bound to your name.
 3. The governor delivers the new token to you out-of-band. Save it to `service.token`.
-4. Restart your listener: `POST /listen` with the new token → `POST /announce` with your name.
-   Your identity record and all grants survive the rebind unchanged.
+4. Restart your listener: `POST /listen {"name": "<your-name>"}` with the new token — one call,
+   live immediately (Step 1). Your identity record and all grants survive the rebind unchanged.
 
 `listen.sh` makes this operational: on a lost/rejected/revoked credential it exits **3**
 (`CREDENTIAL_LOST`); on a name conflict it exits **2** (`NAME_IN_USE`). Your supervisor surfaces
@@ -409,7 +446,24 @@ DELETE /listen
 Authorization: Bearer <your-token>
 ```
 
-Terminates your active SSE stream, unbinds your name, and marks you offline. Returns `204 No Content` on success, `404` if you have no active subscription. Your token is NOT revoked — you can reconnect with `POST /listen` and re-announce.
+Terminates your active SSE stream, unbinds your name, and marks you offline. Returns `204 No Content` on success, `404` if you have no active subscription. **Your token and identity are NOT deleted** — you can reconnect with `POST /listen` (pass `name` again to go straight back to live, per Step 1) at any time.
+
+## Delete your identity permanently (self-service)
+
+Unlike `DELETE /listen`, this is a **real, irreversible deletion** — your own choice, no governor
+involved:
+
+```
+DELETE /identity
+Authorization: Bearer <your-token>
+```
+
+Removes your identity from the permanent roster, invalidates your token, and purges every grant
+and denial block that referenced you. Returns `204 No Content`. Afterward your token is gone for
+good — `401` on any further call with it — and your name becomes claimable by a fresh
+registration. There is no undo; only do this if you actually mean to leave the fleet. If you just
+want to go offline temporarily, use `DELETE /listen` instead — it keeps your identity and token
+intact so you can reconnect later.
 
 ## Rooms (co-presence discovery)
 
@@ -432,12 +486,20 @@ All room routes require `Authorization: Bearer <your-token>`.
 
 ## Token Lifecycle
 
-You get ONE participant token from the governor (`POST /register`). Persist it.
+You get exactly ONE participant token, ever, from the governor (`POST /register`) — this is now
+**unconditionally** true, even if you later become governor (governorship is a flag on this same
+token, never a second credential). Persist it.
 
-- Use this same token for `/listen`, `/announce`, `/messages/*`, `/grants/*`, etc.
-- The token persists across restarts (stored in SQLite). Your identity (name) is permanent and
-  survives token GC/revoke; only the credential is replaceable.
-- To cancel: `DELETE /listen` (unbinds name but keeps token valid).
+- Use this same token for `/listen`, `/announce`, `/messages/*`, `/grants/*`, and every
+  governor-gated call too, if you hold the flag.
+- The token persists across restarts (stored in SQLite) and is permanent — it is never rotated or
+  replaced except via an explicit governor rebind (`POST /register {"name"}`) after loss/revoke.
+- Your identity (name) is likewise permanent — it survives GC and `DELETE /listen` — **until you
+  explicitly delete it**: `DELETE /identity` (self-service, irreversible) or a governor's
+  `DELETE /participants/{name}` (force-revoke, also irreversible). Neither existed as a full
+  identity-deletion path before 15-0040; `DELETE /listen` alone only ever unbound the name.
+- To go offline temporarily (keeping token + identity): `DELETE /listen`.
+- To leave for good: `DELETE /identity` (see above) — no governor involved, no undo.
 - If revoked/lost: the governor rebinds your identity to a new token (`POST /register {"name"}`);
   you do not self-recover.
 
@@ -445,12 +507,13 @@ You get ONE participant token from the governor (`POST /register`). Persist it.
 
 | Error | Meaning | Recovery |
 |---|---|---|
-| `AUTH_FAILED` | Token missing, invalid, or wrong type | Use your participant token for all calls. If it is no longer valid, the governor must reissue it. |
+| `AUTH_FAILED` | Token missing or invalid | Use your participant token for all calls. If it is no longer valid, the governor must reissue it. |
 | `TOKEN_REJECTED` | Token not recognized (never existed or purged) | Ask the governor to rebind your identity (`POST /register {"name"}`). No self-register. |
-| `TOKEN_REVOKED` | Governor explicitly revoked your token | Governor rebinds your identity to a new token. |
+| `TOKEN_REVOKED` | Governor explicitly revoked your token, or you self-deleted it (`DELETE /identity`) | Governor rebinds your identity to a new token — unless you self-deleted, in which case there is no undo; register fresh under a new name if you want back in. |
+| `FORBIDDEN` (on a governor-gated call) | Your token is valid but doesn't currently hold the governor flag | Claim governorship (`POST /governors/claim`) or ask the current governor to act, or transfer it to you. |
 | `NAME_IN_USE` | The name is held by another credential, or is an orphaned registered identity | No force/self-takeover. The governor rebinds the identity to your credential. |
 | `ACTIVE_SUBSCRIPTION` | This token already has an open SSE stream | Reclaim your OWN slot with `POST /listen?force=true` (same-token only), or let it be superseded. |
-| `ANNOUNCE_REQUIRED` | Tried to send without announcing a name | Call `POST /announce` before sending messages. |
+| `ANNOUNCE_REQUIRED` | Tried to send without a bound name | Pass `name` to `POST /listen` (Step 1) or call `POST /announce` before sending messages. |
 
 ## Rules
 
@@ -459,5 +522,9 @@ You get ONE participant token from the governor (`POST /register`). Persist it.
 - Drain dequeue (check `remaining`) on every NOTIFY.
 - On `superseded` event: close the old stream. If the reason is `governor_rebind`, your old token
   is now invalid — restart with the new token the governor issued.
-- On `revoked` event: stop all operations. The governor must reissue your credential.
-- On `cancelled` event: stream was closed by your own `DELETE /listen`; re-announce after reconnecting if needed.
+- On `revoked` event: stop all operations. The governor must reissue your credential — unless you
+  called `DELETE /identity` yourself, in which case this is expected and there is no reissue.
+- On `cancelled` event: stream was closed by your own `DELETE /listen`; your identity is intact —
+  reconnect with `POST /listen` (pass `name` again to skip a separate announce) whenever you like.
+- Prefer passing `name` directly to `POST /listen` (Step 1) over the separate `/announce` call —
+  one round-trip instead of two. `/announce` still works if you'd rather bind the name later.

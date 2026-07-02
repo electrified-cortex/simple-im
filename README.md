@@ -77,14 +77,17 @@ curl -s http://localhost:9191/ | jq .
 There are two kinds of participant: **participants** (who message each other) and an optional **governor** (who centralizes grant approval). The participant flow:
 
 ```text
-POST /register            → governor issues a participant token (Bearer <governor-token>; open only during bootstrap)
-POST /listen              → open your SSE stream with that token (Authorization: Bearer <token>)
-POST /announce            → claim a name; you are now reachable
+POST /register             → governor issues a participant token (Bearer <governor's-own-token>; open only during bootstrap)
+POST /listen {"name":...}  → open your SSE stream AND claim your name in one call — reachable immediately
         … a grant is established between you and your peer …
-POST /messages/send       → send to a peer by name → 202 accepted
-(SSE notify fires)        → your stream emits {"type":"notify","pending":N}
-POST /messages/queue/pop  → pop the waiting message(s)
+POST /messages/send        → send to a peer by name → 202 accepted
+(SSE notify fires)         → your stream emits {"type":"notify","pending":N}
+POST /messages/queue/pop   → pop the waiting message(s)
 ```
+
+Governorship is a privilege flag on a participant's own token (never a second credential) —
+whoever holds it presents the exact same bearer for governor-gated calls as for everything else.
+`POST /announce` still exists if you'd rather bind your name in a separate call after `/listen`.
 
 Delivery is **online-only**: if the recipient is not currently connected, the send fails immediately with an explicit error — nothing is buffered to disk and silently delivered later. The persistent SSE stream from `POST /listen` doubles as the wake-on-message channel, so participants never poll on a timer.
 
@@ -133,7 +136,7 @@ Governor (optional, elected) ── approves grants, mediates, blocks/unblocks
 >
 > The tables below are a summary. For authoritative details, consult the sources above.
 
-- **Auth** — send your token as `Authorization: Bearer <token>`. Token types: `participant` (issued by the governor via `/register`), `governor` (from `/governors/claim` or `/admin/governor/reset`).
+- **Auth** — send your token as `Authorization: Bearer <token>`. There is exactly one credential type: a participant token (issued via `/register`). Governorship is a privilege flag on a participant's own identity (set via `/governors/claim`, transfer/election, or cleared via `/admin/governor/reset`) — it is never a second, distinct token.
 - **Bodies** — JSON with `Content-Type: application/json`, except attachment upload (raw bytes).
 - **Responses** — **gate on the HTTP status code.** Success bodies vary by route (`{"status":"accepted"}`, `{"token":"…"}`, `204 No Content`, …); errors are always `{"error":"CODE","message":"…"}`. The always-current machine-readable route map is at `GET /`.
 
@@ -172,10 +175,10 @@ These endpoints require a governor token. See [§7](#7-electing-a-governor-optio
 | `GET` | `/governors/grants` | List all active grants in the system. Governor token. |
 | `POST` | `/governors/mediate` | Resolve a brief-auth hold: `{"mediation_id":"…","decision":"approve"\|"block"}`. Governor token. |
 | `GET` | `/governors/events` | SSE stream of governor-relevant events (grant requests, mediation holds). Governor token. |
-| `POST` | `/governors/refresh` | Self-rotate the governor token. Governor token. |
 | `POST` | `/governors/transfer` | Initiate governor authority transfer → `{"transfer_token":"…"}`. Governor token. |
-| `POST` | `/governors/accept-transfer` | Accept a transfer: `Authorization: Bearer <participant-token>` + `{"transfer_token":"…"}` → `{"token":"…"}`. Claimer identity derived from the bearer. |
-| `DELETE` | `/participants/{name}` | Revoke a participant's token (identity record persists). Governor token. |
+| `POST` | `/governors/accept-transfer` | Accept a transfer: `Authorization: Bearer <participant-token>` + `{"transfer_token":"…"}` → `{"status":"accepted"}` (the flag moves to the accepting identity's own token — no new credential). Claimer identity derived from the bearer. |
+| `DELETE` | `/participants/{name}` | Revoke a participant's token AND identity (grants/denial-blocks purged too). Governor token. |
+| `DELETE` | `/identity` | Self-service: permanently delete your OWN identity, token, and grants. Any participant token. |
 
 ### Rooms endpoints
 
@@ -275,11 +278,11 @@ Check your active grants any time with `GET /grants`.
 
 ## 7. Electing a governor (optional)
 
-A governor does not exist by default. Any participant may claim governorship via `POST /governors/claim` (bearer = your participant token, optional body `{"expiry_secs":N}`). The outcome depends on current hub state:
+A governor does not exist by default. Any participant may claim governorship via `POST /governors/claim` (bearer = your participant token, optional body `{"expiry_secs":N}`, ignored — the flag rides on your permanent token, which never expires). Claiming sets a privilege flag on your own identity; it never mints a second credential. The outcome depends on current hub state:
 
 | Hub state | Outcome | Response |
 | --- | --- | --- |
-| No governor + you are the only active participant | **Granted immediately** | `200 {"status":"granted","governor_token":"…"}` |
+| No governor + you are the only active participant | **Granted immediately** | `200 {"status":"granted","governor":"<your-name>"}` |
 | No governor + other active participants exist | **Election** — every active participant must approve | `202 {"status":"election","claim_id":"…","voters":N}` |
 | A governor already exists | **Transfer pending** — the current governor must approve | `202 {"status":"transfer_pending","claim_id":"…"}` |
 
@@ -290,7 +293,7 @@ POST /governors/elections/{claim_id}   {"action": "approve" | "reject"}
 Authorization: Bearer <your-participant-token>
 ```
 
-On unanimous approval the candidate receives their governor token as a `{"type":"governance","event":"governorship_granted","governor_token":"…"}` event on their own SSE feed.
+On unanimous approval the candidate's OWN existing token gains the governor flag — no new credential is issued. They learn this via a `{"type":"governance","event":"governorship_granted","claim_id":"…","identity":"<candidate-name>"}` event on their own SSE feed.
 
 **Transfer.** The existing governor approves via the same `POST /governors/elections/{id}` endpoint; the claim is held until they respond, even if they are temporarily offline.
 

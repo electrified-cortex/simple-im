@@ -9,10 +9,17 @@ pub const MAX_EXPIRY: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
 // §3.1: unique name bound to a token-identity for the lifetime of a registration
 pub struct ParticipantName(pub String);
 
-// §4.3: minted by a governor; authorizes register/send/presence/dequeue for one agent identity
+// §4.3: minted by a governor (or bootstrap); authorizes register/send/presence/dequeue for one
+// participant identity. Also the SOLE credential a governor holds (15-0040 FR1/FR2): governorship
+// is a privilege flag carried by an identity, never a second minted credential.
 pub struct ParticipantToken(pub String);
 
-// §4.2: minted by the owner; carries delegated authority valid only while online and unexpired
+// 15-0040 (FR2, OQ4 — implementer's call): retained as an internal marker type, NOT a second
+// wire credential. It wraps the SAME bearer string as `ParticipantToken` — the caller presents
+// their one participant token; this newtype only marks "this call site is asserting the governor
+// privilege flag must be checked for this bearer" (see `DeliveryHub`/`HubInner::validate_governor_token`,
+// which resolves the wrapped token to an identity and checks it against the singleton governor
+// pointer). No code path mints a distinct `GovernorToken` value handed to a participant.
 pub struct GovernorToken(pub String);
 
 // §5.3: opaque bytes handed to the recipient's live channel; hub never stores or inspects contents

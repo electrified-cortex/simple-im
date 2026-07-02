@@ -183,6 +183,19 @@ impl TokenStore {
         .execute(&self.pool)
         .await?;
 
+        // 15-0040 FR2/OQ1: the governor is a privilege flag on a participant identity, not a
+        // separate credential — persisted as a single-row singleton pointer (identity name),
+        // never a per-identity table (that would smuggle back the two-credential shape this task
+        // removes). At most one row (id=0) ever exists.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS governor (
+                id        INTEGER PRIMARY KEY CHECK (id = 0),
+                identity  TEXT NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
         // ── 15-0029 zero-debt migration Steps 2–7 ──────────────────────────────
         // All idempotent, all mandatory. Run AFTER the identities table exists and AFTER
         // the v2→listen rename above. Provably-safe: a row is preserved by the Step-6 purge
@@ -291,6 +304,88 @@ impl TokenStore {
             name_col_dropped,
         );
 
+        // ── 15-0040 — operator-authorized full reset (one-time, ever) ──────────────────
+        // Collapses the old two-credential (participant + gov-N) model into the single-token +
+        // governor-flag model (FR1/FR2). The operator explicitly authorized wiping ALL pre-reset
+        // naming/trust state fleet-wide rather than a careful preserve-and-convert migration (see
+        // 15-0040 "Backward-compatibility / migration — OPERATOR-AUTHORIZED FULL RESET"): the
+        // hub's naming/governor layer was already fully locked out, so a reset cannot make it
+        // worse. Every participant re-registers and every grant is re-requested after this runs.
+        //
+        // Gated by a one-row marker table so this destructive step runs exactly once, ever, no
+        // matter how many times the server restarts afterward (AC-13 idempotency).
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS reset_15_0040 (
+                id       INTEGER PRIMARY KEY CHECK (id = 0),
+                done_at  TEXT NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        let already_reset = sqlx::query("SELECT 1 FROM reset_15_0040 WHERE id = 0")
+            .fetch_optional(&self.pool)
+            .await?
+            .is_some();
+
+        // AC-13: log a `sim_migrate:`-style count line on EVERY migrate() call, consistent with
+        // the Step 2-7 log above — not just the one time the wipe actually runs. Re-running this
+        // against an already-reset DB reports all-zero counts (idempotent no-op), rather than
+        // going silent, so the log always reflects what this step did on this run.
+        let (
+            tokens_cleared,
+            identities_cleared,
+            grants_cleared,
+            denial_blocks_cleared,
+            governor_cleared,
+        ) = if !already_reset {
+            let now = system_time_to_secs_str(SystemTime::now());
+            let mut tx = self.pool.begin().await?;
+            let tokens_cleared = sqlx::query("DELETE FROM tokens")
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            let identities_cleared = sqlx::query("DELETE FROM identities")
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            let grants_cleared = sqlx::query("DELETE FROM grants")
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            let denial_blocks_cleared = sqlx::query("DELETE FROM denial_blocks")
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            let governor_cleared = sqlx::query("DELETE FROM governor")
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            sqlx::query("INSERT INTO reset_15_0040 (id, done_at) VALUES (0, ?)")
+                .bind(&now)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            (
+                tokens_cleared,
+                identities_cleared,
+                grants_cleared,
+                denial_blocks_cleared,
+                governor_cleared,
+            )
+        } else {
+            (0, 0, 0, 0, 0)
+        };
+        eprintln!(
+            "sim_migrate: 15-0040 full reset — tokens_cleared={} identities_cleared={} \
+             grants_cleared={} denial_blocks_cleared={} governor_cleared={}",
+            tokens_cleared,
+            identities_cleared,
+            grants_cleared,
+            denial_blocks_cleared,
+            governor_cleared,
+        );
+
         Ok(())
     }
 
@@ -350,6 +445,36 @@ impl TokenStore {
             .collect())
     }
 
+    /// Load the singleton governor identity (15-0040 FR2/OQ1), if one is currently set.
+    pub async fn load_governor(&self) -> Result<Option<String>, sqlx::Error> {
+        use sqlx::Row;
+        let row = sqlx::query("SELECT identity FROM governor WHERE id = 0")
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get("identity")))
+    }
+
+    /// Set (or move) the singleton governor pointer to `identity`. No credential is minted —
+    /// this only records which existing participant identity currently holds the flag.
+    pub async fn set_governor(&self, identity: &str) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO governor (id, identity) VALUES (0, ?) \
+             ON CONFLICT(id) DO UPDATE SET identity = excluded.identity",
+        )
+        .bind(identity)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Clear the singleton governor pointer (nobody is governor afterward).
+    pub async fn clear_governor(&self) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM governor")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Load all permanent identity records (15-0029 / FG-7).
     pub async fn load_identities(&self) -> Result<Vec<PersistedIdentity>, sqlx::Error> {
         use sqlx::Row;
@@ -375,6 +500,18 @@ impl TokenStore {
         sqlx::query("INSERT OR IGNORE INTO identities (name, created_at) VALUES (?, ?)")
             .bind(name)
             .bind(now)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Permanently remove an identity record (15-0040 FR4a/FR4b: self-delete / governor-delete).
+    /// Unlike everything else GC/revoke/expiry does to a name, this is the one path that DOES
+    /// remove the permanent roster entry — explicit deletion is the only way a name leaves
+    /// `identities` (see the `identities` table's own "NEVER removed by GC" invariant).
+    pub async fn delete_identity(&self, name: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM identities WHERE name = ?")
+            .bind(name)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -413,35 +550,6 @@ impl TokenStore {
             .bind(token)
             .execute(&self.pool)
             .await?;
-        Ok(())
-    }
-
-    /// Operator-anchored governor reset (15-0029 / security-MAJOR-1/2): delete the revoked
-    /// governor rows and insert the new governor in a SINGLE transaction, so a crash cannot
-    /// leave the hub with no durable governor.
-    pub async fn reset_governors(
-        &self,
-        delete_ids: &[String],
-        new_token: &str,
-    ) -> Result<(), sqlx::Error> {
-        let now = system_time_to_secs_str(SystemTime::now());
-        let mut tx = self.pool.begin().await?;
-        for id in delete_ids {
-            sqlx::query("DELETE FROM tokens WHERE token = ?")
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
-        }
-        sqlx::query(
-            "INSERT OR REPLACE INTO tokens (token, identity, token_type, expires_at, created_at) \
-             VALUES (?, ?, 'governor', NULL, ?)",
-        )
-        .bind(new_token)
-        .bind(new_token)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
         Ok(())
     }
 
@@ -656,6 +764,19 @@ impl TokenStore {
     /// Re-run the schema migration (idempotency + legacy-row processing in tests).
     pub async fn migrate_for_test(&self) -> Result<(), sqlx::Error> {
         self.migrate().await
+    }
+
+    /// Test seam (15-0040 S6): clears the one-time `reset_15_0040` marker so a subsequent
+    /// `migrate_for_test()` call re-triggers the destructive full-reset step over whatever state
+    /// currently exists. `TokenStore::open` always runs the reset once (harmlessly, on an empty
+    /// DB) before a test can get a handle at all — this lets a test seed state first and then
+    /// exercise the SAME wipe logic a real first-time upgrade runs, without needing a literal
+    /// pre-15-0040 database file.
+    pub async fn clear_reset_marker_for_test(&self) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM reset_15_0040 WHERE id = 0")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     /// Insert a raw token row (including the legacy `name` column) to simulate a pre-migration DB.

@@ -5,8 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::error::Error;
-use crate::persistence::{PersistedGrant, PersistedToken};
-use crate::types::GovernorToken;
+use crate::persistence::PersistedGrant;
 
 // ── Public enums ──────────────────────────────────────────────────────────────
 
@@ -70,16 +69,11 @@ pub struct ApproveGrantRequest {
 
 // ── Internal records ──────────────────────────────────────────────────────────
 
-struct GovernorRecord {
-    expires: Option<Instant>,
-    online: bool,
-    revoked: bool,
-    /// Listen token linked to this governor's active participant session.
-    listen_token: Option<String>,
-}
-
+/// A pending one-time governor transfer (`POST /governors/transfer` / `.../accept-transfer`).
+/// `from_identity` is the outgoing governor's participant identity name (OQ1: governorship is
+/// keyed by identity name, never by a minted credential).
 struct PendingTransfer {
-    from_gov_token: String,
+    from_identity: String,
     to_identity: Option<String>,
 }
 
@@ -102,12 +96,16 @@ struct Grant {
     conditions: Option<String>,
 }
 
-/// The in-memory trust state: governors, agent tokens, grants, and pending transfers.
+/// The in-memory trust state: the governor pointer, grants, and pending transfers.
 pub struct TrustChain<F = fn() -> Instant>
 where
     F: Fn() -> Instant,
 {
-    governors: HashMap<String, GovernorRecord>,
+    /// Singleton governor pointer (15-0040 FR2 / OQ1): `Some(participant identity name)` when a
+    /// governor is currently set, `None` otherwise. Governorship is a privilege flag carried by
+    /// an existing participant identity's own token — never a separate minted credential. There
+    /// is at most one governor at a time, transferred as a unit (never a per-identity map).
+    governor_identity: Option<String>,
     grants: Vec<Grant>,
     pending_transfers: HashMap<String, PendingTransfer>,
     counter: u64,
@@ -131,30 +129,11 @@ impl<F: Fn() -> Instant> TrustChain<F> {
     /// Creates a `TrustChain` with a custom clock function; used in tests.
     pub fn with_clock(now: F) -> Self {
         Self {
-            governors: HashMap::new(),
+            governor_identity: None,
             grants: vec![],
             pending_transfers: HashMap::new(),
             counter: 0,
             now,
-        }
-    }
-
-    fn verify_governor(&self, token: &GovernorToken) -> Result<(), Error> {
-        if let Some(record) = self.governors.get(&token.0) {
-            if record.revoked {
-                return Err(Error::AuthFailed);
-            }
-            if !record.online {
-                return Err(Error::AuthFailed);
-            }
-            if let Some(expires) = record.expires
-                && (self.now)() >= expires
-            {
-                return Err(Error::TokenExpired);
-            }
-            Ok(())
-        } else {
-            Err(Error::AuthFailed)
         }
     }
 
@@ -163,71 +142,59 @@ impl<F: Fn() -> Instant> TrustChain<F> {
         format!("{}-{}", prefix, self.counter)
     }
 
-    /// True when at least one non-revoked governor record exists (bootstrap gate).
+    /// True when a governor identity is currently set (bootstrap gate, P2).
     pub fn has_active_governor(&self) -> bool {
-        self.governors.values().any(|r| !r.revoked)
+        self.governor_identity.is_some()
     }
 
-    /// Install a governor unconditionally and return its token. No authorization — the caller
-    /// (the hub's claim / election / transfer flow) owns the governance policy that gates this.
-    /// Used for auto-grant (first governor on an empty hub), a completed election, or a
-    /// completed transfer.
-    pub fn install_governor(&mut self, expiry: Option<Duration>) -> GovernorToken {
-        let now = (self.now)();
-        let expires = expiry.map(|d| now + d.min(crate::types::MAX_EXPIRY));
-        let id = self.next_id("gov");
-        self.governors.insert(
-            id.clone(),
-            GovernorRecord {
-                expires,
-                online: true,
-                revoked: false,
-                listen_token: None,
-            },
-        );
-        GovernorToken(id)
+    /// True when `identity` currently holds the governor privilege flag (FR2). The caller is
+    /// responsible for having already resolved `identity` from a verified, live bearer token —
+    /// `TrustChain` itself has no notion of tokens/bearers, only identity names.
+    pub fn is_governor(&self, identity: &str) -> bool {
+        self.governor_identity.as_deref() == Some(identity)
     }
 
-    /// Token ids of all currently-active (non-revoked) governors.
-    pub fn active_governor_tokens(&self) -> Vec<String> {
-        self.governors
-            .iter()
-            .filter(|(_, r)| !r.revoked)
-            .map(|(id, _)| id.clone())
-            .collect()
+    /// Returns the current governor's identity name, if any.
+    pub fn governor_identity(&self) -> Option<&str> {
+        self.governor_identity.as_deref()
     }
 
-    /// Revoke every active governor (used when a transfer completes: the new governor replaces
-    /// the old). Returns the revoked token ids.
-    pub fn revoke_all_governors(&mut self) -> Vec<String> {
-        let mut revoked = vec![];
-        for (id, rec) in self.governors.iter_mut() {
-            if !rec.revoked {
-                rec.revoked = true;
-                revoked.push(id.clone());
-            }
-        }
-        revoked
+    /// Sets the governor privilege flag on `identity`, unconditionally replacing whoever held it
+    /// before — there is at most one governor at a time (OQ1). No credential is minted; the
+    /// identity's own existing participant token now authorizes every governor-gated operation.
+    /// No authorization check here — the caller (the hub's claim/election/transfer flow) owns the
+    /// governance policy that gates when this is called.
+    pub fn set_governor(&mut self, identity: &str) {
+        self.governor_identity = Some(identity.to_string());
     }
 
-    /// Marks a governor online or offline. The hub calls this when the governor's session state
-    /// changes. An offline governor cannot mint tokens or approve grants (AC-SEC-2).
-    pub fn set_governor_online(&mut self, governor: &GovernorToken, online: bool) {
-        if let Some(record) = self.governors.get_mut(&governor.0) {
-            record.online = online;
+    /// Clears the governor flag unconditionally (nobody is governor afterward).
+    pub fn clear_governor(&mut self) {
+        self.governor_identity = None;
+    }
+
+    /// Clears the governor flag iff `identity` currently holds it; no-op otherwise. Used when an
+    /// identity is deleted (FR4a self-delete / FR4b governor-delete) so a removed identity is
+    /// never left as a phantom governor.
+    pub fn clear_governor_if(&mut self, identity: &str) {
+        if self.governor_identity.as_deref() == Some(identity) {
+            self.governor_identity = None;
         }
     }
 
     /// Backward-compatible wrapper: Symmetric, no budget, opens_reply_window=true.
+    /// `governor_identity` is the already-resolved, already-verified approving identity (or
+    /// `"recipient-consent"` for the governorless consent-grant path) — recorded on the grant for
+    /// provenance only; this function performs no authorization itself.
     pub fn approve_grant(
         &mut self,
-        governor: &GovernorToken,
+        governor_identity: &str,
         identity_a: &str,
         identity_b: &str,
         expiry: Option<Duration>,
     ) -> Result<String, Error> {
         self.approve_grant_req(
-            governor,
+            governor_identity,
             identity_a,
             identity_b,
             expiry,
@@ -236,16 +203,17 @@ impl<F: Fn() -> Instant> TrustChain<F> {
     }
 
     /// Governor approves a pending grant request with full parameters; lower-level than `approve_grant`.
+    /// The caller must have already verified `governor_identity` holds the governor flag (or is
+    /// the `"recipient-consent"` governorless sentinel) — this function only records provenance.
     pub fn approve_grant_req(
         &mut self,
-        governor: &GovernorToken,
+        governor_identity: &str,
         identity_a: &str,
         identity_b: &str,
         expiry: Option<Duration>,
         req: ApproveGrantRequest,
     ) -> Result<String, Error> {
-        self.verify_governor(governor)?;
-        let governor_id = governor.0.clone();
+        let governor_id = governor_identity.to_string();
         let now = (self.now)();
         let expires = expiry.map(|d| now + d.min(crate::types::MAX_EXPIRY));
         let id = self.next_id("grant");
@@ -383,35 +351,6 @@ impl<F: Fn() -> Instant> TrustChain<F> {
             && grant.max_messages.is_some()
         {
             grant.messages_used += 1;
-        }
-    }
-
-    /// Returns `Ok` if the token is a current, non-expired governor token.
-    pub fn validate_governor_token(&self, token: &GovernorToken) -> Result<(), Error> {
-        self.verify_governor(token)
-    }
-
-    /// Returns true if any governor token is currently marked online.
-    pub fn has_online_governor(&self) -> bool {
-        let now = (self.now)();
-        self.governors
-            .values()
-            .any(|r| !r.revoked && r.online && r.expires.is_none_or(|exp| now < exp))
-    }
-
-    /// Returns true if the governor with the given raw token ID is online and not expired.
-    pub fn is_governor_id_online(&self, id: &str) -> bool {
-        let now = (self.now)();
-        self.governors
-            .get(id)
-            .is_some_and(|r| !r.revoked && r.online && r.expires.is_none_or(|exp| now < exp))
-    }
-
-    /// Link a governor token to its active participant listen session.
-    /// Called when the governor opens a listen session using their governor token as bearer.
-    pub fn link_governor_session(&mut self, gov_token_id: &str, listen_token: &str) {
-        if let Some(record) = self.governors.get_mut(gov_token_id) {
-            record.listen_token = Some(listen_token.to_string());
         }
     }
 
@@ -564,6 +503,25 @@ impl<F: Fn() -> Instant> TrustChain<F> {
         self.grants.len() < before
     }
 
+    /// Removes every grant where `name` appears as `identity_a`, `identity_b`, `name_a`, or
+    /// `name_b` (15-0040 FR4a/FR4b deletion cleanup — self-delete and governor-delete must both
+    /// purge every grant referencing the removed identity, not just live routing state). Returns
+    /// the removed grant IDs so the caller can also purge the persisted rows.
+    pub fn purge_grants_for(&mut self, name: &str) -> Vec<String> {
+        let mut removed = Vec::new();
+        self.grants.retain(|g| {
+            let matches = g.identity_a == name
+                || g.identity_b == name
+                || g.name_a.as_deref() == Some(name)
+                || g.name_b.as_deref() == Some(name);
+            if matches {
+                removed.push(g.id.clone());
+            }
+            !matches
+        });
+        removed
+    }
+
     /// Returns (identity_a, identity_b, name_a, name_b) for a grant, or None if not found.
     pub fn grant_parties(
         &self,
@@ -577,27 +535,6 @@ impl<F: Fn() -> Instant> TrustChain<F> {
                 g.name_b.clone(),
             )
         })
-    }
-
-    /// Rotate a governor token atomically: move the record to a fresh ID, invalidate the old one.
-    /// Returns the new token. All record fields (expiry, online, revoked) are unchanged.
-    pub fn rotate_governor_token(
-        &mut self,
-        old_token: &GovernorToken,
-    ) -> Result<GovernorToken, Error> {
-        self.validate_governor_token(old_token)?;
-        let record = self
-            .governors
-            .remove(&old_token.0)
-            .ok_or(Error::AuthFailed)?;
-        let new_id = self.next_id("gov");
-        self.governors.insert(new_id.clone(), record);
-        Ok(GovernorToken(new_id))
-    }
-
-    /// Returns the expiry Instant for a governor token, or None if permanent or not found.
-    pub fn governor_expiry(&self, token: &GovernorToken) -> Option<Instant> {
-        self.governors.get(&token.0).and_then(|r| r.expires)
     }
 
     /// Reverses a prior `consume_grant_message` call. Called under the hub lock when a channel
@@ -614,12 +551,12 @@ impl<F: Fn() -> Instant> TrustChain<F> {
     /// Create a pending governor transfer. The current governor designates who may claim authority.
     /// Returns a one-time transfer token the current governor delivers out-of-band to the recipient.
     /// `to_identity` is optional — if set, only that identity may accept; if None, any presenter can.
+    /// The caller must have already verified `from_identity` holds the governor flag.
     pub fn transfer_governor(
         &mut self,
-        from: &GovernorToken,
+        from_identity: &str,
         to_identity: Option<&str>,
     ) -> Result<String, Error> {
-        self.verify_governor(from)?;
         use rand::RngCore;
         let mut rng = rand::thread_rng();
         let mut bytes = [0u8; 16];
@@ -628,7 +565,7 @@ impl<F: Fn() -> Instant> TrustChain<F> {
         self.pending_transfers.insert(
             transfer_token.clone(),
             PendingTransfer {
-                from_gov_token: from.0.clone(),
+                from_identity: from_identity.to_string(),
                 to_identity: to_identity.map(|s| s.to_string()),
             },
         );
@@ -643,13 +580,15 @@ impl<F: Fn() -> Instant> TrustChain<F> {
 
     /// Accept a pending governor transfer. The caller passes the transfer token and the identity
     /// it resolved from the **verified participant bearer** (never from the request body). On
-    /// success: a new governor token is minted, the initiating governor is revoked, and the
-    /// pending transfer is consumed. Returns the new governor token. (FG-5 / security-MAJOR-3)
+    /// success: the governor flag moves to the accepting identity — the singleton pointer is
+    /// simply repointed, so the outgoing governor loses authority in the same step the incoming
+    /// one gains it. No credential is minted (FR2); the accepting identity's own existing
+    /// participant token now authorizes governor ops. (FG-5 / security-MAJOR-3, adapted for FR2)
     pub fn accept_governor_transfer(
         &mut self,
         transfer_token: &str,
         verified_bearer_identity: &str,
-    ) -> Result<GovernorToken, Error> {
+    ) -> Result<(), Error> {
         let pending = self
             .pending_transfers
             .get(transfer_token)
@@ -659,24 +598,19 @@ impl<F: Fn() -> Instant> TrustChain<F> {
         {
             return Err(Error::Forbidden);
         }
-        let from_gov = pending.from_gov_token.clone();
-        self.pending_transfers.remove(transfer_token);
-        // Revoke the initiating governor.
-        if let Some(record) = self.governors.get_mut(&from_gov) {
-            record.revoked = true;
+        // Safety check enabled by the singleton model: if the initiating identity is no longer
+        // the current governor (e.g. superseded by an admin reset + fresh claim while this
+        // transfer sat pending), the transfer is stale — do not let it resurrect a governor who
+        // has since lost the flag through another path.
+        if self.governor_identity.as_deref() != Some(pending.from_identity.as_str()) {
+            self.pending_transfers.remove(transfer_token);
+            return Err(Error::AuthFailed);
         }
-        // Mint a new governor token for the recipient.
-        let new_id = self.next_id("gov");
-        self.governors.insert(
-            new_id.clone(),
-            GovernorRecord {
-                expires: None,
-                online: true,
-                revoked: false,
-                listen_token: None,
-            },
-        );
-        Ok(GovernorToken(new_id))
+        self.pending_transfers.remove(transfer_token);
+        // Singleton repoint: this alone both revokes the outgoing governor and installs the
+        // incoming one — there is nothing else to clear (OQ1).
+        self.governor_identity = Some(verified_bearer_identity.to_string());
+        Ok(())
     }
 }
 
@@ -690,47 +624,19 @@ fn parse_counter_val(id: &str) -> u64 {
 }
 
 impl<F: Fn() -> Instant> TrustChain<F> {
-    /// Load persisted tokens and grants into the in-memory trust chain on startup.
-    /// Expired entries are skipped. Governors are loaded as offline (session state).
-    /// The counter is seeded to the max seen ID so new IDs never collide.
-    pub fn load_from_store(&mut self, tokens: Vec<PersistedToken>, grants: Vec<PersistedGrant>) {
+    /// Load persisted grants into the in-memory trust chain on startup. Expired entries are
+    /// skipped. The counter is seeded to the max seen grant ID so new IDs never collide.
+    ///
+    /// Governor state is NOT loaded here (FR2/OQ1): there is no more per-token "governor" row to
+    /// scan for — the singleton governor identity pointer is persisted and restored separately
+    /// (see `persistence::TokenStore::load_governor` / `DeliveryHub::new_with_persisted_state`).
+    /// Participant (listen) token rows are also loaded separately, by `DeliveryHub` itself.
+    pub fn load_from_store(&mut self, grants: Vec<PersistedGrant>) {
         let now_instant = (self.now)();
         let now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::ZERO)
             .as_secs();
-
-        for t in tokens {
-            let expires = match t.expires_at_secs {
-                Some(exp) if exp <= now_unix => continue, // expired
-                Some(exp) => Some(
-                    now_instant + Duration::from_secs(exp - now_unix).min(crate::types::MAX_EXPIRY),
-                ),
-                None => None,
-            };
-
-            let n = parse_counter_val(&t.token);
-            if n > self.counter {
-                self.counter = n;
-            }
-
-            // Only "governor" rows are loaded here — migration Step 5 purges legacy
-            // "agent" rows before this runs (src/persistence.rs), and "participant"
-            // (listen) rows are loaded separately by DeliveryHub.
-            if t.token_type.as_str() == "governor" {
-                // Governors have no session registration flow — they are always
-                // considered online once minted (and not revoked/expired).
-                self.governors.insert(
-                    t.token,
-                    GovernorRecord {
-                        expires,
-                        online: true,
-                        revoked: false,
-                        listen_token: None,
-                    },
-                );
-            }
-        }
 
         for g in grants {
             let expires = match g.expires_at_secs {
@@ -741,7 +647,7 @@ impl<F: Fn() -> Instant> TrustChain<F> {
                 None => None,
             };
 
-            // Counter must be seeded from governor token IDs, agent token IDs, AND grant IDs.
+            // Counter must be seeded from grant IDs so new grant-N ids never collide.
             let n = parse_counter_val(&g.id);
             if n > self.counter {
                 self.counter = n;
@@ -846,7 +752,6 @@ fn select_better_grant<'a>(a: &'a Grant, b: &'a Grant) -> &'a Grant {
 mod tests {
     use super::*;
     use crate::error::Error;
-    use crate::types::GovernorToken;
     use std::cell::Cell;
     use std::rc::Rc;
 
@@ -858,18 +763,17 @@ mod tests {
         (chain, offset)
     }
 
-    /// AC-TOK-1: install_governor creates a governor token; invalid gov token → AuthFailed.
+    /// AC-TOK-1 (adapted for FR2/OQ1): `set_governor` sets the singleton pointer on an identity;
+    /// `is_governor` recognizes that identity and rejects everyone else.
     #[test]
-    fn ac_tok_1_install_governor_and_forged_rejected() {
+    fn ac_tok_1_set_governor_and_others_rejected() {
         let (mut chain, _) = controlled_chain();
-        let gov = chain.install_governor(None);
-        assert!(chain.validate_governor_token(&gov).is_ok());
+        assert!(!chain.has_active_governor());
 
-        let forged = GovernorToken("not-a-real-gov".into());
-        assert!(matches!(
-            chain.validate_governor_token(&forged),
-            Err(Error::AuthFailed)
-        ));
+        chain.set_governor("alice");
+        assert!(chain.has_active_governor());
+        assert!(chain.is_governor("alice"));
+        assert!(!chain.is_governor("not-the-governor"));
     }
 
     /// AC-TOK-5: check_grant with no covering grant → NoGrant.
@@ -886,10 +790,10 @@ mod tests {
     #[test]
     fn ac_tok_6_temporary_grant_expires_permanent_does_not() {
         let (mut chain, offset) = controlled_chain();
-        let gov = chain.install_governor(None);
+        chain.set_governor("gov");
 
         chain
-            .approve_grant(&gov, "alice", "bob", Some(Duration::from_secs(60)))
+            .approve_grant("gov", "alice", "bob", Some(Duration::from_secs(60)))
             .unwrap();
         assert!(chain.check_grant("alice", "bob").is_ok());
 
@@ -899,50 +803,35 @@ mod tests {
             Err(Error::GrantExpired)
         ));
 
-        chain.approve_grant(&gov, "carol", "dave", None).unwrap();
+        chain.approve_grant("gov", "carol", "dave", None).unwrap();
         offset.set(Duration::from_secs(10_000));
         assert!(chain.check_grant("carol", "dave").is_ok());
     }
 
-    /// AC-TOK-7: revoking governor (via revoke_all_governors) prevents further actions;
-    /// grants it issued survive to own expiry.
+    /// AC-TOK-7 (adapted for FR2/OQ1): clearing the governor pointer (`clear_governor`, the
+    /// singleton-model equivalent of the old `revoke_all_governors`) prevents that identity from
+    /// being recognized as governor going forward; grants it already issued survive to their own
+    /// expiry (grant validity never depended on the approving governor's continued status).
     #[test]
-    fn ac_tok_7_revoke_governor_grants_survive() {
+    fn ac_tok_7_clear_governor_grants_survive() {
         let (mut chain, _) = controlled_chain();
-        let gov = chain.install_governor(None);
+        chain.set_governor("gov");
 
-        chain.approve_grant(&gov, "alice", "bob", None).unwrap();
+        chain.approve_grant("gov", "alice", "bob", None).unwrap();
 
-        chain.revoke_all_governors();
+        chain.clear_governor();
 
-        assert!(matches!(
-            chain.approve_grant(&gov, "alice", "carol", None),
-            Err(Error::AuthFailed)
-        ));
+        assert!(!chain.is_governor("gov"));
         assert!(chain.check_grant("alice", "bob").is_ok());
-    }
-
-    /// AC-SEC-2: offline governor cannot mint tokens or approve grants even before token expiry.
-    #[test]
-    fn ac_sec_2_offline_governor_rejected() {
-        let (mut chain, _) = controlled_chain();
-        let gov = chain.install_governor(None);
-
-        chain.set_governor_online(&gov, false);
-
-        assert!(matches!(
-            chain.approve_grant(&gov, "alice", "bob", None),
-            Err(Error::AuthFailed)
-        ));
     }
 
     /// Criterion 9 / OQ-G1: grant (A, B) authorizes both A→B and B→A (symmetric).
     #[test]
     fn criterion_9_grants_are_symmetric() {
         let (mut chain, _) = controlled_chain();
-        let gov = chain.install_governor(None);
+        chain.set_governor("gov");
 
-        chain.approve_grant(&gov, "alice", "bob", None).unwrap();
+        chain.approve_grant("gov", "alice", "bob", None).unwrap();
 
         assert!(chain.check_grant("alice", "bob").is_ok());
         assert!(chain.check_grant("bob", "alice").is_ok());
@@ -952,11 +841,11 @@ mod tests {
     #[test]
     fn direction_a_to_b_blocks_reverse() {
         let (mut chain, _) = controlled_chain();
-        let gov = chain.install_governor(None);
+        chain.set_governor("gov");
 
         chain
             .approve_grant_req(
-                &gov,
+                "gov",
                 "alice",
                 "bob",
                 None,
@@ -984,12 +873,12 @@ mod tests {
     #[test]
     fn fp1_grant_survives_identity_rotation() {
         let (mut chain, _) = controlled_chain();
-        let gov = chain.install_governor(None);
+        chain.set_governor("gov");
 
         // Approve a name-keyed grant: identity-based fields use the initial tokens.
         chain
             .approve_grant_req(
-                &gov,
+                "gov",
                 "token-alice-1", // identity_a (initial listen token for alice)
                 "token-bob-1",   // identity_b (initial listen token for bob)
                 None,
@@ -1073,12 +962,12 @@ mod tests {
     #[test]
     fn fp1_directed_grant_survives_identity_rotation() {
         let (mut chain, _) = controlled_chain();
-        let gov = chain.install_governor(None);
+        chain.set_governor("gov");
 
         // AToB grant: only alice→bob, not bob→alice.
         chain
             .approve_grant_req(
-                &gov,
+                "gov",
                 "token-alice-1",
                 "token-bob-1",
                 None,
