@@ -486,6 +486,18 @@ impl TokenStore {
         Ok(())
     }
 
+    /// Permanently remove an identity record (15-0040 FR4a/FR4b: self-delete / governor-delete).
+    /// Unlike everything else GC/revoke/expiry does to a name, this is the one path that DOES
+    /// remove the permanent roster entry — explicit deletion is the only way a name leaves
+    /// `identities` (see the `identities` table's own "NEVER removed by GC" invariant).
+    pub async fn delete_identity(&self, name: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM identities WHERE name = ?")
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn upsert_token(
         &self,
         token: &str,

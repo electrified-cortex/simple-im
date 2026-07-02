@@ -529,6 +529,23 @@ impl HubInner {
         }
     }
 
+    /// Removes every `denial_blocks` entry referencing the deleted participant — as the blocked
+    /// recipient (`to_name == name`) or as the blocked sender (`from_identity == name` or
+    /// `== identity`, covering both a stable-name key and a raw-token key). Used by self-delete
+    /// (FR4a) and governor-delete (FR4b) cleanup. Returns the removed `(from_identity, to_name)`
+    /// keys so the caller can also purge the persisted rows.
+    fn purge_denial_blocks_for(&mut self, name: &str, identity: &str) -> Vec<(String, String)> {
+        let mut removed = Vec::new();
+        self.denial_blocks.retain(|k, _| {
+            let matches = k.1 == name || k.0 == name || k.0 == identity;
+            if matches {
+                removed.push(k.clone());
+            }
+            !matches
+        });
+        removed
+    }
+
     /// Start an offline settle timer for `name`. Cancels any existing timer.
     /// Returns (senders, cancel_rx) if there are opted-in grant-peers; None otherwise.
     fn begin_settle_offline(
@@ -2185,10 +2202,14 @@ impl DeliveryHub {
         Ok(MediationResult::Delivered { to_name })
     }
 
-    /// Governor-deregisters a minted agent AND revokes their listen token (if any), atomically.
+    /// Governor-deregisters a participant AND revokes their listen token (if any), atomically.
+    /// FR4b (15-0040): this is a full identity deletion, not just live-routing cleanup — it also
+    /// removes the permanent `identities` entry and purges every grant and denial block
+    /// referencing the deleted name (in-memory AND persisted), mirroring self-delete (FR4a).
+    /// Previously this left the `identities` entry and name-keyed grants/blocks behind.
     /// The SSE revocation event and presence settle task are started after the lock releases.
     pub fn revoke_by_name(&self, name: &str, gov: &GovernorToken) -> Result<(), Error> {
-        let (sse_sender, settle_opt, settle_window) = {
+        let (sse_sender, settle_opt, settle_window, removed_grant_ids, removed_denial_keys) = {
             let mut inner = self.lock();
             inner.validate_governor_token(gov)?;
             // Begin settle BEFORE removing name from maps (presence push AC4 / TR4).
@@ -2205,17 +2226,31 @@ impl DeliveryHub {
                 .connection_requests
                 .retain(|_, r| r.from_name != name && r.to_name != name);
             // revoke listen token, if any
-            let sse_sender = if let Some(listen_tok) = inner.name_to_token.remove(name) {
-                if let Some(state) = inner.listen_tokens.get_mut(&listen_tok) {
+            let (sse_sender, identity) = if let Some(listen_tok) = inner.name_to_token.remove(name)
+            {
+                let sender = if let Some(state) = inner.listen_tokens.get_mut(&listen_tok) {
                     state.revoked = true;
                     state.sse_sender.take()
                 } else {
                     None
-                }
+                };
+                (sender, listen_tok)
             } else {
-                None
+                (None, String::new())
             };
-            (sse_sender, settle_opt, settle_window)
+            // FR4b: full identity deletion — remove the permanent roster entry, clear a phantom
+            // governor pointer, and purge every grant/denial-block referencing this name.
+            inner.identities.remove(name);
+            inner.trust.clear_governor_if(name);
+            let removed_grant_ids = inner.trust.purge_grants_for(name);
+            let removed_denial_keys = inner.purge_denial_blocks_for(name, &identity);
+            (
+                sse_sender,
+                settle_opt,
+                settle_window,
+                removed_grant_ids,
+                removed_denial_keys,
+            )
         }; // lock released
 
         if let Some(tx) = sse_sender {
@@ -2224,6 +2259,115 @@ impl DeliveryHub {
         // Spawn settle task for opted-in grant-peers with active SSE streams.
         if let Some((senders, cancel_rx)) = settle_opt {
             spawn_settle_task(name.to_string(), senders, settle_window, cancel_rx);
+        }
+
+        // Persist the deletion cleanup outside the lock.
+        if let Some(store) = self.token_store.clone() {
+            let name = name.to_string();
+            self.db_write(async move {
+                if let Err(e) = store.delete_identity(&name).await {
+                    eprintln!("WARNING: identity store delete failed: {e}");
+                }
+                for gid in removed_grant_ids {
+                    let _ = store.delete_grant(&gid).await;
+                }
+                for (from_identity, to_name) in removed_denial_keys {
+                    let _ = store.delete_denial_block(&from_identity, &to_name).await;
+                }
+            });
+        }
+        Ok(())
+    }
+
+    /// Self-service "delete me" (FR4a, 15-0040). A participant revokes its OWN registration
+    /// using its own token — a NEW, stronger operation than `DELETE /listen` (`cancel_listen`),
+    /// which only unbinds the name and leaves the token + identity intact. This removes the
+    /// identity from the permanent roster, invalidates the token (in-memory AND persisted — a
+    /// self-deleted token must not come back on restart, unlike governor-revoked tokens today),
+    /// and purges the participant's grants and denial blocks exactly as a governor-initiated
+    /// deletion would (FR4b) — the two share the same cleanup helpers so they can never drift.
+    ///
+    /// Valid even for a never-announced token (register-but-no-name): the token is still
+    /// invalidated, there is just no identity/grant/denial-block state to clean up.
+    ///
+    /// Errors: `TokenRejected` (unknown token), `TokenRevoked` (already revoked/deleted).
+    pub fn delete_self(&self, token: &str) -> Result<(), Error> {
+        let (sse_sender, settle_opt, settle_window, name_opt, removed_grant_ids, removed_denial_keys) = {
+            let mut inner = self.lock();
+            let st = inner.listen_tokens.get(token).ok_or(Error::TokenRejected)?;
+            if st.revoked {
+                return Err(Error::TokenRevoked);
+            }
+            let name_opt = inner.token_to_name.get(token).cloned();
+
+            let (settle_opt, removed_grant_ids, removed_denial_keys) =
+                if let Some(ref name) = name_opt {
+                    // Begin settle BEFORE removing name from maps (presence push parity with
+                    // revoke_by_name / cancel_listen).
+                    let settle_opt = inner.begin_settle_offline(name);
+                    inner.registry.force_deregister(name);
+                    inner.agents.remove(name);
+                    inner.name_to_token.remove(name);
+                    inner.active_sse_connections.remove(name);
+                    inner.message_queues.remove(name);
+                    inner.kick_pending.remove(name);
+                    inner
+                        .connection_requests
+                        .retain(|_, r| r.from_name != *name && r.to_name != *name);
+                    // FR4a: full identity deletion — same cleanup FR4b's revoke_by_name performs.
+                    inner.identities.remove(name);
+                    inner.trust.clear_governor_if(name);
+                    let removed_grant_ids = inner.trust.purge_grants_for(name);
+                    let removed_denial_keys = inner.purge_denial_blocks_for(name, token);
+                    (settle_opt, removed_grant_ids, removed_denial_keys)
+                } else {
+                    (None, Vec::new(), Vec::new())
+                };
+
+            let settle_window = inner.settle_window;
+            inner.token_to_name.remove(token);
+            let sse_sender = inner.listen_tokens.get_mut(token).and_then(|state| {
+                state.revoked = true;
+                state.sse_sender.take()
+            });
+            (
+                sse_sender,
+                settle_opt,
+                settle_window,
+                name_opt,
+                removed_grant_ids,
+                removed_denial_keys,
+            )
+        }; // lock released
+
+        if let Some(tx) = sse_sender {
+            let _ = tx.send(r#"{"type":"service","event":"revoked"}"#.to_string());
+        }
+        if let Some(ref name) = name_opt
+            && let Some((senders, cancel_rx)) = settle_opt
+        {
+            spawn_settle_task(name.clone(), senders, settle_window, cancel_rx);
+        }
+
+        // Persist the deletion outside the lock: unlike the existing (pre-15-0040) revoke
+        // functions, self-delete removes the token row too — a deleted identity must not
+        // resurrect on restart.
+        if let Some(store) = self.token_store.clone() {
+            let tok = token.to_string();
+            self.db_write(async move {
+                let _ = store.delete_token(&tok).await;
+                if let Some(name) = name_opt
+                    && let Err(e) = store.delete_identity(&name).await
+                {
+                    eprintln!("WARNING: identity store delete failed: {e}");
+                }
+                for gid in removed_grant_ids {
+                    let _ = store.delete_grant(&gid).await;
+                }
+                for (from_identity, to_name) in removed_denial_keys {
+                    let _ = store.delete_denial_block(&from_identity, &to_name).await;
+                }
+            });
         }
         Ok(())
     }
@@ -6929,6 +7073,133 @@ mod tests {
             "a minted-agent-registered name must be NAME_IN_USE via listen-with-name: {:?}",
             outcome_b
         );
+    }
+
+    // ── 15-0040 FR4: identity lifecycle — self-delete (AC-7) and governor-delete grant
+    // cleanup (AC-8). Neither `delete_self` nor the FR4b-extended `revoke_by_name` had direct
+    // unit coverage before this task; both are exercised here end to end.
+
+    /// AC-7: a participant can self-delete its own identity with its own token — afterward the
+    /// name is gone from `identities`, the token is invalid, and the participant's grants
+    /// (in-memory) are removed (a grant check for the deleted pair returns no-grant).
+    #[test]
+    fn ac7_self_delete_removes_identity_token_and_grants() {
+        let hub = make_hub(Duration::from_secs(30));
+        let gov = hub.install_governor(None);
+        let reg_a = hub.register_participant();
+        let (tok_a, _rx_a, _) = hub
+            .open_listen(Some(&reg_a), None, Some("Alice"), None, false, false)
+            .unwrap();
+        let reg_b = hub.register_participant();
+        let (tok_b, _rx_b, _) = hub
+            .open_listen(Some(&reg_b), None, Some("Bob"), None, false, false)
+            .unwrap();
+        hub.approve_grant(&gov, &tok_a, &tok_b, None).unwrap();
+        assert!(
+            hub.list_grants_for_token(&tok_a).unwrap().len() == 1,
+            "sanity: grant must exist before deletion"
+        );
+
+        hub.delete_self(&tok_a).unwrap();
+
+        assert!(
+            !hub.lock().identities.contains("Alice"),
+            "AC-7: name must be gone from identities"
+        );
+        assert!(
+            matches!(hub.validate_token(&tok_a), Err(Error::TokenRevoked)),
+            "AC-7: token must be invalid after self-delete"
+        );
+        // A grant check for the deleted pair returns no-grant.
+        assert!(
+            matches!(
+                hub.lock().trust.check_grant(&tok_a, &tok_b),
+                Err(Error::NoGrant)
+            ),
+            "AC-7: the deleted participant's grant must be gone"
+        );
+
+        // Self-delete on an already-deleted token is rejected, not silently repeated.
+        assert!(matches!(
+            hub.delete_self(&tok_a),
+            Err(Error::TokenRevoked)
+        ));
+    }
+
+    /// AC-7 (never-announced token): self-delete still invalidates a token that was registered
+    /// but never bound to a name — there is just no identity/grant state to clean up.
+    #[test]
+    fn ac7_self_delete_never_announced_token() {
+        let hub = make_hub(Duration::from_secs(30));
+        let reg = hub.register_participant();
+        assert!(hub.delete_self(&reg).is_ok());
+        assert!(matches!(
+            hub.validate_token(&reg),
+            Err(Error::TokenRevoked)
+        ));
+    }
+
+    /// AC-8: governor deletion of a participant removes the `identities` entry AND purges all
+    /// grants (in-memory + persisted) and denial blocks referencing that name — verified by a
+    /// grant check for the deleted pair returning no-grant after deletion, and by the persisted
+    /// grant/denial-block rows actually being gone after a restart.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ac8_governor_delete_purges_grants_and_denial_blocks() {
+        let db = unique_test_db();
+        let (tok_a, _tok_b) = {
+            let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
+            let gov = hub.install_governor(None);
+            let reg_a = hub.register_participant();
+            let (tok_a, _rx_a, _) = hub
+                .open_listen(Some(&reg_a), None, Some("Carol"), None, false, false)
+                .unwrap();
+            let reg_b = hub.register_participant();
+            let (tok_b, _rx_b, _) = hub
+                .open_listen(Some(&reg_b), None, Some("Dave"), None, false, false)
+                .unwrap();
+            hub.approve_grant(&gov, &tok_a, &tok_b, None).unwrap();
+            hub.block_direct(&gov, &tok_a, "Dave", "spam", None).unwrap();
+
+            hub.revoke_by_name("Carol", &gov).unwrap();
+            // Let the async persistence writes (spawned via db_write) land before the DB reopens.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            assert!(
+                !hub.lock().identities.contains("Carol"),
+                "AC-8: identities entry must be gone"
+            );
+            assert!(
+                matches!(
+                    hub.lock().trust.check_grant(&tok_a, &tok_b),
+                    Err(Error::NoGrant)
+                ),
+                "AC-8: grant for the deleted pair must be gone (in-memory)"
+            );
+            (tok_a, tok_b)
+        };
+
+        // Persisted rows must also be gone — confirmed by reloading the store into a fresh hub.
+        let store = Arc::new(TokenStore::open(&db).await.expect("reopen db"));
+        let identities = store.load_identities().await.expect("load identities");
+        assert!(
+            !identities.iter().any(|i| i.name == "Carol"),
+            "AC-8: persisted identities row must be gone after restart"
+        );
+        let grants = store.load_grants().await.expect("load grants");
+        assert!(
+            !grants
+                .iter()
+                .any(|g| g.identity_a == tok_a || g.identity_b == tok_a),
+            "AC-8: persisted grant row must be gone after restart"
+        );
+        let denial_blocks = store.load_denial_blocks().await.expect("load denial blocks");
+        assert!(
+            !denial_blocks
+                .iter()
+                .any(|b| b.from_identity == tok_a && b.to_name == "Dave"),
+            "AC-8: persisted denial_block row must be gone after restart"
+        );
+        let _ = std::fs::remove_file(&db);
     }
 
     fn read_crate_src(rel: &str) -> String {

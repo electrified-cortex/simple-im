@@ -503,6 +503,25 @@ impl<F: Fn() -> Instant> TrustChain<F> {
         self.grants.len() < before
     }
 
+    /// Removes every grant where `name` appears as `identity_a`, `identity_b`, `name_a`, or
+    /// `name_b` (15-0040 FR4a/FR4b deletion cleanup — self-delete and governor-delete must both
+    /// purge every grant referencing the removed identity, not just live routing state). Returns
+    /// the removed grant IDs so the caller can also purge the persisted rows.
+    pub fn purge_grants_for(&mut self, name: &str) -> Vec<String> {
+        let mut removed = Vec::new();
+        self.grants.retain(|g| {
+            let matches = g.identity_a == name
+                || g.identity_b == name
+                || g.name_a.as_deref() == Some(name)
+                || g.name_b.as_deref() == Some(name);
+            if matches {
+                removed.push(g.id.clone());
+            }
+            !matches
+        });
+        removed
+    }
+
     /// Returns (identity_a, identity_b, name_a, name_b) for a grant, or None if not found.
     pub fn grant_parties(
         &self,

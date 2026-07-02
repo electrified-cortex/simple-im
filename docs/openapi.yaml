@@ -169,8 +169,9 @@ paths:
       tags: [participant]
       summary: Open SSE stream
       description: |
-        Open a persistent SSE stream for real-time events. The first event
-        is a welcome. Pass a name in the body to auto-announce on connect.
+        Open a persistent SSE stream for real-time events. The first event is a welcome. Pass a
+        name in the body to become reachable in this same call — no separate /announce needed.
+        The welcome event reports name_in_use/resolution_stream if the requested name conflicts.
       operationId: listen
       security:
         - bearerAuth: []
@@ -206,7 +207,7 @@ paths:
     delete:
       tags: [participant]
       summary: Cancel listen subscription
-      description: Close SSE stream, unbind name, go offline. Token is not revoked.
+      description: Close SSE stream, unbind name, go offline. Token and identity are not deleted — re-listen to resume.
       operationId: cancelListen
       security:
         - bearerAuth: []
@@ -215,6 +216,23 @@ paths:
           description: Subscription cancelled
         "404":
           description: No active subscription
+
+  /identity:
+    delete:
+      tags: [participant]
+      summary: Self-service delete-me
+      description: |
+        Permanently delete the caller's OWN identity: removes it from the permanent roster,
+        invalidates its token, and purges its grants and denial blocks. Unlike DELETE /listen,
+        this cannot be undone by reconnecting — a fresh registration is required afterward.
+      operationId: deleteSelf
+      security:
+        - bearerAuth: []
+      responses:
+        "204":
+          description: Identity, token, grants, and denial blocks deleted
+        "401":
+          $ref: "#/components/responses/AuthFailed"
 
   /announce:
     post:

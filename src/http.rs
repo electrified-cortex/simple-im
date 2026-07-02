@@ -156,6 +156,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/register", post(handle_register))
         .route("/listen", post(handle_listen))
         .route("/listen", delete(handle_cancel_listen))
+        .route("/identity", delete(handle_delete_self))
         .route("/announce", post(handle_announce))
         .route("/skills/participant", get(handle_skill_participant))
         .route(
@@ -1214,9 +1215,10 @@ async fn handle_discovery() -> Response {
                 },
                 "participant": {
                     "POST /register": {"auth": "governor", "body": "{name?}", "hint": "Governor issues a participant token; with {name} atomically rebinds an existing identity. Open during bootstrap (no governor)."},
-                    "POST /listen": {"auth": "participant", "body": "{name?}", "hint": "Open SSE stream; optional name to auto-announce"},
-                    "DELETE /listen": {"auth": "participant", "body": null, "hint": "Close SSE stream, unbind name"},
-                    "POST /announce": {"auth": "participant", "body": "{name}", "hint": "Claim a name for this token"},
+                    "POST /listen": {"auth": "participant", "body": "{name?}", "hint": "Open SSE stream; optional name makes you reachable in this same call, no separate /announce needed"},
+                    "DELETE /listen": {"auth": "participant", "body": null, "hint": "Close SSE stream, unbind name (identity + token survive; re-listen to resume)"},
+                    "DELETE /identity": {"auth": "participant", "body": null, "hint": "Self-service: permanently delete your own identity, token, and grants — no undo"},
+                    "POST /announce": {"auth": "participant", "body": "{name}", "hint": "Claim a name for this token (optional — /listen can do this in one step instead)"},
                     "GET /participants": {"auth": "governor", "body": null, "hint": "List all announced participants"},
                     "DELETE /participants/{name}": {"auth": "governor", "body": null, "hint": "Force-revoke participant by name"},
                     "GET /participants/{name}/presence": {"auth": "participant", "body": null, "hint": "Check if participant is online"},
@@ -1548,6 +1550,25 @@ async fn handle_cancel_listen(State(state): State<Arc<AppState>>, headers: Heade
             Json(json!({"error": "NOT_FOUND", "message": "no active subscription"})),
         )
             .into_response(),
+    }
+}
+
+// ── DELETE /identity — self-service "delete me" (15-0040 FR4a) ────────────────
+//
+// A NEW, stronger operation than `DELETE /listen`: permanently removes the caller's own
+// identity, invalidates its token, and purges its grants and denial blocks. There is no
+// undo — a fresh registration is required afterward to participate again.
+//
+//   204 → deleted (identity, token, grants, and denial blocks removed)
+//   401 → no bearer, unknown token, or token already revoked/deleted
+async fn handle_delete_self(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let token = match bearer_token(&headers) {
+        Some(t) => t,
+        None => return auth_failed(),
+    };
+    match state.hub.delete_self(&token) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => err_response(e),
     }
 }
 
@@ -1894,6 +1915,7 @@ fn router_routes() -> Vec<String> {
         "POST /register".to_string(),
         "POST /listen".to_string(),
         "DELETE /listen".to_string(),
+        "DELETE /identity".to_string(),
         "POST /announce".to_string(),
         "GET /skills/participant".to_string(),
         "GET /skills/participant/listen.sh".to_string(),

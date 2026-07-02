@@ -1437,6 +1437,91 @@ async fn ac6_listen_with_name_body_conflict_reports_name_in_use() {
     drop(stream_b);
 }
 
+// ── 15-0040 FR4a: DELETE /identity — self-service delete-me ────────────────────
+
+/// AC-7 over HTTP: a participant deletes its own identity; the token is then rejected on any
+/// subsequent authenticated call, and the name becomes claimable again by a fresh registration
+/// (identity actually left the permanent roster, not just went offline).
+#[tokio::test]
+async fn ac7_delete_identity_removes_self_and_frees_name() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+
+    let tok = register_participant_tok(&server, &client).await;
+    let r = client
+        .post(server.url("/listen"))
+        .header("Authorization", format!("Bearer {}", tok))
+        .json(&json!({"name": "SelfDeleter"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let stream = r.bytes_stream();
+
+    let del = client
+        .delete(server.url("/identity"))
+        .header("Authorization", format!("Bearer {}", tok))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.status(), StatusCode::NO_CONTENT);
+
+    // The deleted token is rejected on a subsequent authenticated call.
+    let dequeue = client
+        .post(server.url("/messages/queue/pop"))
+        .header("Authorization", format!("Bearer {}", tok))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        dequeue.status(),
+        StatusCode::UNAUTHORIZED,
+        "deleted token must no longer authenticate"
+    );
+
+    // Deleting again is rejected, not silently repeated.
+    let del_again = client
+        .delete(server.url("/identity"))
+        .header("Authorization", format!("Bearer {}", tok))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del_again.status(), StatusCode::UNAUTHORIZED);
+
+    // The name actually left the roster: a fresh registration can claim it (no NAME_IN_USE).
+    let new_tok = register_participant_tok(&server, &client).await;
+    let relisten = client
+        .post(server.url("/listen"))
+        .header("Authorization", format!("Bearer {}", new_tok))
+        .json(&json!({"name": "SelfDeleter"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(relisten.status(), StatusCode::OK);
+    let mut relisten_stream = relisten.bytes_stream();
+    let mut buf = String::new();
+    let welcome_json = loop {
+        let chunk = tokio::time::timeout(Duration::from_secs(5), relisten_stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+        if let Some(line) = buf.lines().find(|l| l.starts_with("data:")) {
+            break line.trim_start_matches("data:").trim().to_string();
+        }
+    };
+    let welcome: Value = serde_json::from_str(&welcome_json).unwrap();
+    assert_eq!(
+        welcome["name_in_use"], false,
+        "the deleted name must be freely claimable again: {:?}",
+        welcome
+    );
+
+    drop(stream);
+    drop(relisten_stream);
+}
+
 // ── AC-L2: Revoked token → POST /listen returns 401 TOKEN_REVOKED ─────────────
 
 #[tokio::test]
