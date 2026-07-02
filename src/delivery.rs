@@ -121,6 +121,7 @@ pub enum ClaimOutcome {
 }
 
 /// Current state of a pending governance claim after a vote is cast.
+#[derive(Debug)]
 pub enum ClaimResolution {
     /// Not all required votes have been received yet.
     Waiting { approved: usize, required: usize },
@@ -931,9 +932,6 @@ impl DeliveryHub {
                 .filter(|t| t.token_type == "participant" || t.token_type == "listen")
                 .collect();
             inner.trust.load_from_store(persisted_grants);
-            if let Some(name) = persisted_governor {
-                inner.trust.set_governor(&name);
-            }
             // Populate the permanent identity roster (FG-7) BEFORE token restore so guards see it.
             for row in persisted_identities {
                 inner.identities.insert(row.name);
@@ -978,6 +976,25 @@ impl DeliveryHub {
                         expires_at: block.expires_at,
                     },
                 );
+            }
+            // 15-0040 revision-1: only trust the persisted governor pointer if `name` is actually
+            // among the identities just loaded (roster + any name bound by a restored listen
+            // token above) — checked last, after every source of `inner.identities` has been
+            // populated, for maximum robustness against a skewed DB. Fixes #1/#2 (delete_self /
+            // revoke_by_name now persist the pointer clear) should mean this else-branch is never
+            // hit going forward, but this is the defense-in-depth backstop against any
+            // already-dangling row (e.g. written before this patch shipped): blindly trusting it
+            // is exactly how a routine restart turned a resolved deletion into a permanent
+            // lockout (AC-12) or a name-reclaim privilege escalation.
+            if let Some(name) = persisted_governor {
+                if inner.identities.contains(&name) {
+                    inner.trust.set_governor(&name);
+                } else {
+                    eprintln!(
+                        "WARNING: persisted governor '{name}' is not among loaded identities; \
+                         dropping stale governor pointer (bootstrap re-opens)"
+                    );
+                }
             }
         }
         hub.token_store = Some(token_store);
@@ -1418,6 +1435,25 @@ impl DeliveryHub {
                 });
             }
 
+            // 15-0040 revision-1: re-verify the candidate is still a live, registered identity
+            // right before granting — `candidate_name`/`candidate_token` were captured back at
+            // claim-request time (above), and the candidate may have deleted themselves (or been
+            // governor-deleted) while this claim sat pending. Mirrors the staleness guard in
+            // `accept_governor_transfer`, which resolves identity from the verified live bearer
+            // rather than trusting stored state. Applies to both `Election` and `Transfer` kinds —
+            // in both, granting the flag to a name nobody holds anymore is the same dangling-
+            // pointer bug (lockout / name-reclaim escalation) fixed elsewhere in this revision.
+            let candidate_still_live = inner
+                .listen_tokens
+                .get(&candidate_token)
+                .map(|s| !s.revoked)
+                .unwrap_or(false)
+                && inner.token_to_name.get(&candidate_token) == Some(&candidate_name);
+            if !candidate_still_live {
+                inner.pending_claims.remove(claim_id);
+                return Err(Error::RecipientUnknown);
+            }
+
             // All approved: set the governor flag on the candidate's OWN existing identity
             // (FR2). For a transfer this single repoint both revokes the outgoing governor and
             // installs the incoming one — the singleton pointer has nothing else to clear (OQ1).
@@ -1456,7 +1492,6 @@ impl DeliveryHub {
                 .get(&candidate_name)
                 .map(|s| Arc::clone(&s.notify));
             let ntx = inner.take_notify(&candidate_name);
-            let _ = candidate_token; // used above for token resolution; captured for completeness
 
             (
                 ClaimResolution::Established {
@@ -2210,7 +2245,7 @@ impl DeliveryHub {
     /// Previously this left the `identities` entry and name-keyed grants/blocks behind.
     /// The SSE revocation event and presence settle task are started after the lock releases.
     pub fn revoke_by_name(&self, name: &str, gov: &GovernorToken) -> Result<(), Error> {
-        let (sse_sender, settle_opt, settle_window, removed_grant_ids, removed_denial_keys) = {
+        let (sse_sender, settle_opt, settle_window, removed_grant_ids, removed_denial_keys, was_gov) = {
             let mut inner = self.lock();
             inner.validate_governor_token(gov)?;
             // Begin settle BEFORE removing name from maps (presence push AC4 / TR4).
@@ -2242,6 +2277,11 @@ impl DeliveryHub {
             // FR4b: full identity deletion — remove the permanent roster entry, clear a phantom
             // governor pointer, and purge every grant/denial-block referencing this name.
             inner.identities.remove(name);
+            // 15-0040 revision-1: capture whether `name` held the governor flag BEFORE clearing it
+            // in-memory, so the DB write below can persist the pointer clear too — previously this
+            // was cleared in-memory only, leaving a dangling `governor` row that `restart` would
+            // blindly reinstall (lockout / name-reclaim escalation).
+            let was_gov = inner.trust.is_governor(name);
             inner.trust.clear_governor_if(name);
             let removed_grant_ids = inner.trust.purge_grants_for(name);
             let removed_denial_keys = inner.purge_denial_blocks_for(name, &identity);
@@ -2251,6 +2291,7 @@ impl DeliveryHub {
                 settle_window,
                 removed_grant_ids,
                 removed_denial_keys,
+                was_gov,
             )
         }; // lock released
 
@@ -2268,6 +2309,13 @@ impl DeliveryHub {
             self.db_write(async move {
                 if let Err(e) = store.delete_identity(&name).await {
                     eprintln!("WARNING: identity store delete failed: {e}");
+                }
+                // 15-0040 revision-1: persist the governor-pointer clear too, or a restart
+                // resurrects a phantom governor pointing at the just-deleted name.
+                if was_gov
+                    && let Err(e) = store.clear_governor().await
+                {
+                    eprintln!("WARNING: token store write failed: {e}");
                 }
                 for gid in removed_grant_ids {
                     let _ = store.delete_grant(&gid).await;
@@ -2293,7 +2341,15 @@ impl DeliveryHub {
     ///
     /// Errors: `TokenRejected` (unknown token), `TokenRevoked` (already revoked/deleted).
     pub fn delete_self(&self, token: &str) -> Result<(), Error> {
-        let (sse_sender, settle_opt, settle_window, name_opt, removed_grant_ids, removed_denial_keys) = {
+        let (
+            sse_sender,
+            settle_opt,
+            settle_window,
+            name_opt,
+            removed_grant_ids,
+            removed_denial_keys,
+            was_gov,
+        ) = {
             let mut inner = self.lock();
             let st = inner.listen_tokens.get(token).ok_or(Error::TokenRejected)?;
             if st.revoked {
@@ -2301,7 +2357,7 @@ impl DeliveryHub {
             }
             let name_opt = inner.token_to_name.get(token).cloned();
 
-            let (settle_opt, removed_grant_ids, removed_denial_keys) =
+            let (settle_opt, removed_grant_ids, removed_denial_keys, was_gov) =
                 if let Some(ref name) = name_opt {
                     // Begin settle BEFORE removing name from maps (presence push parity with
                     // revoke_by_name / cancel_listen).
@@ -2317,12 +2373,17 @@ impl DeliveryHub {
                         .retain(|_, r| r.from_name != *name && r.to_name != *name);
                     // FR4a: full identity deletion — same cleanup FR4b's revoke_by_name performs.
                     inner.identities.remove(name);
+                    // 15-0040 revision-1: capture whether `name` held the governor flag BEFORE
+                    // clearing it in-memory (see revoke_by_name for the full rationale).
+                    let was_gov = inner.trust.is_governor(name);
                     inner.trust.clear_governor_if(name);
                     let removed_grant_ids = inner.trust.purge_grants_for(name);
                     let removed_denial_keys = inner.purge_denial_blocks_for(name, token);
-                    (settle_opt, removed_grant_ids, removed_denial_keys)
+                    (settle_opt, removed_grant_ids, removed_denial_keys, was_gov)
                 } else {
-                    (None, Vec::new(), Vec::new())
+                    // A never-announced token has no name, so it can never have held the governor
+                    // flag (the flag is only ever set on an announced identity).
+                    (None, Vec::new(), Vec::new(), false)
                 };
 
             let settle_window = inner.settle_window;
@@ -2338,6 +2399,7 @@ impl DeliveryHub {
                 name_opt,
                 removed_grant_ids,
                 removed_denial_keys,
+                was_gov,
             )
         }; // lock released
 
@@ -2361,6 +2423,13 @@ impl DeliveryHub {
                     && let Err(e) = store.delete_identity(&name).await
                 {
                     eprintln!("WARNING: identity store delete failed: {e}");
+                }
+                // 15-0040 revision-1: persist the governor-pointer clear too, or a restart
+                // resurrects a phantom governor pointing at the just-deleted name.
+                if was_gov
+                    && let Err(e) = store.clear_governor().await
+                {
+                    eprintln!("WARNING: token store write failed: {e}");
                 }
                 for gid in removed_grant_ids {
                     let _ = store.delete_grant(&gid).await;
@@ -7405,6 +7474,182 @@ mod tests {
                 .any(|b| b.from_identity == tok_a && b.to_name == "Dave"),
             "AC-8: persisted denial_block row must be gone after restart"
         );
+        let _ = std::fs::remove_file(&db);
+    }
+
+    // ── 15-0040 revision-1 (foreman review, assignment 09): governor-pointer persistence ───────
+    //
+    // Root cause: deleting the governor's own identity (self-delete or governor-delete) cleared
+    // the governor pointer in-memory only — the DB-write blocks never called
+    // `store.clear_governor()`. A restart then blindly reinstalled the stale persisted pointer,
+    // producing either a permanent lockout (AC-12's exact failure mode) or a name-reclaim
+    // privilege escalation. `respond_claim` had the same root cause via a different path: it never
+    // re-verified a pending claim's candidate was still live before granting. These four tests
+    // cover, respectively: self-delete's DB-write fix, revoke_by_name's DB-write fix,
+    // respond_claim's candidate-liveness guard, and new_with_persisted_state's defense-in-depth
+    // guard against an already-dangling row.
+
+    /// Revision-1: self-delete on the governor's own identity must persist the governor-pointer
+    /// clear, not just clear it in-memory — verified by reloading from the same DB (a simulated
+    /// restart) and confirming no phantom governor is reinstalled, plus a no-escalation check that
+    /// reclaiming the freed name does not inherit governor status.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revision1_self_delete_governor_pointer_cleared_on_reload() {
+        let db = unique_test_db();
+        let gov_name = {
+            let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
+            let gov = hub.install_governor(None);
+            let gov_name = hub
+                .lock()
+                .token_to_name
+                .get(&gov.0)
+                .cloned()
+                .expect("installed governor must have a bound name");
+
+            hub.delete_self(&gov.0).unwrap();
+            // Let the async persistence writes (spawned via db_write) land before the DB reopens.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            assert!(
+                !hub.has_active_governor(),
+                "revision-1: governor flag must be cleared in-memory immediately after self-delete"
+            );
+            gov_name
+        };
+
+        // The real bug only showed up past a restart: reload from the same DB (this exercises
+        // `new_with_persisted_state` end to end) and confirm no phantom governor comes back.
+        let hub2 = make_persisted_hub(&db, Duration::from_secs(30)).await;
+        assert!(
+            !hub2.has_active_governor(),
+            "revision-1: a self-deleted governor must not resurrect as a phantom governor on restart"
+        );
+
+        // Privilege-escalation check: the freed name must not silently confer governor status
+        // when reclaimed by a brand-new participant.
+        let reg = hub2.register_participant();
+        hub2.open_listen(Some(&reg), None, Some(gov_name.as_str()), None, false, false)
+            .unwrap();
+        assert!(
+            !hub2.lock().trust.is_governor(&gov_name),
+            "revision-1: reclaiming the freed governor name must not inherit governor status"
+        );
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// Revision-1: same bug, the other reachable call site — a governor revoking their OWN name
+    /// via `revoke_by_name` (`DELETE /participants/{own-name}`) must also persist the
+    /// governor-pointer clear, independent of `delete_self`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revision1_revoke_by_name_self_governor_pointer_cleared_on_reload() {
+        let db = unique_test_db();
+        let gov_name = {
+            let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
+            let gov = hub.install_governor(None);
+            let gov_name = hub
+                .lock()
+                .token_to_name
+                .get(&gov.0)
+                .cloned()
+                .expect("installed governor must have a bound name");
+
+            hub.revoke_by_name(&gov_name, &gov).unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            assert!(
+                !hub.has_active_governor(),
+                "revision-1: governor flag must be cleared in-memory immediately after governor-delete"
+            );
+            gov_name
+        };
+
+        let hub2 = make_persisted_hub(&db, Duration::from_secs(30)).await;
+        assert!(
+            !hub2.has_active_governor(),
+            "revision-1: a governor-deleted governor must not resurrect as a phantom governor on restart"
+        );
+
+        // Parity with the self-delete test: the same no-escalation check on the freed name.
+        let reg = hub2.register_participant();
+        hub2.open_listen(Some(&reg), None, Some(gov_name.as_str()), None, false, false)
+            .unwrap();
+        assert!(
+            !hub2.lock().trust.is_governor(&gov_name),
+            "revision-1: reclaiming the freed governor name must not inherit governor status"
+        );
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// Revision-1: `respond_claim` must re-verify a Transfer claim's candidate is still live right
+    /// before granting — a candidate who deletes themselves while their transfer claim is pending
+    /// must be rejected, not silently installed as governor (which would also silently depose the
+    /// real governor).
+    #[test]
+    fn revision1_respond_claim_rejects_deleted_transfer_candidate() {
+        let hub = make_hub(Duration::from_secs(30));
+        let gov = hub.install_governor(None);
+        let gov_name = hub
+            .lock()
+            .token_to_name
+            .get(&gov.0)
+            .cloned()
+            .expect("installed governor must have a bound name");
+
+        let reg_b = hub.register_participant();
+        let (tok_b, _rx_b, _) = hub
+            .open_listen(Some(&reg_b), None, Some("Bob"), None, false, false)
+            .unwrap();
+
+        // A governor already exists, so Bob's claim takes the Transfer path.
+        let outcome = hub.claim_governorship(&tok_b, None).unwrap();
+        let claim_id = match outcome {
+            ClaimOutcome::Transfer { claim_id } => claim_id,
+            other => panic!("expected Transfer outcome, got {other:?}"),
+        };
+
+        // Bob deletes himself while the transfer claim is still pending approval.
+        hub.delete_self(&tok_b).unwrap();
+
+        // A approves the now-stale claim.
+        let result = hub.respond_claim(&gov.0, &claim_id, true);
+        assert!(
+            matches!(result, Err(Error::RecipientUnknown)),
+            "revision-1: approving a claim for a deleted candidate must be rejected, got {result:?}"
+        );
+
+        // The real governor must not have been silently deposed, and the deleted candidate must
+        // not have received the flag.
+        assert!(
+            hub.lock().trust.is_governor(&gov_name),
+            "revision-1: the original governor must still hold the flag"
+        );
+        assert!(
+            !hub.lock().trust.is_governor("Bob"),
+            "revision-1: the deleted candidate must not receive the governor flag"
+        );
+    }
+
+    /// Revision-1: `new_with_persisted_state`'s defense-in-depth guard — a persisted `governor`
+    /// row pointing at a name that is NOT among the loaded identities (simulating an
+    /// already-dangling row from before this patch shipped, independent of the delete-path fixes)
+    /// must be dropped on load, not blindly installed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revision1_stale_persisted_governor_dropped_on_reload() {
+        let db = unique_test_db();
+        let store = TokenStore::open(&db).await.expect("open db");
+
+        // "Ghost" was never a registered identity — a dangling row by construction.
+        store.set_governor("Ghost").await.unwrap();
+
+        let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
+        assert!(
+            !hub.has_active_governor(),
+            "revision-1: a stale persisted governor pointer to a non-existent identity must be \
+             dropped on load, not installed"
+        );
+
         let _ = std::fs::remove_file(&db);
     }
 

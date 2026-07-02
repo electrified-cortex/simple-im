@@ -7,9 +7,12 @@ info:
     optional governor trust layer, and real-time push over SSE.
 
     **Authentication**: Most endpoints require `Authorization: Bearer <token>`.
-    Token types: `participant` (issued by the governor via POST /register) and
-    `governor` (from POST /governors/claim or /admin/governor/reset). A one-time
-    governor `transfer_token` is carried in the POST /governors/accept-transfer body.
+    There is exactly one credential type: a participant token (issued via POST
+    /register). Governorship is a privilege flag on a participant's own identity —
+    set via POST /governors/claim (auto-grant, election, or transfer), transfer
+    acceptance, or cleared via POST /admin/governor/reset — never a second,
+    distinct token. A one-time governor `transfer_token` is carried in the
+    POST /governors/accept-transfer body.
 
     **Errors**: All errors return `{"error":"CODE","message":"..."}` with an
     appropriate HTTP status code. Gate on status code, not body content.
@@ -833,13 +836,16 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [status, governor_token]
+                required: [status, governor]
                 properties:
                   status:
                     type: string
                     enum: [granted]
-                  governor_token:
+                  governor:
                     type: string
+                    description: >-
+                      The claimant's own identity name. No credential is minted — governorship
+                      is a privilege flag on the claimant's existing participant token.
         "202":
           description: Election or transfer pending
           content:
@@ -912,28 +918,10 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/AuthFailed"
-
-  /governors/refresh:
-    post:
-      tags: [governor]
-      summary: Refresh governor token
-      description: Rotate the governor token
-      operationId: refreshGovernorToken
-      security:
-        - bearerAuth: []
-      responses:
-        "200":
-          description: New token
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [token]
-                properties:
-                  token:
-                    type: string
-        "401":
-          $ref: "#/components/responses/AuthFailed"
+        "404":
+          description: >-
+            The candidate deleted their own identity (or was governor-deleted) while this claim
+            was pending approval; the claim is discarded rather than granted to a stale candidate
 
   /governors/transfer:
     post:
@@ -1389,11 +1377,13 @@ components:
       type: http
       scheme: bearer
       description: |
-        Token types vary by endpoint:
-        - `participant`: participant operations (issued by the governor via POST /register)
-        - `governor`: governor operations (POST /governors/claim or /admin/governor/reset)
-        - governor transfer acceptance uses a participant bearer; the one-time transfer token
-          travels in the request body, not the Authorization header
+        There is exactly one credential type: a participant token (issued via POST /register).
+        Governorship is a privilege flag on a participant's own identity (set via
+        POST /governors/claim, transfer/election, or cleared via POST /admin/governor/reset) —
+        it is never a second, distinct token. Governor-gated endpoints simply require the bearer
+        to be the identity currently holding the flag. Governor transfer acceptance also uses a
+        participant bearer; the one-time transfer token travels in the request body, not the
+        Authorization header.
 
   responses:
     AuthFailed:
