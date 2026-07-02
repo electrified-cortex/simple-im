@@ -747,6 +747,19 @@ impl TokenStore {
         self.migrate().await
     }
 
+    /// Test seam (15-0040 S6): clears the one-time `reset_15_0040` marker so a subsequent
+    /// `migrate_for_test()` call re-triggers the destructive full-reset step over whatever state
+    /// currently exists. `TokenStore::open` always runs the reset once (harmlessly, on an empty
+    /// DB) before a test can get a handle at all — this lets a test seed state first and then
+    /// exercise the SAME wipe logic a real first-time upgrade runs, without needing a literal
+    /// pre-15-0040 database file.
+    pub async fn clear_reset_marker_for_test(&self) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM reset_15_0040 WHERE id = 0")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Insert a raw token row (including the legacy `name` column) to simulate a pre-migration DB.
     /// `TokenStore::open` already ran `migrate()` once by the time a test gets a `store` handle,
     /// which (15-0031) drops the retired `name` column whenever it finds one present — so this

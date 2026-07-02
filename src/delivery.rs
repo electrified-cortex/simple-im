@@ -109,6 +109,7 @@ struct GovernanceClaim {
 }
 
 /// Immediate result of calling `claim_governorship`.
+#[derive(Debug)]
 pub enum ClaimOutcome {
     /// Governorship was awarded immediately (no competition). `identity` is the claimant's own
     /// participant identity name — FR2: no credential is minted, so there is no token to return.
@@ -6493,6 +6494,156 @@ mod tests {
         store.migrate_for_test().await.expect("migrate 2");
         store.migrate_for_test().await.expect("migrate 3");
         let _ = std::fs::remove_file(&db);
+    }
+
+    // ── 15-0040 S6: operator-authorized full reset ─────────────────────────────
+
+    /// AC-11: the full reset wipes governor/identity/token/grant/denial-block state. Seeded via
+    /// the normal write API, then the one-time marker is cleared (test seam) and migrate() is
+    /// re-run — exercising the exact same wipe logic a real first-time upgrade runs, without
+    /// needing a literal pre-15-0040 database file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ac11_full_reset_wipes_all_pre_reset_state() {
+        let db = unique_test_db();
+        let store = TokenStore::open(&db).await.expect("open");
+
+        store.set_governor("old-governor").await.unwrap();
+        store.upsert_identity("Alice").await.unwrap();
+        store
+            .upsert_token("tok-alice", "Alice", "participant", None)
+            .await
+            .unwrap();
+        store
+            .upsert_grant(
+                "grant-1",
+                "tok-alice",
+                "tok-bob",
+                "symmetric",
+                "bypass",
+                None,
+                0,
+                None,
+                true,
+                None,
+                "old-governor",
+                Some("Alice"),
+                Some("Bob"),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_denial_block("tok-alice", "Bob", "spam", None)
+            .await
+            .unwrap();
+
+        // Simulate "the reset hasn't run yet" and re-trigger it over the seeded state.
+        store.clear_reset_marker_for_test().await.unwrap();
+        store.migrate_for_test().await.expect("re-migrate");
+
+        assert!(
+            store.load_governor().await.unwrap().is_none(),
+            "AC-11: governor must be wiped"
+        );
+        assert!(
+            store.load_identities().await.unwrap().is_empty(),
+            "AC-11: identities must be wiped"
+        );
+        assert!(
+            store.load_tokens().await.unwrap().is_empty(),
+            "AC-11: tokens must be wiped"
+        );
+        assert!(
+            store.load_grants().await.unwrap().is_empty(),
+            "AC-11: grants must be wiped"
+        );
+        assert!(
+            store.load_denial_blocks().await.unwrap().is_empty(),
+            "AC-11: denial_blocks must be wiped"
+        );
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// AC-13: re-running the reset/migration path against an ALREADY-reset DB is a no-op — it
+    /// must not error, and it must not wipe fresh state legitimately added after the reset ran
+    /// (e.g. BT's fresh governor claim and Alice's fresh registration) — the failure mode this
+    /// is easiest to get subtly wrong.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ac13_reset_is_idempotent_does_not_double_wipe_fresh_state() {
+        let db = unique_test_db();
+        // Reset #1 runs here, harmlessly, against an empty DB.
+        let store = TokenStore::open(&db).await.expect("open");
+
+        // Fresh, legitimate post-reset state.
+        store.set_governor("BT").await.unwrap();
+        store.upsert_identity("Alice").await.unwrap();
+        store
+            .upsert_token("tok-alice", "Alice", "participant", None)
+            .await
+            .unwrap();
+
+        // Every server restart re-runs migrate(); this must be a no-op against fresh state.
+        store.migrate_for_test().await.expect("re-migrate must not error");
+
+        assert_eq!(
+            store.load_governor().await.unwrap().as_deref(),
+            Some("BT"),
+            "AC-13: fresh governor must survive a second migrate() run"
+        );
+        assert!(
+            store
+                .load_identities()
+                .await
+                .unwrap()
+                .iter()
+                .any(|i| i.name == "Alice"),
+            "AC-13: fresh identity must survive"
+        );
+        assert!(
+            store
+                .load_tokens()
+                .await
+                .unwrap()
+                .iter()
+                .any(|t| t.token == "tok-alice"),
+            "AC-13: fresh token must survive"
+        );
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// AC-12: after the reset, a fresh claim (auto-grant path: no other live agents) establishes
+    /// exactly one governor identity, and governor-gated ops work via THAT identity's own
+    /// existing token — no state where a governor "exists" but no live credential can act as it.
+    #[test]
+    fn ac12_governor_reestablished_after_reset_via_fresh_claim() {
+        let hub = make_hub(Duration::from_secs(30));
+        assert!(!hub.has_active_governor(), "post-reset: no governor exists");
+
+        // BT registers and claims governorship fresh.
+        let reg = hub.register_participant();
+        let (listen_tok, _rx, _) = hub
+            .open_listen(Some(&reg), None, Some("BT"), None, false, false)
+            .unwrap();
+        let outcome = hub.claim_governorship(&listen_tok, None).unwrap();
+        match outcome {
+            ClaimOutcome::Granted { identity } => assert_eq!(identity, "BT"),
+            other => panic!("expected auto-grant, got {:?}", other),
+        }
+        assert!(hub.has_active_governor());
+
+        // Governor-gated ops work via BT's OWN existing token — no separate credential appeared.
+        let gov = GovernorToken(listen_tok.clone());
+        assert!(hub.validate_governor_token(&gov).is_ok());
+        let other_reg = hub.register_participant();
+        let (other_tok, _rx2, _) = hub
+            .open_listen(Some(&other_reg), None, Some("Ops"), None, false, false)
+            .unwrap();
+        assert!(
+            hub.approve_grant(&gov, &listen_tok, &other_tok, None)
+                .is_ok(),
+            "governor-gated approve_grant must work via BT's existing participant token"
+        );
     }
 
     /// S1-AC-3: a listen-type token with a name backfills the identities table on migration.
