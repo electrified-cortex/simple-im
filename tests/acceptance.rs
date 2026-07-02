@@ -5394,8 +5394,7 @@ async fn ac10_discovery_participants_auth_hint_is_not_governor_only() {
     let r = server.client().get(server.url("/")).send().await.unwrap();
     let body: Value = r.json().await.unwrap();
     assert_ne!(
-        body["routes"]["participant"]["GET /participants"]["auth"],
-        "governor",
+        body["routes"]["participant"]["GET /participants"]["auth"], "governor",
         "GET /participants must no longer be advertised as governor-only: {:?}",
         body["routes"]["participant"]["GET /participants"]
     );

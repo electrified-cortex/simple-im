@@ -1549,11 +1549,7 @@ impl DeliveryHub {
         let (req, gov_identity) = {
             let inner = self.lock();
             inner.validate_governor_token(gov)?;
-            let gov_identity = inner
-                .token_to_name
-                .get(&gov.0)
-                .cloned()
-                .unwrap_or_default();
+            let gov_identity = inner.token_to_name.get(&gov.0).cloned().unwrap_or_default();
             let mut r = req;
             if r.name_a.is_none() {
                 r.name_a = inner.token_to_name.get(id_a).cloned();
@@ -2245,7 +2241,14 @@ impl DeliveryHub {
     /// Previously this left the `identities` entry and name-keyed grants/blocks behind.
     /// The SSE revocation event and presence settle task are started after the lock releases.
     pub fn revoke_by_name(&self, name: &str, gov: &GovernorToken) -> Result<(), Error> {
-        let (sse_sender, settle_opt, settle_window, removed_grant_ids, removed_denial_keys, was_gov) = {
+        let (
+            sse_sender,
+            settle_opt,
+            settle_window,
+            removed_grant_ids,
+            removed_denial_keys,
+            was_gov,
+        ) = {
             let mut inner = self.lock();
             inner.validate_governor_token(gov)?;
             // Begin settle BEFORE removing name from maps (presence push AC4 / TR4).
@@ -2312,9 +2315,7 @@ impl DeliveryHub {
                 }
                 // 15-0040 revision-1: persist the governor-pointer clear too, or a restart
                 // resurrects a phantom governor pointing at the just-deleted name.
-                if was_gov
-                    && let Err(e) = store.clear_governor().await
-                {
+                if was_gov && let Err(e) = store.clear_governor().await {
                     eprintln!("WARNING: token store write failed: {e}");
                 }
                 for gid in removed_grant_ids {
@@ -2426,9 +2427,7 @@ impl DeliveryHub {
                 }
                 // 15-0040 revision-1: persist the governor-pointer clear too, or a restart
                 // resurrects a phantom governor pointing at the just-deleted name.
-                if was_gov
-                    && let Err(e) = store.clear_governor().await
-                {
+                if was_gov && let Err(e) = store.clear_governor().await {
                     eprintln!("WARNING: token store write failed: {e}");
                 }
                 for gid in removed_grant_ids {
@@ -2514,7 +2513,12 @@ impl DeliveryHub {
     /// who is asking.
     pub fn list_participants(&self, token: &str) -> Result<Vec<ParticipantInfo>, Error> {
         let inner = self.lock();
-        if inner.listen_tokens.get(token).map(|s| s.revoked).unwrap_or(true) {
+        if inner
+            .listen_tokens
+            .get(token)
+            .map(|s| s.revoked)
+            .unwrap_or(true)
+        {
             return Err(Error::AuthFailed);
         }
         let mut result: Vec<ParticipantInfo> = inner
@@ -2575,7 +2579,11 @@ impl DeliveryHub {
     /// Errors: `AuthFailed` (bearer is not a named participant), `RecipientUnknown` (transfer
     /// token not found or already consumed → 404), `Forbidden` (transfer's to_identity is set
     /// and does not match the bearer's name → 403).
-    pub fn accept_governor_transfer(&self, bearer: &str, transfer_token: &str) -> Result<(), Error> {
+    pub fn accept_governor_transfer(
+        &self,
+        bearer: &str,
+        transfer_token: &str,
+    ) -> Result<(), Error> {
         let mut inner = self.lock();
         // Resolve the claiming identity from the verified participant bearer.
         let is_live_participant = inner
@@ -3568,7 +3576,14 @@ impl DeliveryHub {
         observed_host: Option<String>,
         force: bool,
         presence_push: bool,
-    ) -> Result<(String, mpsc::UnboundedReceiver<String>, Option<AnnounceResult>), Error> {
+    ) -> Result<
+        (
+            String,
+            mpsc::UnboundedReceiver<String>,
+            Option<AnnounceResult>,
+        ),
+        Error,
+    > {
         // Token is required.
         let provided_token = token_opt.ok_or(Error::AuthFailed)?;
         let _observed_host_str = observed_host.unwrap_or_default();
@@ -6185,7 +6200,11 @@ mod tests {
         test_bind(&hub, "bob", &tok_b, PresenceScope::GrantScoped).unwrap();
 
         let agents = hub.list_participants(&gov.0).unwrap();
-        assert_eq!(agents.len(), 3, "alice, bob, and the governor's own identity");
+        assert_eq!(
+            agents.len(),
+            3,
+            "alice, bob, and the governor's own identity"
+        );
 
         // Listen-flow identity == token (unlike the deleted minted-agent path).
         let alice = agents.iter().find(|a| a.name == "alice").unwrap();
@@ -6652,7 +6671,10 @@ mod tests {
             .unwrap();
 
         // Every server restart re-runs migrate(); this must be a no-op against fresh state.
-        store.migrate_for_test().await.expect("re-migrate must not error");
+        store
+            .migrate_for_test()
+            .await
+            .expect("re-migrate must not error");
 
         assert_eq!(
             store.load_governor().await.unwrap().as_deref(),
@@ -6748,10 +6770,7 @@ mod tests {
             "AC-3: B's existing token must authorize governor ops after accepting the transfer"
         );
         assert!(
-            matches!(
-                hub.validate_governor_token(&gov_a),
-                Err(Error::Forbidden)
-            ),
+            matches!(hub.validate_governor_token(&gov_a), Err(Error::Forbidden)),
             "AC-3: A must no longer authorize governor ops after transferring away"
         );
     }
@@ -7395,10 +7414,7 @@ mod tests {
         );
 
         // Self-delete on an already-deleted token is rejected, not silently repeated.
-        assert!(matches!(
-            hub.delete_self(&tok_a),
-            Err(Error::TokenRevoked)
-        ));
+        assert!(matches!(hub.delete_self(&tok_a), Err(Error::TokenRevoked)));
     }
 
     /// AC-7 (never-announced token): self-delete still invalidates a token that was registered
@@ -7408,10 +7424,7 @@ mod tests {
         let hub = make_hub(Duration::from_secs(30));
         let reg = hub.register_participant();
         assert!(hub.delete_self(&reg).is_ok());
-        assert!(matches!(
-            hub.validate_token(&reg),
-            Err(Error::TokenRevoked)
-        ));
+        assert!(matches!(hub.validate_token(&reg), Err(Error::TokenRevoked)));
     }
 
     /// AC-8: governor deletion of a participant removes the `identities` entry AND purges all
@@ -7433,7 +7446,8 @@ mod tests {
                 .open_listen(Some(&reg_b), None, Some("Dave"), None, false, false)
                 .unwrap();
             hub.approve_grant(&gov, &tok_a, &tok_b, None).unwrap();
-            hub.block_direct(&gov, &tok_a, "Dave", "spam", None).unwrap();
+            hub.block_direct(&gov, &tok_a, "Dave", "spam", None)
+                .unwrap();
 
             hub.revoke_by_name("Carol", &gov).unwrap();
             // Let the async persistence writes (spawned via db_write) land before the DB reopens.
@@ -7467,7 +7481,10 @@ mod tests {
                 .any(|g| g.identity_a == tok_a || g.identity_b == tok_a),
             "AC-8: persisted grant row must be gone after restart"
         );
-        let denial_blocks = store.load_denial_blocks().await.expect("load denial blocks");
+        let denial_blocks = store
+            .load_denial_blocks()
+            .await
+            .expect("load denial blocks");
         assert!(
             !denial_blocks
                 .iter()
@@ -7528,8 +7545,15 @@ mod tests {
         // Privilege-escalation check: the freed name must not silently confer governor status
         // when reclaimed by a brand-new participant.
         let reg = hub2.register_participant();
-        hub2.open_listen(Some(&reg), None, Some(gov_name.as_str()), None, false, false)
-            .unwrap();
+        hub2.open_listen(
+            Some(&reg),
+            None,
+            Some(gov_name.as_str()),
+            None,
+            false,
+            false,
+        )
+        .unwrap();
         assert!(
             !hub2.lock().trust.is_governor(&gov_name),
             "revision-1: reclaiming the freed governor name must not inherit governor status"
@@ -7572,8 +7596,15 @@ mod tests {
 
         // Parity with the self-delete test: the same no-escalation check on the freed name.
         let reg = hub2.register_participant();
-        hub2.open_listen(Some(&reg), None, Some(gov_name.as_str()), None, false, false)
-            .unwrap();
+        hub2.open_listen(
+            Some(&reg),
+            None,
+            Some(gov_name.as_str()),
+            None,
+            false,
+            false,
+        )
+        .unwrap();
         assert!(
             !hub2.lock().trust.is_governor(&gov_name),
             "revision-1: reclaiming the freed governor name must not inherit governor status"
