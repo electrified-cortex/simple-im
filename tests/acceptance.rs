@@ -1283,6 +1283,160 @@ async fn ac_s3_send_by_token_routes_to_recipient() {
     drop(stream);
 }
 
+// ── 15-0040 FR3 / AC-5, AC-6: collapsed listen+announce over HTTP ──────────────
+
+/// AC-5: a single `POST /listen` call with `{"name": ...}` in the body makes the participant
+/// reachable — `send()` succeeds with NO separate `/announce` round-trip. The welcome SSE event
+/// also reports `name_in_use: false` and the bound `name` directly, so the client learns the
+/// bind succeeded without a second request.
+#[tokio::test]
+async fn ac5_listen_with_name_body_no_announce_needed() {
+    let (server, gov) = TestServer::spawn_with_governor().await;
+    let client = server.client();
+
+    // Receiver: POST /listen with {"name": ...} — single step, no /announce.
+    let recv_tok = register_participant_tok(&server, &client).await;
+    let r = client
+        .post(server.url("/listen"))
+        .header("Authorization", format!("Bearer {}", recv_tok))
+        .json(&json!({"name": "Fr3Receiver"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK, "POST /listen failed");
+    let mut recv_stream = r.bytes_stream();
+    let mut buf = String::new();
+    let welcome_json = loop {
+        let chunk = tokio::time::timeout(Duration::from_secs(5), recv_stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+        if let Some(line) = buf.lines().find(|l| l.starts_with("data:")) {
+            break line.trim_start_matches("data:").trim().to_string();
+        }
+    };
+    let welcome: Value = serde_json::from_str(&welcome_json).unwrap();
+    assert_eq!(welcome["event"], "welcome");
+    assert_eq!(
+        welcome["name"], "Fr3Receiver",
+        "welcome must report the name bound inline at listen time: {:?}",
+        welcome
+    );
+    assert_eq!(
+        welcome["name_in_use"], false,
+        "welcome must confirm the bind succeeded, no follow-up /announce needed: {:?}",
+        welcome
+    );
+
+    // Sender: same single-step listen-with-name.
+    let sender_tok = register_participant_tok(&server, &client).await;
+    let sr = client
+        .post(server.url("/listen"))
+        .header("Authorization", format!("Bearer {}", sender_tok))
+        .json(&json!({"name": "Fr3Sender"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sr.status(), StatusCode::OK);
+    let sender_stream = sr.bytes_stream();
+
+    // Governor approves the grant — no /announce call was ever made by either party.
+    let approve = client
+        .post(server.url("/grants/approve"))
+        .header("Authorization", format!("Bearer {}", gov))
+        .json(&json!({"identity_a": sender_tok, "identity_b": recv_tok}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(approve.status(), StatusCode::OK, "grant approve failed");
+
+    let send = client
+        .post(server.url("/messages/send"))
+        .header("Authorization", format!("Bearer {}", sender_tok))
+        .json(&json!({"to": "Fr3Receiver", "payload": "no-announce-needed"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        send.status(),
+        StatusCode::ACCEPTED,
+        "send must succeed after listen-with-name alone, with no /announce ever called"
+    );
+
+    let pop = client
+        .post(server.url("/messages/queue/pop"))
+        .header("Authorization", format!("Bearer {}", recv_tok))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = pop.json().await.unwrap();
+    assert_eq!(body["message"]["payload"], "no-announce-needed");
+
+    drop(recv_stream);
+    drop(sender_stream);
+}
+
+/// AC-6 over HTTP: a name already live-bound via listen-with-name cannot be taken by a
+/// different token's listen-with-name call either — the welcome event reports
+/// `name_in_use: true` with a `resolution_stream`, and the subscription still opens (the TOKEN
+/// is valid) but the NAME is not reassigned.
+#[tokio::test]
+async fn ac6_listen_with_name_body_conflict_reports_name_in_use() {
+    let server = TestServer::spawn().await;
+    let client = server.client();
+
+    let tok_a = register_participant_tok(&server, &client).await;
+    let ra = client
+        .post(server.url("/listen"))
+        .header("Authorization", format!("Bearer {}", tok_a))
+        .json(&json!({"name": "Fr3Contested"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ra.status(), StatusCode::OK);
+    let stream_a = ra.bytes_stream();
+
+    let tok_b = register_participant_tok(&server, &client).await;
+    let rb = client
+        .post(server.url("/listen"))
+        .header("Authorization", format!("Bearer {}", tok_b))
+        .json(&json!({"name": "Fr3Contested"}))
+        .send()
+        .await
+        .unwrap();
+    // The subscription itself still opens — only the name claim is rejected.
+    assert_eq!(rb.status(), StatusCode::OK);
+    let mut stream_b = rb.bytes_stream();
+    let mut buf = String::new();
+    let welcome_json = loop {
+        let chunk = tokio::time::timeout(Duration::from_secs(5), stream_b.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+        if let Some(line) = buf.lines().find(|l| l.starts_with("data:")) {
+            break line.trim_start_matches("data:").trim().to_string();
+        }
+    };
+    let welcome: Value = serde_json::from_str(&welcome_json).unwrap();
+    assert_eq!(
+        welcome["name_in_use"], true,
+        "second token's listen-with-name must report the conflict: {:?}",
+        welcome
+    );
+    assert!(
+        welcome["resolution_stream"].is_string(),
+        "conflict welcome must include a resolution_stream: {:?}",
+        welcome
+    );
+
+    drop(stream_a);
+    drop(stream_b);
+}
+
 // ── AC-L2: Revoked token → POST /listen returns 401 TOKEN_REVOKED ─────────────
 
 #[tokio::test]
@@ -3103,7 +3257,7 @@ async fn ac_pp1_announce_sends_online_to_grant_peer_sse() {
     // Agent A: open listen stream (observer).
     let tok_a = hub.register_participant();
 
-    let (_, mut rx_a) = hub
+    let (_, mut rx_a, _) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
     hub.announce(&tok_a, "PpA").unwrap();
@@ -3111,7 +3265,7 @@ async fn ac_pp1_announce_sends_online_to_grant_peer_sse() {
     // Agent B: open listen stream but do NOT announce yet.
     let tok_b = hub.register_participant();
 
-    let (_, _rx_b) = hub
+    let (_, _rx_b, _) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
 
@@ -3157,14 +3311,14 @@ async fn ac_pp2_cancel_listen_sends_offline_to_grant_peer_sse() {
 
     let tok_a = hub.register_participant();
 
-    let (_, mut rx_a) = hub
+    let (_, mut rx_a, _) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
     hub.announce(&tok_a, "PpA2").unwrap();
 
     let tok_b = hub.register_participant();
 
-    let (_, _rx_b) = hub
+    let (_, _rx_b, _) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
     hub.announce(&tok_b, "PpB2").unwrap();
@@ -3210,14 +3364,14 @@ async fn ac_pp3_sse_drop_sends_offline_to_grant_peer_sse() {
 
     let tok_a = hub.register_participant();
 
-    let (_, mut rx_a) = hub
+    let (_, mut rx_a, _) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
     hub.announce(&tok_a, "PpA3").unwrap();
 
     let tok_b = hub.register_participant();
 
-    let (_, _rx_b) = hub
+    let (_, _rx_b, _) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
     hub.announce(&tok_b, "PpB3").unwrap();
@@ -3265,14 +3419,14 @@ async fn ac_pp4_no_grant_no_presence_event_to_non_peer() {
     // A and B have a grant (A is the observer with active SSE).
     let tok_a = hub.register_participant();
 
-    let (_, mut rx_a) = hub
+    let (_, mut rx_a, _) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
     hub.announce(&tok_a, "PpA4").unwrap();
 
     let tok_b = hub.register_participant();
 
-    let (_, _rx_b) = hub
+    let (_, _rx_b, _) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
     hub.announce(&tok_b, "PpB4").unwrap();
@@ -3293,7 +3447,7 @@ async fn ac_pp4_no_grant_no_presence_event_to_non_peer() {
     // C has NO grant with A.
     let tok_c = hub.register_participant();
 
-    let (_, _rx_c) = hub
+    let (_, _rx_c, _) = hub
         .open_listen(Some(&tok_c), None, None, None, false, false)
         .unwrap();
 
@@ -3336,7 +3490,7 @@ async fn ac_pp5_governor_revoke_sends_offline_to_listen_peer() {
     // Alice: listen-flow agent (observer — will receive presence events).
     let tok_a = hub.register_participant();
 
-    let (_, mut rx_a) = hub
+    let (_, mut rx_a, _) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
     hub.announce(&tok_a, "PpA5").unwrap();
@@ -3381,7 +3535,7 @@ async fn ac_pp6_live_holder_not_evicted_no_offline() {
     // Agent A: the observer — has an active SSE stream and a grant with B.
     let tok_a = hub.register_participant();
 
-    let (_, mut rx_a) = hub
+    let (_, mut rx_a, _) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
     hub.announce(&tok_a, "PpA6").unwrap();
@@ -3389,7 +3543,7 @@ async fn ac_pp6_live_holder_not_evicted_no_offline() {
     // Agent B: announces "PpB6" with a live SSE stream.
     let tok_b = hub.register_participant();
 
-    let (_, _rx_b) = hub
+    let (_, _rx_b, _) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
     hub.announce(&tok_b, "PpB6").unwrap();
@@ -3414,7 +3568,7 @@ async fn ac_pp6_live_holder_not_evicted_no_offline() {
     // Agent C attempts to claim B's live name — force is gone, so this is NAME_IN_USE.
     let tok_c = hub.register_participant();
 
-    let (_, _rx_c) = hub
+    let (_, _rx_c, _) = hub
         .open_listen(Some(&tok_c), None, None, None, false, false)
         .unwrap();
     assert!(
@@ -3451,7 +3605,7 @@ async fn ac_pp6b_stale_holder_cross_token_not_evicted() {
     // Agent A: the observer.
     let tok_a = hub.register_participant();
 
-    let (_, mut _rx_a) = hub
+    let (_, mut _rx_a, _) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
     hub.announce(&tok_a, "PpA6b").unwrap();
@@ -3459,7 +3613,7 @@ async fn ac_pp6b_stale_holder_cross_token_not_evicted() {
     // Agent B: announces "PpB6b" then its SSE drops without cancel_listen.
     let tok_b = hub.register_participant();
 
-    let (_, _rx_b) = hub
+    let (_, _rx_b, _) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
     hub.announce(&tok_b, "PpB6b").unwrap();
@@ -3484,7 +3638,7 @@ async fn ac_pp6b_stale_holder_cross_token_not_evicted() {
     // Agent C attempts to reclaim B's stale name — BLOCKER-4 blocks cross-token eviction.
     let tok_c = hub.register_participant();
 
-    let (_, _rx_c) = hub
+    let (_, _rx_c, _) = hub
         .open_listen(Some(&tok_c), None, None, None, false, false)
         .unwrap();
     assert!(
@@ -3511,14 +3665,14 @@ async fn ac_pp_default_listener_no_events() {
 
     // A: open with presence_push=false (default, opt-out).
     let tok_a = hub.register_participant();
-    let (_, mut rx_a) = hub
+    let (_, mut rx_a, _) = hub
         .open_listen(Some(&tok_a), None, None, None, false, false)
         .unwrap();
     hub.announce(&tok_a, "PpOptA").unwrap();
 
     // B: open and announce.
     let tok_b = hub.register_participant();
-    let (_, _rx_b) = hub
+    let (_, _rx_b, _) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
     hub.announce(&tok_b, "PpOptB").unwrap();
@@ -3541,7 +3695,7 @@ async fn ac_pp_default_listener_no_events() {
     // B goes offline then comes back online.
     hub.cancel_listen(&tok_b).unwrap();
     let tok_b2 = hub.register_participant();
-    let (_, _rx_b2) = hub
+    let (_, _rx_b2, _) = hub
         .open_listen(Some(&tok_b2), None, None, None, false, false)
         .unwrap();
     hub.announce(&tok_b2, "PpOptB").unwrap();
@@ -3568,13 +3722,13 @@ async fn ac_pp_timer_cancellation() {
     // 50 ms settle window (set by make_presence_hub).
 
     let tok_a = hub.register_participant();
-    let (_, mut rx_a) = hub
+    let (_, mut rx_a, _) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
     hub.announce(&tok_a, "PpTcA").unwrap();
 
     let tok_b = hub.register_participant();
-    let (_, _rx_b) = hub
+    let (_, _rx_b, _) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
     hub.announce(&tok_b, "PpTcB").unwrap();
@@ -3603,7 +3757,7 @@ async fn ac_pp_timer_cancellation() {
 
     // B reconnects with the SAME token and re-announces — this cancels the settle timer.
     // Re-announce is idempotent (flap-free, FR4): no spurious online event is emitted.
-    let (_, _rx_b2) = hub
+    let (_, _rx_b2, _) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
     hub.announce(&tok_b, "PpTcB").unwrap();
@@ -3632,13 +3786,13 @@ async fn ac_pp_flap_collapse() {
     let (hub, gov) = make_presence_hub();
 
     let tok_a = hub.register_participant();
-    let (_, mut rx_a) = hub
+    let (_, mut rx_a, _) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
     hub.announce(&tok_a, "PpFlA").unwrap();
 
     let tok_b = hub.register_participant();
-    let (_, _rx_b) = hub
+    let (_, _rx_b, _) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
     hub.announce(&tok_b, "PpFlB").unwrap();
@@ -3664,7 +3818,7 @@ async fn ac_pp_flap_collapse() {
     for _ in 0u32..3 {
         hub.close_listen(&tok_b);
         // Reconnect immediately — well within the 50 ms window — with the same token.
-        let (_, _rx_bx) = hub
+        let (_, _rx_bx, _) = hub
             .open_listen(Some(&tok_b), None, None, None, false, false)
             .unwrap();
         hub.announce(&tok_b, "PpFlB").unwrap();
@@ -3712,13 +3866,13 @@ async fn ac_pp_pull_during_settle() {
     let (hub, gov) = make_presence_hub();
 
     let tok_a = hub.register_participant();
-    let (_, _rx_a) = hub
+    let (_, _rx_a, _) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
     hub.announce(&tok_a, "PpPsA").unwrap();
 
     let tok_b = hub.register_participant();
-    let (_, _rx_b) = hub
+    let (_, _rx_b, _) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
     hub.announce(&tok_b, "PpPsB").unwrap();
@@ -3759,13 +3913,13 @@ async fn ac_pp_opt_in_not_persisted() {
 
     let tok_a = hub.register_participant();
     // First session: opt-in.
-    let (_, _rx_a1) = hub
+    let (_, _rx_a1, _) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
     hub.announce(&tok_a, "PpNpA").unwrap();
 
     let tok_b = hub.register_participant();
-    let (_, _rx_b) = hub
+    let (_, _rx_b, _) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
     hub.announce(&tok_b, "PpNpB").unwrap();
@@ -3787,7 +3941,7 @@ async fn ac_pp_opt_in_not_persisted() {
     hub.close_listen(&tok_a);
 
     // Re-open A's listen WITHOUT presence_push (opt-out for the new session).
-    let (_, mut rx_a2) = hub
+    let (_, mut rx_a2, _) = hub
         .open_listen(Some(&tok_a), None, None, None, false, false)
         .unwrap();
 
@@ -3796,7 +3950,7 @@ async fn ac_pp_opt_in_not_persisted() {
     // B goes offline and comes back — both events should NOT reach A.
     hub.cancel_listen(&tok_b).unwrap();
     let tok_b2 = hub.register_participant();
-    let (_, _rx_b2) = hub
+    let (_, _rx_b2, _) = hub
         .open_listen(Some(&tok_b2), None, None, None, false, false)
         .unwrap();
     hub.announce(&tok_b2, "PpNpB").unwrap();
@@ -3825,13 +3979,13 @@ async fn ac_ppv1_permissive_grant_sees_presence() {
     let (hub, gov) = make_presence_hub();
 
     let tok_a = hub.register_participant();
-    let (_, mut rx_a) = hub
+    let (_, mut rx_a, _) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
     hub.announce(&tok_a, "PpA7a").unwrap();
 
     let tok_b = hub.register_participant();
-    let (_, _rx_b) = hub
+    let (_, _rx_b, _) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
 
@@ -3886,13 +4040,13 @@ async fn ac_ppv2_no_grant_no_room_returns_recipient_unknown() {
     let (hub, _gov) = make_presence_hub();
 
     let tok_a = hub.register_participant();
-    let (_, mut rx_a) = hub
+    let (_, mut rx_a, _) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
     hub.announce(&tok_a, "PpA7b").unwrap();
 
     let tok_b = hub.register_participant();
-    let (_, _rx_b) = hub
+    let (_, _rx_b, _) = hub
         .open_listen(Some(&tok_b), None, None, None, false, false)
         .unwrap();
     // No grant, no shared room.
@@ -3922,7 +4076,7 @@ async fn ac_ppv3_shared_room_no_grant_sees_presence() {
     let (hub, _gov) = make_presence_hub();
 
     let tok_a = hub.register_participant();
-    let (_, mut rx_a) = hub
+    let (_, mut rx_a, _) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
     hub.announce(&tok_a, "PpA7c").unwrap();
@@ -3973,7 +4127,7 @@ async fn ac_ppv4_deny_grant_returns_recipient_unknown_even_in_room() {
     let (hub, gov) = make_presence_hub();
 
     let tok_a = hub.register_participant();
-    let (_, mut rx_a) = hub
+    let (_, mut rx_a, _) = hub
         .open_listen(Some(&tok_a), None, None, None, false, true)
         .unwrap();
     hub.announce(&tok_a, "PpA7d").unwrap();
@@ -4029,7 +4183,7 @@ async fn ac_startup_announce_first_sub_only() {
     // AC1: first subscriber gets sim_online
     let _tok1 = hub.register_participant();
 
-    let (_, mut rx1) = hub
+    let (_, mut rx1, _) = hub
         .open_listen(Some(&_tok1), None, None, None, false, false)
         .unwrap();
     let mut events1 = vec![];
@@ -4049,7 +4203,7 @@ async fn ac_startup_announce_first_sub_only() {
     // AC2: second subscriber does NOT get sim_online
     let _tok2 = hub.register_participant();
 
-    let (_, mut rx2) = hub
+    let (_, mut rx2, _) = hub
         .open_listen(Some(&_tok2), None, None, None, false, false)
         .unwrap();
     let mut events2 = vec![];

@@ -170,6 +170,7 @@ pub enum MediationResult {
 // ── Listen token model ────────────────────────────────────────────────────────
 
 /// Result of a name announcement attempt on a listen token.
+#[derive(Debug)]
 pub enum AnnounceResult {
     /// The name was successfully bound to this token.
     Bound,
@@ -1090,7 +1091,7 @@ impl DeliveryHub {
             let mut inner = self.lock();
             inner.trust.set_governor(&name);
         }
-        let (listen_tok, _rx) = self
+        let (listen_tok, _rx, _) = self
             .open_listen(Some(&reg), None, Some(&name), None, false, false)
             .expect("a token minted by register_participant() is always accepted by open_listen()");
         if let Some(store) = self.token_store.clone() {
@@ -3327,8 +3328,17 @@ impl DeliveryHub {
     /// `force`: if true and an active SSE exists for this token, supersede it.
     ///          if false and an active SSE exists, return `ActiveSubscription` error.
     ///
-    /// `name_to_bind`: if Some, attempt to bind that name at listen time (combined listen+announce).
-    /// Welcome event always includes `name_in_use`, `holder_identity`, `resolution_token` fields.
+    /// `name_to_bind`: if Some, attempt to bind that name at listen time — this is the FR3
+    /// collapsed listen+announce path: a single successful call makes the participant reachable,
+    /// no separate `/announce` required. Returns `Ok((token, rx, outcome))` where `outcome` is
+    /// `None` if no name was requested, or `Some(AnnounceResult)` mirroring exactly what a
+    /// separate `announce()` call would have returned for that name — including the SAME
+    /// NAME_IN_USE guards (cross-token, orphaned-identity, minted-agent-conflict; 15-0029
+    /// BLOCKER-3/4). The subscription itself still opens (the token is valid) even when the
+    /// requested name could not be bound; the welcome SSE event also always reports
+    /// `name_in_use`/`resolution_stream` so a client that requested a name learns immediately
+    /// whether the bind actually happened, without needing a separate `/announce` round-trip to
+    /// find out.
     pub fn open_listen(
         &self,
         token_opt: Option<&str>,
@@ -3337,11 +3347,19 @@ impl DeliveryHub {
         observed_host: Option<String>,
         force: bool,
         presence_push: bool,
-    ) -> Result<(String, mpsc::UnboundedReceiver<String>), Error> {
+    ) -> Result<(String, mpsc::UnboundedReceiver<String>, Option<AnnounceResult>), Error> {
         // Token is required.
         let provided_token = token_opt.ok_or(Error::AuthFailed)?;
         let _observed_host_str = observed_host.unwrap_or_default();
-        let (token, rx, bound_name_for_persist, gc_offline_events, settle_window) = {
+        let (
+            token,
+            rx,
+            name_bind_outcome,
+            bound_name_for_persist,
+            presence_online_senders,
+            gc_offline_events,
+            settle_window,
+        ) = {
             let mut inner = self.lock();
             let gc_offline_events = inner.gc_tokens();
             let settle_window = inner.settle_window;
@@ -3474,26 +3492,43 @@ impl DeliveryHub {
             // `listen_tokens` (never a distinct credential), so `token == provided_token`
             // unconditionally here. There is nothing left to link.
 
-            // Fix 2: attempt inline name binding if requested.
-            let (_name_in_use, _holder_identity, bound_name_for_persist) =
+            // FR3: attempt inline name binding if requested — this IS the collapsed
+            // listen+announce path. Preserves the exact same guards `announce()` enforces
+            // (15-0029 BLOCKER-3/4): collapsing the step must not collapse the checks.
+            let (name_bind_outcome, bound_name_for_persist, presence_online_senders) =
                 if let Some(name) = name_to_bind {
                     if inner.name_to_token.get(name).map(|t| t.as_str()) == Some(token.as_str()) {
                         // Already bound to this token — idempotent.
                         // Cancel any pending settle task (participant reconnected).
                         inner.cancel_settle_online(name);
-                        (false, None::<String>, None::<String>)
+                        (Some(AnnounceResult::Bound), None, Vec::new())
                     } else if inner.name_to_token.contains_key(name) {
                         // BLOCKER-4: held by a DIFFERENT token (the same-token case returned
                         // above). Whether the holder's SSE is live or stale, no cross-token
                         // eviction occurs — force-reclaim is removed (FG-1). NAME_IN_USE.
-                        (true, Some(name.to_string()), None)
+                        let resolution_stream = format!("/sessions/{}/events", name);
+                        (
+                            Some(AnnounceResult::NameInUse { resolution_stream }),
+                            None,
+                            Vec::new(),
+                        )
                     } else if inner.registry.is_online(name) {
                         // A minted agent holds this name.
-                        (true, Some(name.to_string()), None)
+                        let resolution_stream = format!("/sessions/{}/events", name);
+                        (
+                            Some(AnnounceResult::NameInUse { resolution_stream }),
+                            None,
+                            Vec::new(),
+                        )
                     } else if inner.identities.contains(name) {
                         // BLOCKER-3: registered identity with no active binding (orphaned) —
                         // governor rebind is the only reclaim path. NAME_IN_USE.
-                        (true, Some(name.to_string()), None)
+                        let resolution_stream = format!("/sessions/{}/events", name);
+                        (
+                            Some(AnnounceResult::NameInUse { resolution_stream }),
+                            None,
+                            Vec::new(),
+                        )
                     } else {
                         inner.bind_name(&token, name);
                         // Cancel any pending settle task (name is being freshly bound).
@@ -3507,23 +3542,37 @@ impl DeliveryHub {
                         if inner.trust.is_governor(name) {
                             maybe_enqueue_governor_breadcrumb(&mut inner, name);
                         }
-                        (false, None, Some(name.to_string()))
+                        // Presence push (AC1/TR1 parity with announce()): collect opted-in
+                        // grant-peer senders now, under the lock; fired after release below.
+                        let senders = inner.grant_peer_presence_senders(name);
+                        (Some(AnnounceResult::Bound), Some(name.to_string()), senders)
                     }
                 } else {
-                    (false, None, None)
+                    (None, None, Vec::new())
                 };
 
             // Emit service/welcome — the agent's entry point. Participants already know their
             // token (from POST /register) so we do not echo it back.
             // AC8: subscription_id is included for unambiguous subscription identity.
+            // FR3: when a name was requested at listen time, name_in_use / resolution_stream
+            // report whether the bind actually took — no separate /announce round-trip needed
+            // to find out.
             {
                 let name_opt = inner.listen_tokens.get(&token).and_then(|s| s.name.clone());
+                let (name_in_use, resolution_stream) = match &name_bind_outcome {
+                    Some(AnnounceResult::NameInUse { resolution_stream }) => {
+                        (true, Some(resolution_stream.clone()))
+                    }
+                    _ => (false, None),
+                };
                 let welcome = serde_json::json!({
                     "type": "service",
                     "event": "welcome",
                     "subscription_id": &token,
                     "name": name_opt,
-                    "instructions": "Call POST /announce to register your name. You will receive notify events when messages arrive — call POST /messages/dequeue to retrieve them.",
+                    "name_in_use": name_in_use,
+                    "resolution_stream": resolution_stream,
+                    "instructions": "Pass {\"name\": \"...\"} in the POST /listen body to become reachable in this same call — no separate /announce needed. /announce still works if you'd rather bind the name afterward. You will receive notify events when messages arrive — call POST /messages/dequeue to retrieve them.",
                 })
                 .to_string();
                 let _ = tx.send(welcome);
@@ -3594,7 +3643,9 @@ impl DeliveryHub {
             (
                 token,
                 rx,
+                name_bind_outcome,
                 bound_name_for_persist,
+                presence_online_senders,
                 gc_offline_events,
                 settle_window,
             )
@@ -3603,6 +3654,12 @@ impl DeliveryHub {
         // Spawn settle tasks for Branch-3 GC evictions after the lock is released. (15-0002H)
         for (name, senders, cancel_rx) in gc_offline_events {
             spawn_settle_task(name, senders, settle_window, cancel_rx);
+        }
+
+        // Fire presence "online" event to opted-in grant-peers on a fresh inline bind — parity
+        // with what a separate announce() call would have done (FR3).
+        if let Some(ref name) = bound_name_for_persist {
+            push_presence_event(presence_online_senders, name, "online");
         }
 
         // Persist the newly bound name outside the lock (mirrors announce pattern).
@@ -3622,7 +3679,7 @@ impl DeliveryHub {
             });
         }
 
-        Ok((token, rx))
+        Ok((token, rx, name_bind_outcome))
     }
 
     /// Signal that a listen SSE stream has closed (client disconnected).
@@ -5565,7 +5622,7 @@ mod tests {
 
         // Bob is a listen-flow client — register first, then open_listen.
         let bob_token = hub.register_participant();
-        let (bob_token, rx1) = hub
+        let (bob_token, rx1, _) = hub
             .open_listen(Some(&bob_token), None, Some("bob"), None, false, false)
             .unwrap();
         // Alice is a regular agent with a Notify grant to Bob.
@@ -5593,7 +5650,7 @@ mod tests {
 
         // Simulate reconnect: open_listen with the same token (force=true to supersede).
         // SIM-1 fix: open_listen must reset notify_suppressed and emit a catch-up NOTIFY.
-        let (returned_token, mut rx2) = hub
+        let (returned_token, mut rx2, _) = hub
             .open_listen(Some(&bob_token), None, None, None, true, false)
             .unwrap();
         assert_eq!(
@@ -6493,7 +6550,7 @@ mod tests {
         let db = unique_test_db();
         let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
         let reg = hub.register_participant();
-        let (tok, _rx) = hub
+        let (tok, _rx, _) = hub
             .open_listen(Some(&reg), None, None, None, false, false)
             .unwrap();
         hub.announce(&tok, "Alice").unwrap();
@@ -6571,7 +6628,7 @@ mod tests {
         let tok = {
             let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
             let reg = hub.register_participant();
-            let (tok, _rx) = hub
+            let (tok, _rx, _) = hub
                 .open_listen(Some(&reg), None, None, None, false, false)
                 .unwrap();
             hub.announce(&tok, "Alice").unwrap();
@@ -6611,13 +6668,13 @@ mod tests {
     fn test_announce_live_holder_not_evicted() {
         let hub = DeliveryHub::new(Duration::from_secs(30));
         let reg_a = hub.register_participant();
-        let (tok_a, _rx_a) = hub
+        let (tok_a, _rx_a, _) = hub
             .open_listen(Some(&reg_a), None, None, None, false, false)
             .unwrap();
         hub.announce(&tok_a, "Alice").unwrap();
 
         let reg_b = hub.register_participant();
-        let (tok_b, _rx_b) = hub
+        let (tok_b, _rx_b, _) = hub
             .open_listen(Some(&reg_b), None, None, None, false, false)
             .unwrap();
         assert!(
@@ -6643,12 +6700,12 @@ mod tests {
     fn test_announce_force_body_ignored_returns_409() {
         let hub = DeliveryHub::new(Duration::from_secs(30));
         let reg_a = hub.register_participant();
-        let (tok_a, _rx_a) = hub
+        let (tok_a, _rx_a, _) = hub
             .open_listen(Some(&reg_a), None, None, None, false, false)
             .unwrap();
         hub.announce(&tok_a, "Alice").unwrap();
         let reg_b = hub.register_participant();
-        let (tok_b, _rx_b) = hub
+        let (tok_b, _rx_b, _) = hub
             .open_listen(Some(&reg_b), None, None, None, false, false)
             .unwrap();
         // The HTTP layer ignores any `force` field; the hub method has no force parameter at all.
@@ -6667,7 +6724,7 @@ mod tests {
     fn test_orphaned_name_returns_name_in_use() {
         let hub = DeliveryHub::new(Duration::from_secs(30));
         let reg_a = hub.register_participant();
-        let (tok_a, _rx_a) = hub
+        let (tok_a, _rx_a, _) = hub
             .open_listen(Some(&reg_a), None, None, None, false, false)
             .unwrap();
         hub.announce(&tok_a, "Alice").unwrap();
@@ -6682,7 +6739,7 @@ mod tests {
             assert!(inner.identities.contains("Alice"));
         }
         let reg_b = hub.register_participant();
-        let (tok_b, _rx_b) = hub
+        let (tok_b, _rx_b, _) = hub
             .open_listen(Some(&reg_b), None, None, None, false, false)
             .unwrap();
         assert!(
@@ -6699,7 +6756,7 @@ mod tests {
     fn test_stale_cross_token_eviction_blocked() {
         let hub = DeliveryHub::new(Duration::from_secs(30));
         let reg_a = hub.register_participant();
-        let (tok_a, rx_a) = hub
+        let (tok_a, rx_a, _) = hub
             .open_listen(Some(&reg_a), None, None, None, false, false)
             .unwrap();
         hub.announce(&tok_a, "Alice").unwrap();
@@ -6708,7 +6765,7 @@ mod tests {
         hub.close_listen(&tok_a);
 
         let reg_b = hub.register_participant();
-        let (tok_b, _rx_b) = hub
+        let (tok_b, _rx_b, _) = hub
             .open_listen(Some(&reg_b), None, None, None, false, false)
             .unwrap();
         assert!(
@@ -6730,7 +6787,7 @@ mod tests {
     fn test_same_token_stale_reconnect_succeeds() {
         let hub = DeliveryHub::new(Duration::from_secs(30));
         let reg_a = hub.register_participant();
-        let (tok_a, rx_a) = hub
+        let (tok_a, rx_a, _) = hub
             .open_listen(Some(&reg_a), None, None, None, false, false)
             .unwrap();
         hub.announce(&tok_a, "Alice").unwrap();
@@ -6739,6 +6796,138 @@ mod tests {
         assert!(
             matches!(hub.announce(&tok_a, "Alice"), Ok(AnnounceResult::Bound)),
             "same-token stale reconnect must succeed"
+        );
+    }
+
+    // ── 15-0040 FR3: collapsed listen+announce — the SAME guards, exercised via the
+    // single-step `open_listen(name_to_bind)` path instead of a separate `announce()` call.
+    // Per the S2 assignment: "don't just trust the old announce-path tests still pass if
+    // announce is now a no-op" — these construct each conflict THROUGH the collapsed path.
+
+    /// AC-5: a single `POST /listen`-equivalent call (open_listen with a name) makes the
+    /// participant reachable — `send()` succeeds with no separate `/announce` call at all.
+    #[test]
+    fn ac5_listen_with_name_makes_reachable_without_announce() {
+        let hub = make_hub(Duration::from_secs(30));
+        let gov = hub.install_governor(None);
+        let reg_a = hub.register_participant();
+        let (tok_a, _rx_a, outcome) = hub
+            .open_listen(Some(&reg_a), None, Some("alice"), None, false, false)
+            .unwrap();
+        assert!(
+            matches!(outcome, Some(AnnounceResult::Bound)),
+            "listen-with-name must report Bound, not require a follow-up announce"
+        );
+        let reg_b = hub.register_participant();
+        let (tok_b, _rx_b, _) = hub
+            .open_listen(Some(&reg_b), None, Some("bob"), None, false, false)
+            .unwrap();
+        hub.approve_grant(&gov, &tok_a, &tok_b, None).unwrap();
+
+        // Bob → Alice with NO announce() call for either party — must succeed.
+        let result = hub.send(
+            &ParticipantToken(tok_b.clone()),
+            "alice",
+            Payload(b"hi".to_vec()),
+            None,
+            None,
+        );
+        assert!(
+            matches!(result, Ok(Ack::Accepted)),
+            "send must succeed after listen-with-name alone, got {:?}",
+            result
+        );
+    }
+
+    /// AC-6 (cross-token NAME_IN_USE via the collapsed path): a different token cannot take a
+    /// name already live-bound to another token, whether the original bind happened via
+    /// `announce()` or via `open_listen`'s inline bind.
+    #[test]
+    fn ac6_listen_with_name_cross_token_name_in_use() {
+        let hub = DeliveryHub::new(Duration::from_secs(30));
+        let reg_a = hub.register_participant();
+        let (tok_a, _rx_a, outcome_a) = hub
+            .open_listen(Some(&reg_a), None, Some("Alice"), None, false, false)
+            .unwrap();
+        assert!(matches!(outcome_a, Some(AnnounceResult::Bound)));
+
+        let reg_b = hub.register_participant();
+        let (_tok_b, _rx_b, outcome_b) = hub
+            .open_listen(Some(&reg_b), None, Some("Alice"), None, false, false)
+            .unwrap();
+        assert!(
+            matches!(outcome_b, Some(AnnounceResult::NameInUse { .. })),
+            "a different token must not steal a live-bound name via listen-with-name: {:?}",
+            outcome_b
+        );
+        assert_eq!(
+            hub.validate_token(&tok_a).unwrap().as_deref(),
+            Some("Alice"),
+            "original holder A must be unaffected"
+        );
+        assert_eq!(
+            hub.lock().name_to_token.get("Alice").map(String::as_str),
+            Some(tok_a.as_str())
+        );
+    }
+
+    /// AC-6 (orphaned-registered-identity NAME_IN_USE via the collapsed path): a name that
+    /// exists in `identities` but has no live binding still cannot be silently reclaimed by a
+    /// different token through listen-with-name — governor rebind remains the only reclaim path.
+    #[test]
+    fn ac6_listen_with_name_orphaned_identity_name_in_use() {
+        let hub = DeliveryHub::new(Duration::from_secs(30));
+        let reg_a = hub.register_participant();
+        let (tok_a, _rx_a, _) = hub
+            .open_listen(Some(&reg_a), None, Some("Alice"), None, false, false)
+            .unwrap();
+        // Simulate revoke + GC: clear A's live binding and token, KEEP the identity record.
+        {
+            let mut inner = hub.lock();
+            inner.name_to_token.remove("Alice");
+            inner.token_to_name.remove(&tok_a);
+            inner.agents.remove("Alice");
+            inner.listen_tokens.remove(&tok_a);
+            inner.sse_connections.remove(&tok_a);
+            assert!(inner.identities.contains("Alice"));
+        }
+        let reg_b = hub.register_participant();
+        let (_tok_b, _rx_b, outcome_b) = hub
+            .open_listen(Some(&reg_b), None, Some("Alice"), None, false, false)
+            .unwrap();
+        assert!(
+            matches!(outcome_b, Some(AnnounceResult::NameInUse { .. })),
+            "orphaned registered name must be NAME_IN_USE via listen-with-name too: {:?}",
+            outcome_b
+        );
+    }
+
+    /// AC-6 (minted-agent-conflict via the collapsed path): a name held by a non-listen-flow
+    /// registry entry (the legacy defense-in-depth branch predating the listen-flow-only model)
+    /// is NAME_IN_USE, not silently reassigned, through listen-with-name exactly as it is through
+    /// `announce()`.
+    #[test]
+    fn ac6_listen_with_name_minted_agent_conflict() {
+        let hub = DeliveryHub::new(Duration::from_secs(30));
+        // Simulate a minted-agent-style registry entry with no listen-flow binding at all.
+        {
+            let mut inner = hub.lock();
+            let _ = inner.registry.register(
+                "Alice",
+                ParticipantIdentity::valid("id-alice"),
+                PresenceScope::Public,
+            );
+            assert!(inner.registry.is_online("Alice"));
+            assert!(!inner.name_to_token.contains_key("Alice"));
+        }
+        let reg_b = hub.register_participant();
+        let (_tok_b, _rx_b, outcome_b) = hub
+            .open_listen(Some(&reg_b), None, Some("Alice"), None, false, false)
+            .unwrap();
+        assert!(
+            matches!(outcome_b, Some(AnnounceResult::NameInUse { .. })),
+            "a minted-agent-registered name must be NAME_IN_USE via listen-with-name: {:?}",
+            outcome_b
         );
     }
 
@@ -6820,7 +7009,7 @@ mod tests {
         let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
         let gov = hub.install_governor(None);
         let reg = hub.register_participant();
-        let (t1, _rx) = hub
+        let (t1, _rx, _) = hub
             .open_listen(Some(&reg), None, None, None, false, false)
             .unwrap();
         hub.announce(&t1, "Alice").unwrap();
@@ -6848,12 +7037,12 @@ mod tests {
         let gov = hub.install_governor(None);
 
         let reg_a = hub.register_participant();
-        let (t1, _ra) = hub
+        let (t1, _ra, _) = hub
             .open_listen(Some(&reg_a), None, None, None, false, false)
             .unwrap();
         hub.announce(&t1, "Alice").unwrap();
         let reg_b = hub.register_participant();
-        let (tb, _rb) = hub
+        let (tb, _rb, _) = hub
             .open_listen(Some(&reg_b), None, None, None, false, false)
             .unwrap();
         hub.announce(&tb, "Bob").unwrap();
@@ -6889,7 +7078,7 @@ mod tests {
         let hub = DeliveryHub::new(Duration::from_secs(30));
         let gov = hub.install_governor(None);
         let reg = hub.register_participant();
-        let (t1, _rx) = hub
+        let (t1, _rx, _) = hub
             .open_listen(Some(&reg), None, None, None, false, false)
             .unwrap();
         hub.announce(&t1, "Alice").unwrap();
@@ -7034,7 +7223,7 @@ mod tests {
 
         let hub = build_hub_from_store(Arc::new(store), Duration::from_secs(30)).await;
         // The previously-valid participant token still works.
-        let (tok, _rx) = hub
+        let (tok, _rx, _) = hub
             .open_listen(Some("141414141"), None, None, None, false, false)
             .unwrap();
         assert_eq!(tok, "141414141");
@@ -7056,7 +7245,7 @@ mod tests {
             let db = unique_test_db();
             let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
             let reg = hub.register_participant();
-            let (tok, _rx) = hub
+            let (tok, _rx, _) = hub
                 .open_listen(Some(&reg), None, None, None, false, false)
                 .unwrap();
             hub.announce(&tok, "FreshOne").unwrap();
@@ -7236,7 +7425,7 @@ mod tests {
             let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
             let gov = hub.install_governor(None);
             let reg = hub.register_participant();
-            let (tok, _rx) = hub
+            let (tok, _rx, _) = hub
                 .open_listen(Some(&reg), None, None, None, false, false)
                 .unwrap();
             hub.announce(&tok, "alice").unwrap();
@@ -7266,12 +7455,12 @@ mod tests {
             let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
             let gov = hub.install_governor(None);
             let reg_a = hub.register_participant();
-            let (a, _ra) = hub
+            let (a, _ra, _) = hub
                 .open_listen(Some(&reg_a), None, None, None, false, false)
                 .unwrap();
             hub.announce(&a, "alice").unwrap();
             let reg_b = hub.register_participant();
-            let (b, _rb) = hub
+            let (b, _rb, _) = hub
                 .open_listen(Some(&reg_b), None, None, None, false, false)
                 .unwrap();
             hub.announce(&b, "bob").unwrap();
@@ -7370,12 +7559,12 @@ mod tests {
             let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
             let gov = hub.install_governor(None);
             let reg_a = hub.register_participant();
-            let (a, _ra) = hub
+            let (a, _ra, _) = hub
                 .open_listen(Some(&reg_a), None, None, None, false, false)
                 .unwrap();
             hub.announce(&a, "ag-a").unwrap();
             let reg_b = hub.register_participant();
-            let (b, _rb) = hub
+            let (b, _rb, _) = hub
                 .open_listen(Some(&reg_b), None, None, None, false, false)
                 .unwrap();
             hub.announce(&b, "ag-b").unwrap();
@@ -7474,7 +7663,7 @@ mod tests {
         let hub = make_hub(Duration::from_secs(30));
 
         let reg_token = hub.register_participant();
-        let (token, _rx) = hub
+        let (token, _rx, _) = hub
             .open_listen(Some(&reg_token), None, None, None, false, false)
             .unwrap();
 
@@ -7572,7 +7761,7 @@ mod tests {
         let hub = make_hub(Duration::from_secs(30));
 
         let reg_token = hub.register_participant();
-        let (stale, _rx) = hub
+        let (stale, _rx, _) = hub
             .open_listen(Some(&reg_token), None, None, None, false, false)
             .unwrap();
 
@@ -7612,7 +7801,7 @@ mod tests {
         let hub = make_hub(Duration::from_secs(30));
 
         let reg_token = hub.register_participant();
-        let (tok, _rx) = hub
+        let (tok, _rx, _) = hub
             .open_listen(Some(&reg_token), None, None, None, false, false)
             .unwrap();
         // Announce a name — sets st.name = Some("GcExempt").
@@ -7659,7 +7848,7 @@ mod tests {
 
         // Agent A: observer with an opted-in push stream.
         let reg_a = hub.register_participant();
-        let (tok_a, mut rx_a) = hub
+        let (tok_a, mut rx_a, _) = hub
             .open_listen(Some(&reg_a), None, None, None, false, true)
             .unwrap();
         hub.announce(&tok_a, "GcA6").unwrap();
@@ -7707,7 +7896,7 @@ mod tests {
     fn test_identity_bound_token_not_gcd() {
         let hub = make_hub(Duration::from_secs(30));
         let reg = hub.register_participant();
-        let (tok, _rx) = hub
+        let (tok, _rx, _) = hub
             .open_listen(Some(&reg), None, None, None, false, false)
             .unwrap();
         hub.announce(&tok, "Bound").unwrap();
@@ -7729,7 +7918,7 @@ mod tests {
         let hub = make_hub(Duration::from_secs(30));
         hub.set_gc_unlisten_ttl_for_test(Duration::from_secs(1));
         let reg = hub.register_participant();
-        let (tok, _rx) = hub
+        let (tok, _rx, _) = hub
             .open_listen(Some(&reg), None, None, None, false, false)
             .unwrap();
         hub.announce(&tok, "Active").unwrap();
@@ -7802,7 +7991,7 @@ mod tests {
 
             // Issue token for bob and announce its name.
             let reg_bob = hub.register_participant();
-            let (listen_tok, _rx) = hub
+            let (listen_tok, _rx, _) = hub
                 .open_listen(Some(&reg_bob), None, None, None, false, false)
                 .unwrap();
             hub.announce(&listen_tok, "bob").unwrap();
@@ -7857,7 +8046,7 @@ mod tests {
         let listen_tok = {
             let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
             let reg_bob = hub.register_participant();
-            let (listen_tok, _rx) = hub
+            let (listen_tok, _rx, _) = hub
                 .open_listen(Some(&reg_bob), None, None, None, false, false)
                 .unwrap();
             hub.announce(&listen_tok, "bob").unwrap();
@@ -7892,7 +8081,7 @@ mod tests {
         let listen_tok = {
             let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
             let reg_bob = hub.register_participant();
-            let (listen_tok, _rx) = hub
+            let (listen_tok, _rx, _) = hub
                 .open_listen(Some(&reg_bob), None, None, None, false, false)
                 .unwrap();
             hub.announce(&listen_tok, "bob").unwrap();
@@ -7920,7 +8109,7 @@ mod tests {
         let listen_tok = {
             let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
             let reg_charlie = hub.register_participant();
-            let (listen_tok, _rx) = hub
+            let (listen_tok, _rx, _) = hub
                 .open_listen(Some(&reg_charlie), None, None, None, false, false)
                 .unwrap();
             hub.announce(&listen_tok, name).unwrap();
@@ -8169,10 +8358,10 @@ mod tests {
         let reg_b = hub.register_participant();
 
         // Open listen for both.
-        let (listen_a, _rx_a) = hub
+        let (listen_a, _rx_a, _) = hub
             .open_listen(Some(&reg_a), None, None, None, false, false)
             .unwrap();
-        let (listen_b, _rx_b) = hub
+        let (listen_b, _rx_b, _) = hub
             .open_listen(Some(&reg_b), None, None, None, false, false)
             .unwrap();
 
@@ -8200,10 +8389,10 @@ mod tests {
         let reg_b = hub.register_participant();
 
         // Open listen for both.
-        let (listen_a, _rx_a) = hub
+        let (listen_a, _rx_a, _) = hub
             .open_listen(Some(&reg_a), None, None, None, false, false)
             .unwrap();
-        let (listen_b, _rx_b) = hub
+        let (listen_b, _rx_b, _) = hub
             .open_listen(Some(&reg_b), None, None, None, false, false)
             .unwrap();
 
@@ -8236,10 +8425,10 @@ mod tests {
         let reg_b = hub.register_participant();
 
         // Open listen for both.
-        let (listen_a, _rx_a) = hub
+        let (listen_a, _rx_a, _) = hub
             .open_listen(Some(&reg_a), None, None, None, false, false)
             .unwrap();
-        let (listen_b, _rx_b) = hub
+        let (listen_b, _rx_b, _) = hub
             .open_listen(Some(&reg_b), None, None, None, false, false)
             .unwrap();
 
@@ -8281,7 +8470,7 @@ mod tests {
 
         // Register and announce only the querier; the target name is never registered.
         let reg_a = hub.register_participant();
-        let (listen_a, _rx_a) = hub
+        let (listen_a, _rx_a, _) = hub
             .open_listen(Some(&reg_a), None, None, None, false, false)
             .unwrap();
         hub.announce(&listen_a, "alice").unwrap();
@@ -8301,7 +8490,7 @@ mod tests {
         let tok = hub.register_participant();
 
         // Open first listen stream.
-        let (token, _rx1) = hub
+        let (token, _rx1, _) = hub
             .open_listen(Some(&tok), None, None, None, false, false)
             .expect("first open_listen must succeed");
 
@@ -8321,12 +8510,12 @@ mod tests {
         let tok = hub.register_participant();
 
         // Open first listen stream.
-        let (token1, mut rx1) = hub
+        let (token1, mut rx1, _) = hub
             .open_listen(Some(&tok), None, None, None, false, false)
             .expect("first open_listen must succeed");
 
         // Second open_listen with force=true → should succeed and return same token.
-        let (token2, _rx2) = hub
+        let (token2, _rx2, _) = hub
             .open_listen(Some(&token1), None, None, None, true, false)
             .expect("force takeover open_listen must succeed");
 

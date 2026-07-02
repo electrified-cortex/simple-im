@@ -1494,7 +1494,11 @@ async fn handle_listen(
         .and_then(|b| b.0.presence_push)
         .unwrap_or(false);
 
-    let (token, rx) = match state.hub.open_listen(
+    // The name-bind outcome (FR3: NAME_IN_USE vs Bound) is already reported to the client via the
+    // welcome SSE event on the stream itself (`name_in_use`/`resolution_stream` fields) — the
+    // subscription always opens with 200 as long as the token itself is valid, so there is
+    // nothing further to branch on here.
+    let (token, rx, _name_bind_outcome) = match state.hub.open_listen(
         Some(&token),
         peer_ip,
         name_to_bind,
@@ -1502,7 +1506,7 @@ async fn handle_listen(
         force,
         presence_push,
     ) {
-        Ok(pair) => pair,
+        Ok(triple) => triple,
         Err(e) => return err_response(e),
     };
 
