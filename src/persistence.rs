@@ -9,9 +9,6 @@ pub struct PersistedToken {
     pub identity: String,
     pub token_type: String, // "governor" or "participant" (post-15-0029; "agent"/"listen" purged)
     pub expires_at_secs: Option<u64>,
-    /// Retired announce-name column (15-0029). Kept as a read-only startup fallback for rows that
-    /// predate the `identity`-as-name model; never written after this epic. See migration Step 7.
-    pub name: Option<String>,
 }
 
 /// A permanent identity record (15-0029 / FG-7). The name survives token GC, revoke, and expiry.
@@ -107,16 +104,6 @@ impl TokenStore {
         .execute(&self.pool)
         .await?;
 
-        // Idempotent: add name column introduced for listen-token announce persistence.
-        let res = sqlx::query("ALTER TABLE tokens ADD COLUMN name TEXT")
-            .execute(&self.pool)
-            .await;
-        if let Err(e) = res
-            && !e.to_string().contains("duplicate column name")
-        {
-            return Err(e);
-        }
-
         // Idempotent: migrate pre-listen token_type values to 'listen'.
         sqlx::query("UPDATE tokens SET token_type='listen' WHERE token_type='v2'")
             .execute(&self.pool)
@@ -201,38 +188,73 @@ impl TokenStore {
         // the v2→listen rename above. Provably-safe: a row is preserved by the Step-6 purge
         // iff its identity is a REGISTERED NAME (present in `identities`, populated by 2a/2b).
 
-        // Step 2a: backfill identities from rows where `identity` already holds the name.
-        let id_2a = sqlx::query(
-            "INSERT OR IGNORE INTO identities (name, created_at) \
-             SELECT identity, created_at FROM tokens \
-             WHERE token_type IN ('listen', 'participant') \
-               AND identity IS NOT NULL AND identity != '' AND identity != token",
-        )
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
+        // Steps 2a/2b/3 read the retired `name` column to backfill/fix legacy pre-15-0029 rows;
+        // Step 7 (15-0031 hard-drop) removes that column once it has been consumed. Gate the
+        // whole group on the column's actual presence instead of unconditionally re-adding it
+        // (former Step 1) on every single migrate() call: a DB that has already been through the
+        // hard-drop (the overwhelmingly common case — every startup after the first) has nothing
+        // left to backfill and nothing left to drop, so it now takes none of these DDL paths.
+        // This also sidesteps a reproducible SQLite quirk where ADD COLUMN, run against the same
+        // connection that previously DROPped a column of the same name, intermittently reports
+        // "duplicate column name" while a subsequent statement on that same connection reports
+        // "no such column" for that identical column — i.e. add-then-drop-then-add-again of the
+        // same name on one live connection is not safe to rely on; never doing the re-add in
+        // production avoids the pattern entirely.
+        let name_col_present =
+            sqlx::query("SELECT 1 FROM pragma_table_info('tokens') WHERE name = 'name' LIMIT 1")
+                .persistent(false)
+                .fetch_optional(&self.pool)
+                .await?
+                .is_some();
 
-        // Step 2b: backfill identities for FG-3 defect rows (identity == token) using `name`.
-        let id_2b = sqlx::query(
-            "INSERT OR IGNORE INTO identities (name, created_at) \
-             SELECT name, created_at FROM tokens \
-             WHERE token_type IN ('listen', 'participant') \
-               AND (identity = token OR identity IS NULL OR identity = '') \
-               AND name IS NOT NULL AND name != ''",
-        )
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
+        let (id_2a, id_2b, name_col_dropped) = if name_col_present {
+            // Step 2a: backfill identities from rows where `identity` already holds the name.
+            let id_2a = sqlx::query(
+                "INSERT OR IGNORE INTO identities (name, created_at) \
+                 SELECT identity, created_at FROM tokens \
+                 WHERE token_type IN ('listen', 'participant') \
+                   AND identity IS NOT NULL AND identity != '' AND identity != token",
+            )
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
 
-        // Step 3: fix the identity column for FG-3 defect rows (identity == token → identity = name).
-        sqlx::query(
-            "UPDATE tokens SET identity = name \
-             WHERE token_type IN ('listen', 'participant') \
-               AND name IS NOT NULL AND name != '' \
-               AND (identity = token OR identity IS NULL OR identity = '')",
-        )
-        .execute(&self.pool)
-        .await?;
+            // Step 2b: backfill identities for FG-3 defect rows (identity == token) using `name`.
+            let id_2b = sqlx::query(
+                "INSERT OR IGNORE INTO identities (name, created_at) \
+                 SELECT name, created_at FROM tokens \
+                 WHERE token_type IN ('listen', 'participant') \
+                   AND (identity = token OR identity IS NULL OR identity = '') \
+                   AND name IS NOT NULL AND name != ''",
+            )
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+
+            // Step 3: fix identity for FG-3 defect rows (identity == token → identity = name).
+            sqlx::query(
+                "UPDATE tokens SET identity = name \
+                 WHERE token_type IN ('listen', 'participant') \
+                   AND name IS NOT NULL AND name != '' \
+                   AND (identity = token OR identity IS NULL OR identity = '')",
+            )
+            .execute(&self.pool)
+            .await?;
+
+            // Step 7 (15-0031 hard-drop): `name` has now been fully consumed by 2a/2b/3 above
+            // (its only remaining reader) — the BLOCKER-5 startup fallback that used to read it
+            // (in DeliveryHub::new_with_persisted_state) has been removed, so no code path reads
+            // `name` anymore once this runs. Column presence was just confirmed above on this
+            // same connection, so this DROP cannot hit "no such column".
+            sqlx::query("ALTER TABLE tokens DROP COLUMN name")
+                .persistent(false)
+                .execute(&self.pool)
+                .await?;
+
+            (id_2a, id_2b, 1)
+        } else {
+            (0, 0, 0)
+        };
 
         // Step 4: rename listen → participant (token-type collapse 3→2).
         let renamed =
@@ -259,12 +281,6 @@ impl TokenStore {
         .await?
         .rows_affected();
 
-        // Step 7: the retired `name` column is intentionally RETAINED as a dead, read-only
-        // startup fallback (SA-4 documented edge case). Dropping it would remove the BLOCKER-5
-        // name-restore fallback and risk a grant-time identity-clobber data-loss window; no
-        // business logic writes to it after this epic. name_col_dropped = 0.
-        let name_col_dropped = 0;
-
         eprintln!(
             "sim_migrate: identities_created={} listen_renamed={} agent_purged={} \
              orphan_purged={} name_col_dropped={}",
@@ -281,7 +297,7 @@ impl TokenStore {
     // ── Load ──────────────────────────────────────────────────────────────────
 
     pub async fn load_tokens(&self) -> Result<Vec<PersistedToken>, sqlx::Error> {
-        let rows = sqlx::query("SELECT token, identity, token_type, expires_at, name FROM tokens")
+        let rows = sqlx::query("SELECT token, identity, token_type, expires_at FROM tokens")
             .fetch_all(&self.pool)
             .await?;
 
@@ -295,7 +311,6 @@ impl TokenStore {
                     identity: row.get("identity"),
                     token_type: row.get("token_type"),
                     expires_at_secs: exp_str.as_deref().and_then(secs_str_to_u64),
-                    name: row.get("name"),
                 }
             })
             .collect())
@@ -371,28 +386,23 @@ impl TokenStore {
         identity: &str,
         token_type: &str,
         expires_at: Option<SystemTime>,
-        name: Option<&str>,
     ) -> Result<(), sqlx::Error> {
         let exp = expires_at.map(system_time_to_secs_str);
         let now = system_time_to_secs_str(SystemTime::now());
-        // COALESCE(excluded.name, tokens.name): a NULL incoming name never overwrites a stored
-        // name, so a grant-time persist (name=None) cannot clobber a prior announce-time persist.
         sqlx::query(
-            "INSERT INTO tokens (token, identity, token_type, expires_at, created_at, name) \
-             VALUES (?, ?, ?, ?, ?, ?) \
+            "INSERT INTO tokens (token, identity, token_type, expires_at, created_at) \
+             VALUES (?, ?, ?, ?, ?) \
              ON CONFLICT(token) DO UPDATE SET \
                  identity   = excluded.identity, \
                  token_type = excluded.token_type, \
                  expires_at = excluded.expires_at, \
-                 created_at = excluded.created_at, \
-                 name       = COALESCE(excluded.name, tokens.name)",
+                 created_at = excluded.created_at",
         )
         .bind(token)
         .bind(identity)
         .bind(token_type)
         .bind(exp)
         .bind(now)
-        .bind(name)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -423,8 +433,8 @@ impl TokenStore {
                 .await?;
         }
         sqlx::query(
-            "INSERT OR REPLACE INTO tokens (token, identity, token_type, expires_at, created_at, name) \
-             VALUES (?, ?, 'governor', NULL, ?, NULL)",
+            "INSERT OR REPLACE INTO tokens (token, identity, token_type, expires_at, created_at) \
+             VALUES (?, ?, 'governor', NULL, ?)",
         )
         .bind(new_token)
         .bind(new_token)
@@ -649,6 +659,13 @@ impl TokenStore {
     }
 
     /// Insert a raw token row (including the legacy `name` column) to simulate a pre-migration DB.
+    /// `TokenStore::open` already ran `migrate()` once by the time a test gets a `store` handle,
+    /// which (15-0031) drops the retired `name` column whenever it finds one present — so this
+    /// helper re-adds it itself, idempotently, before writing a legacy row into it. Both
+    /// statements run on a single connection (via an explicit transaction) so the INSERT can
+    /// never observe a different connection's stale, pre-ADD view of the schema — a real desync
+    /// observed under concurrent test load when each statement was independently pulled from the
+    /// pool.
     pub async fn seed_raw_token(
         &self,
         token: &str,
@@ -656,19 +673,52 @@ impl TokenStore {
         token_type: &str,
         name: Option<&str>,
     ) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        // Only ADD if not already present (checked on this same connection/transaction, matching
+        // migrate()'s presence-gated Step 2a/2b/3/7 group) — see the long comment on that group
+        // in migrate() for why this helper never blindly re-issues ADD COLUMN after a DROP on the
+        // same connection.
+        let name_col_present =
+            sqlx::query("SELECT 1 FROM pragma_table_info('tokens') WHERE name = 'name' LIMIT 1")
+                .persistent(false)
+                .fetch_optional(&mut *tx)
+                .await?
+                .is_some();
+        if !name_col_present {
+            sqlx::query("ALTER TABLE tokens ADD COLUMN name TEXT")
+                .persistent(false)
+                .execute(&mut *tx)
+                .await?;
+        }
         let now = system_time_to_secs_str(SystemTime::now());
         sqlx::query(
             "INSERT OR REPLACE INTO tokens (token, identity, token_type, expires_at, created_at, name) \
              VALUES (?, ?, ?, NULL, ?, ?)",
         )
+        .persistent(false)
         .bind(token)
         .bind(identity)
         .bind(token_type)
         .bind(now)
         .bind(name)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
+    }
+
+    /// Whether the retired `name` column is currently present on the tokens table (15-0031 test
+    /// seam for the `name_col_dropped` acceptance criterion, S1-AC-8). Uses the same
+    /// `pragma_table_info` presence check as migrate() rather than a `SELECT name ...` probe, so
+    /// it can't be confused by the same connection's ADD/DROP history for that column name.
+    pub async fn tokens_name_column_exists(&self) -> Result<bool, sqlx::Error> {
+        Ok(
+            sqlx::query("SELECT 1 FROM pragma_table_info('tokens') WHERE name = 'name' LIMIT 1")
+                .persistent(false)
+                .fetch_optional(&self.pool)
+                .await?
+                .is_some(),
+        )
     }
 
     /// Count token rows of a given type.

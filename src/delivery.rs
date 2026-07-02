@@ -902,14 +902,15 @@ impl DeliveryHub {
                 state.ever_listened = true;
                 state.ever_granted = true;
                 // BLOCKER-5 name restore: for participant tokens the `identity` column holds the
-                // name (post-migration). Fall back to the retired `name` column only for a stale
-                // pre-migration row whose identity still equals the token.
-                let resolved_name: Option<String> =
-                    if !t.identity.is_empty() && t.identity != t.token {
-                        Some(t.identity.clone())
-                    } else {
-                        t.name.clone()
-                    };
+                // name (post-migration). The retired `name` column fallback for a stale
+                // pre-migration row (identity still equal to the token) is gone — migrate()'s
+                // Step 6 purge already guarantees every surviving row here has a valid,
+                // registered `identity` (15-0031 hard-drop; the column no longer exists).
+                let resolved_name: Option<String> = if !t.identity.is_empty() {
+                    Some(t.identity.clone())
+                } else {
+                    None
+                };
                 // Restore name bindings so the agent is reachable while offline.
                 // If two persisted tokens share a name (shouldn't happen), last-write-wins.
                 if let Some(name) = resolved_name {
@@ -1057,10 +1058,7 @@ impl DeliveryHub {
             let tok = gov.0.clone();
             let expires_at = expiry.map(|d| SystemTime::now() + d.min(crate::types::MAX_EXPIRY));
             self.db_write(async move {
-                if let Err(e) = store
-                    .upsert_token(&tok, &tok, "governor", expires_at, None)
-                    .await
-                {
+                if let Err(e) = store.upsert_token(&tok, &tok, "governor", expires_at).await {
                     eprintln!("WARNING: token store write failed: {e}");
                 }
             });
@@ -1159,7 +1157,7 @@ impl DeliveryHub {
                         let tok2 = tok.clone();
                         self.db_write(async move {
                             if let Err(e) = store
-                                .upsert_token(&tok2, &tok2, "governor", expires_at, None)
+                                .upsert_token(&tok2, &tok2, "governor", expires_at)
                                 .await
                             {
                                 eprintln!("WARNING: token store write failed: {e}");
@@ -1411,7 +1409,7 @@ impl DeliveryHub {
             if let Some(store) = self.token_store.clone() {
                 let t = tok.clone();
                 self.db_write(async move {
-                    if let Err(e) = store.upsert_token(&t, &t, "governor", None, None).await {
+                    if let Err(e) = store.upsert_token(&t, &t, "governor", None).await {
                         eprintln!("WARNING: token store write failed: {e}");
                     }
                 });
@@ -2317,10 +2315,7 @@ impl DeliveryHub {
             let new = new_token.0.clone();
             let expires_at = expiry_instant.map(instant_to_system_time);
             self.db_write(async move {
-                if let Err(e) = store
-                    .upsert_token(&new, &new, "governor", expires_at, None)
-                    .await
-                {
+                if let Err(e) = store.upsert_token(&new, &new, "governor", expires_at).await {
                     eprintln!("WARNING: token store write failed: {e}");
                 }
             });
@@ -2369,10 +2364,7 @@ impl DeliveryHub {
             let expires_at = expiry_instant.map(instant_to_system_time);
             self.db_write(async move {
                 let _ = store.delete_token(&old).await;
-                if let Err(e) = store
-                    .upsert_token(&new, &new, "governor", expires_at, None)
-                    .await
-                {
+                if let Err(e) = store.upsert_token(&new, &new, "governor", expires_at).await {
                     eprintln!("WARNING: token store write failed: {e}");
                 }
             });
@@ -2823,10 +2815,7 @@ impl DeliveryHub {
                 let store2 = store.clone();
                 self.db_write(async move {
                     // 15-0029: participant rows write identity=name (never identity=token).
-                    if let Err(e) = store2
-                        .upsert_token(&tok, &name, "participant", None, None)
-                        .await
-                    {
+                    if let Err(e) = store2.upsert_token(&tok, &name, "participant", None).await {
                         eprintln!("WARNING: token store write failed: {e}");
                     }
                 });
@@ -3276,10 +3265,7 @@ impl DeliveryHub {
                     if let Err(e) = store.upsert_identity(nm).await {
                         eprintln!("WARNING: identity store write failed: {e}");
                     }
-                    if let Err(e) = store
-                        .upsert_token(&new, nm, "participant", None, None)
-                        .await
-                    {
+                    if let Err(e) = store.upsert_token(&new, nm, "participant", None).await {
                         eprintln!("WARNING: token store write failed: {e}");
                     }
                 }
@@ -3619,10 +3605,7 @@ impl DeliveryHub {
                     eprintln!("WARNING: identity store write failed: {e}");
                 }
                 // BLOCKER-1 / FG-3: write identity=name, type="participant" (name col retired).
-                if let Err(e) = store
-                    .upsert_token(&tok, &name, "participant", None, None)
-                    .await
-                {
+                if let Err(e) = store.upsert_token(&tok, &name, "participant", None).await {
                     eprintln!("WARNING: token store write failed: {e}");
                 }
             });
@@ -3919,10 +3902,7 @@ impl DeliveryHub {
                     eprintln!("WARNING: identity store write failed: {e}");
                 }
                 // BLOCKER-1 / FG-3: write identity=name, type="participant" (name col retired).
-                if let Err(e) = store
-                    .upsert_token(&tok, &name_s, "participant", None, None)
-                    .await
-                {
+                if let Err(e) = store.upsert_token(&tok, &name_s, "participant", None).await {
                     eprintln!("WARNING: token store write failed: {e}");
                 }
             });
@@ -6383,6 +6363,40 @@ mod tests {
             Some("666666666")
         );
         drop(inner);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// S1-AC-8 (15-0031 hard-drop): the retired `name` column is physically dropped from the
+    /// tokens table — it no longer exists once migration completes on a fresh DB.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_s1_name_column_dropped() {
+        let db = unique_test_db();
+        let store = TokenStore::open(&db).await.expect("open");
+        assert!(
+            !store.tokens_name_column_exists().await.expect("check"),
+            "the retired name column must be dropped after migration"
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// S1-AC-8b: even after a legacy pre-migration row forces the `name` column to be re-added
+    /// and backfilled from, migrate() drops it again — the column is never left behind once its
+    /// data has been consumed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_s1_name_column_dropped_after_legacy_backfill() {
+        let db = unique_test_db();
+        let store = TokenStore::open(&db).await.expect("open");
+        store
+            .seed_raw_token("999999999", "999999999", "listen", Some("Scout9"))
+            .await
+            .expect("seed");
+        store.migrate_for_test().await.expect("migrate");
+        let ids = store.load_identities().await.expect("load");
+        assert!(ids.iter().any(|i| i.name == "Scout9"));
+        assert!(
+            !store.tokens_name_column_exists().await.expect("check"),
+            "the name column must be dropped again after legacy backfill"
+        );
         let _ = std::fs::remove_file(&db);
     }
 
