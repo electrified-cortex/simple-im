@@ -328,7 +328,17 @@ impl TokenStore {
             .await?
             .is_some();
 
-        if !already_reset {
+        // AC-13: log a `sim_migrate:`-style count line on EVERY migrate() call, consistent with
+        // the Step 2-7 log above — not just the one time the wipe actually runs. Re-running this
+        // against an already-reset DB reports all-zero counts (idempotent no-op), rather than
+        // going silent, so the log always reflects what this step did on this run.
+        let (
+            tokens_cleared,
+            identities_cleared,
+            grants_cleared,
+            denial_blocks_cleared,
+            governor_cleared,
+        ) = if !already_reset {
             let now = system_time_to_secs_str(SystemTime::now());
             let mut tx = self.pool.begin().await?;
             let tokens_cleared = sqlx::query("DELETE FROM tokens")
@@ -356,16 +366,25 @@ impl TokenStore {
                 .execute(&mut *tx)
                 .await?;
             tx.commit().await?;
-            eprintln!(
-                "sim_migrate: 15-0040 full reset — tokens_cleared={} identities_cleared={} \
-                 grants_cleared={} denial_blocks_cleared={} governor_cleared={}",
+            (
                 tokens_cleared,
                 identities_cleared,
                 grants_cleared,
                 denial_blocks_cleared,
                 governor_cleared,
-            );
-        }
+            )
+        } else {
+            (0, 0, 0, 0, 0)
+        };
+        eprintln!(
+            "sim_migrate: 15-0040 full reset — tokens_cleared={} identities_cleared={} \
+             grants_cleared={} denial_blocks_cleared={} governor_cleared={}",
+            tokens_cleared,
+            identities_cleared,
+            grants_cleared,
+            denial_blocks_cleared,
+            governor_cleared,
+        );
 
         Ok(())
     }

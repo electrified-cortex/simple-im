@@ -6646,6 +6646,47 @@ mod tests {
         );
     }
 
+    /// AC-3: live transfer between two ALREADY-connected identities. Governor A initiates a
+    /// transfer bound to B; B — a currently-online, non-governor participant — accepts it using
+    /// its OWN EXISTING token (never a new one). Afterward B's token authorizes governor ops, A's
+    /// no longer does, and no new credential was minted anywhere in the process (both parties use
+    /// only the tokens `open_listen` already gave them; `accept_governor_transfer` returns `()`).
+    #[test]
+    fn ac3_live_transfer_moves_flag_to_bs_existing_token_no_new_credential() {
+        let hub = make_hub(Duration::from_secs(30));
+        let gov_a = hub.install_governor(None); // A: governor
+        let reg_b = hub.register_participant();
+        let (tok_b, _rx_b, _) = hub
+            .open_listen(Some(&reg_b), None, Some("Bob"), None, false, false)
+            .unwrap();
+
+        // Before transfer: A is governor, B (online, non-governor) is not.
+        assert!(hub.validate_governor_token(&gov_a).is_ok());
+        assert!(matches!(
+            hub.validate_governor_token(&GovernorToken(tok_b.clone())),
+            Err(Error::Forbidden)
+        ));
+
+        // A initiates a transfer bound to Bob's identity; B accepts with its EXISTING token.
+        let transfer_token = hub.transfer_governor(&gov_a, Some("Bob")).unwrap();
+        hub.accept_governor_transfer(&tok_b, &transfer_token)
+            .expect("B's own existing token must be accepted");
+
+        // After transfer: B's OWN token now authorizes governor ops; A's no longer does.
+        assert!(
+            hub.validate_governor_token(&GovernorToken(tok_b.clone()))
+                .is_ok(),
+            "AC-3: B's existing token must authorize governor ops after accepting the transfer"
+        );
+        assert!(
+            matches!(
+                hub.validate_governor_token(&gov_a),
+                Err(Error::Forbidden)
+            ),
+            "AC-3: A must no longer authorize governor ops after transferring away"
+        );
+    }
+
     /// S1-AC-3: a listen-type token with a name backfills the identities table on migration.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_s1_identities_populated_from_listen_tokens() {
@@ -7613,6 +7654,29 @@ mod tests {
             assert!(
                 window.contains(field),
                 "sim_migrate log must include {field}"
+            );
+        }
+    }
+
+    /// AC-13 (logged): the 15-0040 full-reset step also emits its own `sim_migrate:`-style count
+    /// line, with every field the reset touches, consistent with the Step 2-7 log above.
+    #[test]
+    fn ac13_reset_migration_log_counts() {
+        let src = read_crate_src("src/persistence.rs");
+        let i = src
+            .find("sim_migrate: 15-0040 full reset")
+            .expect("15-0040 full-reset migration log line present");
+        let window = &src[i..i + 300];
+        for field in [
+            "tokens_cleared",
+            "identities_cleared",
+            "grants_cleared",
+            "denial_blocks_cleared",
+            "governor_cleared",
+        ] {
+            assert!(
+                window.contains(field),
+                "15-0040 reset sim_migrate log must include {field}"
             );
         }
     }
