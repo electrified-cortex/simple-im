@@ -2111,14 +2111,18 @@ async fn ac_claim_autogrant_first_governor() {
     );
     let body: Value = r.json().await.unwrap();
     assert_eq!(body["status"], "granted", "status must be 'granted'");
-    assert!(
-        body["governor_token"].is_string(),
-        "governor_token must be present"
+    // 15-0040 (FR2): no new credential is minted — governance is a flag set on the claimant's OWN
+    // existing identity, so the response reports that identity, never a token.
+    assert_eq!(
+        body["governor"], "ClaimAgent",
+        "response must confirm the claimant's own identity, not a new token: {:?}",
+        body
     );
 }
 
 /// AC: Two agents; agent A claims governorship → election; agent B approves → established.
-/// Then A dequeues and sees the governorship_granted governance message with a governor_token.
+/// Then A dequeues and sees the governorship_granted governance message naming its own identity
+/// (15-0040 FR2: no new credential is minted on grant/election/transfer).
 #[tokio::test]
 async fn ac_claim_election_unanimous() {
     let server = TestServer::spawn().await;
@@ -2188,7 +2192,8 @@ async fn ac_claim_election_unanimous() {
     let vote_body: Value = vote.json().await.unwrap();
     assert_eq!(vote_body["status"], "established");
 
-    // Agent A dequeues and should receive a governorship_granted message with governor_token.
+    // Agent A dequeues and should receive a governorship_granted message naming their OWN
+    // identity — no new credential is minted (FR2).
     let pop_a = client
         .post(server.url("/messages/queue/pop"))
         .header("Authorization", format!("Bearer {}", tok_a))
@@ -2203,11 +2208,12 @@ async fn ac_claim_election_unanimous() {
         payload_a.contains("governorship_granted"),
         "A should receive governorship_granted, got: {pop_a}"
     );
-    // Parse the payload to check governor_token is present.
+    // Parse the payload to check the identity is present (never a governor_token).
     let inner: Value = serde_json::from_str(payload_a).unwrap();
-    assert!(
-        inner["governor_token"].is_string(),
-        "governor_token must be in payload"
+    assert_eq!(
+        inner["identity"], "ElAlice",
+        "payload must name A's own identity, not a new token: {:?}",
+        inner
     );
 
     _sa.abort();
@@ -2535,31 +2541,34 @@ async fn ac_pr3_absent_participant_shows_offline_after_ttl_expires() {
     );
 }
 
-// ── AC-GOV-BREADCRUMB: governor gets role breadcrumb on listen+announce ────────
+// ── AC-GOV-BREADCRUMB: governor gets role breadcrumb on connect ────────────────
 
+// 15-0040 (FR2/FR3): `spawn_with_governor()`'s `install_governor()` call already mints the
+// governor's participant token AND binds its (synthetic) name in one step — there is no separate
+// "governor session-link" mint-a-new-token path left, and no separate /announce call is needed
+// (FR3 folds name-binding into /listen). The breadcrumb is enqueued the moment the identity is
+// bound, so it is already sitting in the governor's queue before this test's HTTP client even
+// connects. Reconnecting via `/listen?force=true` (the governor's server-side session counts as
+// already "active" from `install_governor`'s internal open_listen call) picks it up via the
+// existing catch-up-notify path — no explicit /announce round-trip required.
 #[tokio::test]
 async fn ac_gov_breadcrumb_on_connect() {
     let (server, gov_token) = TestServer::spawn_with_governor().await;
     let client = server.client();
 
-    // Governor: POST /listen with their governor token as bearer.
-    // The server detects this is a governor token, mints a linked listen token,
-    // and records the session link so announce() can enqueue the governor_role breadcrumb.
-    let (listen_tok, _stream) = listen_get_token(&server, &client, Some(&gov_token)).await;
-
-    // Governor: POST /announce — this triggers the governor-role breadcrumb to be enqueued.
     let r = client
-        .post(server.url("/announce"))
-        .header("Authorization", format!("Bearer {}", listen_tok))
-        .json(&json!({"name": "Governor"}))
+        .post(server.url("/listen?force=true"))
+        .header("Authorization", format!("Bearer {}", gov_token))
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        r.status(),
-        StatusCode::NO_CONTENT,
-        "announce must return 204"
-    );
+    assert_eq!(r.status(), StatusCode::OK, "POST /listen failed");
+    let stream = r.bytes_stream();
+    // Spawn a task that holds the stream open until dropped (mirrors listen_get_token).
+    let _stream = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        drop(stream);
+    });
 
     // Small yield so the async SSE NOTIFY delivery can process.
     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -2567,7 +2576,7 @@ async fn ac_gov_breadcrumb_on_connect() {
     // Dequeue: must receive the governor_role service message.
     let r = client
         .post(server.url("/messages/queue/pop"))
-        .header("Authorization", format!("Bearer {}", listen_tok))
+        .header("Authorization", format!("Bearer {}", gov_token))
         .send()
         .await
         .unwrap();
@@ -3031,9 +3040,12 @@ async fn ac_gt1_accept_transfer_requires_participant_bearer() {
         StatusCode::OK,
         "accept-transfer should succeed"
     );
-    assert!(
-        accept.json::<Value>().await.unwrap()["token"].is_string(),
-        "response must contain new governor token"
+    // 15-0040 (FR2): the governor flag moves to Alice's OWN existing token — no new credential is
+    // minted or returned.
+    assert_eq!(
+        accept.json::<Value>().await.unwrap()["status"],
+        "accepted",
+        "response must confirm acceptance, not return a new token"
     );
 }
 
@@ -5208,7 +5220,10 @@ async fn test_governor_transfer_identity_verified_against_bearer() {
     assert_eq!(r.status(), StatusCode::OK);
 }
 
-/// EPIC-AC-13 / S5-AC-1: admin reset with the correct secret → 200 {governor_token}.
+/// EPIC-AC-13 / S5-AC-1 (adapted for 15-0040 FR1): admin reset with the correct secret → 200
+/// {status: "cleared"}. FR1 forbids minting a fresh, nameless credential here (there is no
+/// participant identity to attach it to) — reset now only clears the governor pointer; a
+/// participant claims fresh afterward via `POST /governors/claim`.
 #[tokio::test]
 async fn test_admin_reset_returns_governor_token() {
     let (server, _gov) = spawn_with_governor_and_admin(Some("anchor-secret")).await;
@@ -5220,7 +5235,11 @@ async fn test_admin_reset_returns_governor_token() {
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::OK);
-    assert!(r.json::<Value>().await.unwrap()["governor_token"].is_string());
+    assert_eq!(
+        r.json::<Value>().await.unwrap()["status"],
+        "cleared",
+        "reset must confirm the governor pointer was cleared, not return a new token"
+    );
 }
 
 /// EPIC-AC-14 / S5-AC-2: admin reset with a wrong/missing secret → 401.
@@ -5255,14 +5274,18 @@ async fn test_admin_reset_invalidates_old_governor() {
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::OK);
-    // Old governor token on a governor-only endpoint → 401.
-    let participants = client
-        .get(server.url("/participants"))
+    // 15-0040 (FR1): the old governor's participant token is untouched by reset (permanent,
+    // never revoked) — it just no longer carries the governor flag. Exercise a governance-only
+    // (mutating) endpoint, which stays governor-flag-gated even after the security-model change
+    // flattens `GET /participants` to any valid token — a valid-but-not-governor token is
+    // Forbidden (403), not AuthFailed (401).
+    let deregister = client
+        .delete(server.url("/participants/nobody"))
         .header("Authorization", format!("Bearer {}", old_gov))
         .send()
         .await
         .unwrap();
-    assert_eq!(participants.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(deregister.status(), StatusCode::FORBIDDEN);
 }
 
 /// EPIC-AC-26 / S5-AC-4: admin reset with the secret unset/empty → 501.

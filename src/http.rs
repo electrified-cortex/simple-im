@@ -179,7 +179,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/messages/latest", get(handle_latest_message))
         .route("/governors/claim", post(handle_claim_governorship))
         .route("/governors/elections/{id}", post(handle_election_vote))
-        .route("/governors/refresh", post(handle_refresh_governor_token))
         .route("/governors/transfer", post(handle_transfer_governor))
         .route(
             "/governors/accept-transfer",
@@ -472,22 +471,6 @@ async fn handle_list_participants(
     }
 }
 
-// POST /governors/refresh  — governor self-rotates their token
-async fn handle_refresh_governor_token(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Response {
-    let tok_str = match bearer_token(&headers) {
-        Some(t) => t,
-        None => return auth_failed(),
-    };
-    let old_token = GovernorToken(tok_str);
-    match state.hub.refresh_governor_token(&old_token) {
-        Ok(new_token) => (StatusCode::OK, Json(json!({"token": new_token.0}))).into_response(),
-        Err(e) => err_response(e),
-    }
-}
-
 // POST /governors/transfer  — current governor creates a one-time transfer token
 async fn handle_transfer_governor(
     State(state): State<Arc<AppState>>,
@@ -515,7 +498,8 @@ async fn handle_transfer_governor(
 //   Authorization: Bearer <participant-token>   (the claimer; its name is the verified identity)
 //   Body: {"transfer_token": "<transfer-token>"}
 //
-//   200 → {token}                       new governor token
+//   200 → {status: "accepted"}           governor flag moved to the claimer's OWN existing token
+//                                       (FR2: no new credential is minted or returned)
 //   401 → no bearer or bearer fails participant validation
 //   403 → bearer is a governor token (must be a participant)
 //   403 → transfer's to_identity is set and does not match the bearer's name
@@ -555,7 +539,7 @@ async fn handle_accept_governor_transfer(
         }
     };
     match state.hub.accept_governor_transfer(&bearer, &transfer_token) {
-        Ok(new_token) => (StatusCode::OK, Json(json!({"token": new_token.0}))).into_response(),
+        Ok(()) => (StatusCode::OK, Json(json!({"status": "accepted"}))).into_response(),
         // transfer token not found / consumed → 404.
         Err(Error::RecipientUnknown) => (
             StatusCode::NOT_FOUND,
@@ -576,8 +560,13 @@ async fn handle_accept_governor_transfer(
 // POST /admin/governor/reset  — operator-anchored governor recovery (15-0029). Not advertised in
 // the discovery document. Requires the `X-Admin-Secret` header to equal `SIMPLE_IM_ADMIN_SECRET`.
 //
-//   200 → {governor_token}              new governor installed (old governors revoked, pending
-//                                       transfers cleared, committed in one transaction)
+// 15-0040 (FR1): a fresh, nameless credential can no longer be minted here — there is no
+// participant identity to attach it to, and FR1 forbids a second credential type existing at
+// all. This is now purely a "clear the governor pointer, re-open bootstrap" escape hatch; a
+// legitimate participant then claims governorship fresh via `POST /governors/claim`.
+//
+//   200 → {status: "cleared"}           governor pointer cleared + pending transfers dropped,
+//                                       committed in one transaction; bootstrap mode reopens
 //   401 → missing or wrong secret
 //   501 → SIMPLE_IM_ADMIN_SECRET unset or empty
 async fn handle_admin_governor_reset(
@@ -599,8 +588,8 @@ async fn handle_admin_governor_reset(
     if provided != Some(secret.as_str()) {
         return auth_failed();
     }
-    let new_token = state.hub.admin_reset_governor();
-    (StatusCode::OK, Json(json!({"governor_token": new_token.0}))).into_response()
+    state.hub.admin_reset_governor();
+    (StatusCode::OK, Json(json!({"status": "cleared"}))).into_response()
 }
 
 // DELETE /participants/{name}  — governor force-revokes any participant by name
@@ -678,9 +667,9 @@ async fn handle_claim_governorship(
     };
     let expiry = body.and_then(|b| b.expiry_secs).map(Duration::from_secs);
     match state.hub.claim_governorship(&token, expiry) {
-        Ok(ClaimOutcome::Granted { governor_token }) => (
+        Ok(ClaimOutcome::Granted { identity }) => (
             StatusCode::OK,
-            Json(json!({"status": "granted", "governor_token": governor_token})),
+            Json(json!({"status": "granted", "governor": identity})),
         )
             .into_response(),
         Ok(ClaimOutcome::Election { claim_id, voters }) => (
@@ -1252,9 +1241,8 @@ async fn handle_discovery() -> Response {
                     "DELETE /grants/{id}": {"auth": "governor", "body": null, "hint": "Revoke a grant by ID"}
                 },
                 "governor": {
-                    "POST /governors/claim": {"auth": "participant", "body": "{expiry_secs?}", "hint": "Claim governorship (may trigger election)"},
+                    "POST /governors/claim": {"auth": "participant", "body": "{expiry_secs?}", "hint": "Claim governorship (may trigger election) — sets the governor flag on your own participant identity, no new credential is issued"},
                     "POST /governors/elections/{id}": {"auth": "participant", "body": "{action}", "hint": "Vote on a pending election/transfer"},
-                    "POST /governors/refresh": {"auth": "governor", "body": null, "hint": "Rotate governor token"},
                     "POST /governors/transfer": {"auth": "governor", "body": "{to?}", "hint": "Initiate governor transfer"},
                     "POST /governors/accept-transfer": {"auth": "participant", "body": "{transfer_token}", "hint": "Accept governor transfer (claimer identity derived from the participant bearer)"},
                     "POST /governors/mediate": {"auth": "governor", "body": "{mediation_id, decision, payload?}", "hint": "Resolve a mediation hold"},
@@ -1428,17 +1416,13 @@ async fn handle_register(
         Some(b) => b,
         None => return auth_failed(),
     };
-    // 403 (not 401) when the presenter is a participant token (completeness-M3).
-    if state.hub.is_participant_token(&bearer) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "error": "FORBIDDEN",
-                "message": "a participant token cannot register participants; present the governor token"
-            })),
-        )
-            .into_response();
-    }
+    // 15-0040 (FR1/FR2): the old pre-check here (`is_participant_token(&bearer)` → 403) assumed
+    // "participant token" and "governor token" were mutually exclusive credential types. Under
+    // the flag model they are NOT — a governor's bearer IS an ordinary participant token — so
+    // that check would incorrectly 403 the actual governor. `issue_participant_token` itself
+    // already resolves the bearer's identity and distinguishes "not a valid token at all"
+    // (AuthFailed → 401) from "a valid participant token that just isn't the governor"
+    // (Forbidden → 403); the match arms below rely on that distinction directly.
     let gov = GovernorToken(bearer);
     match state.hub.issue_participant_token(&gov, name.as_deref()) {
         Ok((token, Some(name))) => {
@@ -1452,7 +1436,10 @@ async fn handle_register(
             .into_response(),
         Err(Error::Forbidden) => (
             StatusCode::FORBIDDEN,
-            Json(json!({"error": "FORBIDDEN", "message": "governor token required"})),
+            Json(json!({
+                "error": "FORBIDDEN",
+                "message": "a participant token cannot register participants; present the governor token"
+            })),
         )
             .into_response(),
         // Invalid/expired governor bearer → 401.
@@ -1920,7 +1907,6 @@ fn router_routes() -> Vec<String> {
         "GET /messages/latest".to_string(),
         "POST /governors/claim".to_string(),
         "POST /governors/elections/{id}".to_string(),
-        "POST /governors/refresh".to_string(),
         "POST /governors/transfer".to_string(),
         "POST /governors/accept-transfer".to_string(),
         "POST /governors/mediate".to_string(),

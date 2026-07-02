@@ -162,13 +162,18 @@ async fn main() {
                 eprintln!("WARNING: could not load identities from store: {e}");
                 vec![]
             });
+            let governor = store.load_governor().await.unwrap_or_else(|e| {
+                eprintln!("WARNING: could not load governor from store: {e}");
+                None
+            });
             eprintln!(
-                "Token store: {} (loaded {} tokens, {} grants, {} denial blocks, {} identities)",
+                "Token store: {} (loaded {} tokens, {} grants, {} denial blocks, {} identities, governor={})",
                 db_path,
                 tokens.len(),
                 grants.len(),
                 denial_blocks.len(),
-                identities.len()
+                identities.len(),
+                governor.as_deref().unwrap_or("none")
             );
             let hub = simple_im::delivery::DeliveryHub::new_with_persisted_state(
                 liveness,
@@ -177,6 +182,7 @@ async fn main() {
                 grants,
                 denial_blocks,
                 identities,
+                governor,
             );
             let state = Arc::new(AppState::new_with_hub(hub));
             run(config.insecure_http, addr, state).await;

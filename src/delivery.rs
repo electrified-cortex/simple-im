@@ -36,17 +36,6 @@ fn rand_hex(n_bytes: usize) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-/// Convert a future Instant to an approximate SystemTime for DB persistence.
-fn instant_to_system_time(instant: Instant) -> SystemTime {
-    let now_i = Instant::now();
-    let now_s = SystemTime::now();
-    if instant >= now_i {
-        now_s + (instant - now_i)
-    } else {
-        now_s.checked_sub(now_i - instant).unwrap_or(now_s)
-    }
-}
-
 // ── Public types ──────────────────────────────────────────────────────────────
 
 /// Snapshot of a registered agent's name, identity, and online status.
@@ -84,7 +73,9 @@ pub struct ConnectionRequest {
     pub stage: ConnectionStage,
     pub governor_expiry: Option<Duration>,
     pub recipient_expiry: Option<Duration>,
-    /// Governor token stored on approval; used to create the grant when both sides approve.
+    /// Approving governor's participant IDENTITY NAME (or the `"recipient-consent"` governorless
+    /// sentinel), resolved at approval time; used as grant provenance when both sides approve.
+    /// FR2: never a separate credential — just the identity that held the flag when they approved.
     pub approving_governor: Option<String>,
     /// When this request expires. 30 min from creation; resets to 30 min from now on governor approval.
     pub expires_at: Instant,
@@ -119,8 +110,9 @@ struct GovernanceClaim {
 
 /// Immediate result of calling `claim_governorship`.
 pub enum ClaimOutcome {
-    /// Governorship was awarded immediately (no competition).
-    Granted { governor_token: String },
+    /// Governorship was awarded immediately (no competition). `identity` is the claimant's own
+    /// participant identity name — FR2: no credential is minted, so there is no token to return.
+    Granted { identity: String },
     /// Other agents must vote; the claim is pending their responses.
     Election { claim_id: String, voters: usize },
     /// An active governor must approve the transfer.
@@ -131,11 +123,9 @@ pub enum ClaimOutcome {
 pub enum ClaimResolution {
     /// Not all required votes have been received yet.
     Waiting { approved: usize, required: usize },
-    /// All required votes approved; the candidate is now governor.
-    Established {
-        candidate_name: String,
-        governor_token: String,
-    },
+    /// All required votes approved; the candidate is now governor (FR2: on their own existing
+    /// identity — no credential is minted, so there is no token to return).
+    Established { candidate_name: String },
     /// At least one required voter rejected the claim.
     Rejected { candidate_name: String },
 }
@@ -205,8 +195,6 @@ struct ListenTokenState {
     /// Last peer IP seen, for concurrent-use detection.
     last_ip: Option<String>,
     last_ip_at: Option<Instant>,
-    /// If this listen session was opened by a governor (bearer = gov token), holds the governor token ID.
-    governor_id: Option<String>,
     /// Monotonically increasing counter for messages enqueued to this subscriber's queue.
     /// Starts at 0; incremented on every push to message_queues for this token's name.
     /// Used by GET /messages/latest/id for non-consuming peek and long-poll gap detection.
@@ -235,7 +223,6 @@ impl ListenTokenState {
             notify_suppressed: false,
             last_ip: None,
             last_ip_at: None,
-            governor_id: None,
             msg_id_watch: msg_id_tx,
             pending_first_listen: false,
             presence_push: false,
@@ -493,6 +480,35 @@ impl HubInner {
         senders
     }
 
+    /// Resolves `token` to a live participant identity and confirms it currently holds the
+    /// governor privilege flag (15-0040 FR2). Governance no longer rides on a distinct minted
+    /// credential — it rides on the presenter's own ordinary participant token, checked against
+    /// the `TrustChain` singleton governor pointer.
+    ///
+    /// Errors: `AuthFailed` when the bearer is not a known, non-revoked participant token, or has
+    /// no bound identity yet (never announced/listened-with-a-name). `Forbidden` when the bearer
+    /// IS a valid participant identity but does not currently hold the governor flag — this is
+    /// the FR2/AC-2 case (an ordinary participant token presented where a governor is required).
+    fn validate_governor_token(&self, token: &GovernorToken) -> Result<(), Error> {
+        let st = self.listen_tokens.get(&token.0).ok_or(Error::AuthFailed)?;
+        if st.revoked {
+            return Err(Error::AuthFailed);
+        }
+        // A live participant token — Forbidden (not AuthFailed) below covers BOTH "a named
+        // identity that just isn't the governor" and "not yet bound to any name at all": either
+        // way it is a legitimate, live credential, just not (and, unbound, structurally cannot
+        // yet be) the governor. Only a wholly unknown/revoked bearer is AuthFailed.
+        let is_gov = self
+            .token_to_name
+            .get(&token.0)
+            .is_some_and(|name| self.trust.is_governor(name));
+        if is_gov {
+            Ok(())
+        } else {
+            Err(Error::Forbidden)
+        }
+    }
+
     /// Returns true if a non-expired denial block exists for (from_identity → to_name).
     /// Used to enforce deny-grant override in presence fanout and pull checks.
     fn is_denial_active(&self, from_identity: &str, to_name: &str) -> bool {
@@ -666,22 +682,19 @@ impl HubInner {
         //   normal `unlisten_ttl` path so that abandoned `/register` calls cannot accumulate
         //   indefinitely. (sim-gc-race-register-open-listen, sim-gc-registration-grace-cap)
         // 15-0029 addenda (GC bug fix): age is measured from `last_active` (reset on any active
-        // use), and two classes are EXEMPT from age-GC entirely:
-        //   (a) governor listen tokens (long-lived control credentials), and
-        //   (b) identity-bound tokens — a token whose name is a registered identity. Only
-        //       truly-abandoned tokens (registered/listened but never identity-bound, idle past
-        //       their TTL) are reaped.
+        // use). Identity-bound tokens — a token whose name is a registered identity — are EXEMPT
+        // from age-GC entirely. Only truly-abandoned tokens (registered/listened but never
+        // identity-bound, idle past their TTL) are reaped.
+        // 15-0040 (OQ6): the prior separate "governor listen session" GC exemption is retired —
+        // a governor's bearer is now an ordinary participant token bound to a name (FR2), already
+        // covered by the identity-bound rule below; no governor-specific carve-out is needed.
         let identities = &self.identities;
         let to_remove: Vec<String> = self
             .listen_tokens
             .iter()
             .filter(|(_, st)| !st.revoked)
             .filter(|(_, st)| {
-                // (a) governor listen sessions are never age-GC'd.
-                if st.governor_id.is_some() {
-                    return false;
-                }
-                // (b) identity-bound tokens (registered name) are never age-GC'd.
+                // Identity-bound tokens (registered name) are never age-GC'd.
                 if let Some(ref name) = st.name
                     && identities.contains(name)
                 {
@@ -873,6 +886,11 @@ impl DeliveryHub {
     }
 
     /// Construct a hub pre-loaded with persisted tokens and grants, backed by `token_store`.
+    ///
+    /// `persisted_governor` is the singleton governor identity name (15-0040 FR2/OQ1), loaded via
+    /// `TokenStore::load_governor` — governor state is no longer a per-token row in
+    /// `persisted_tokens`, so it is threaded through as its own parameter.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_persisted_state(
         lapse_after: Duration,
         token_store: Arc<TokenStore>,
@@ -880,19 +898,23 @@ impl DeliveryHub {
         persisted_grants: Vec<PersistedGrant>,
         persisted_denial_blocks: Vec<PersistedDenialBlock>,
         persisted_identities: Vec<crate::persistence::PersistedIdentity>,
+        persisted_governor: Option<String>,
     ) -> Self {
         let mut hub = Self::new(lapse_after);
         {
             let mut inner = hub.inner.lock().unwrap();
-            // BLOCKER-5: partition participant tokens into the listen-token map. The "listen"
-            // inclusion is a belt-and-suspenders guard — after migration all rows are
-            // "participant", but the fallback ensures a first post-upgrade startup cannot
-            // discard valid sessions if the predicate runs before migration completes.
-            let (listen_toks, regular_toks): (Vec<PersistedToken>, Vec<PersistedToken>) =
-                persisted_tokens
-                    .into_iter()
-                    .partition(|t| t.token_type == "participant" || t.token_type == "listen");
-            inner.trust.load_from_store(regular_toks, persisted_grants);
+            // BLOCKER-5: partition participant tokens into the listen-token map. Anything not
+            // "participant"/"listen" (e.g. a stray pre-15-0040 "governor" row that predates the
+            // full reset) is simply dropped — there is no longer a separate governor token row to
+            // restore into `TrustChain`; governor state comes from `persisted_governor` instead.
+            let listen_toks: Vec<PersistedToken> = persisted_tokens
+                .into_iter()
+                .filter(|t| t.token_type == "participant" || t.token_type == "listen")
+                .collect();
+            inner.trust.load_from_store(persisted_grants);
+            if let Some(name) = persisted_governor {
+                inner.trust.set_governor(&name);
+            }
             // Populate the permanent identity roster (FG-7) BEFORE token restore so guards see it.
             for row in persisted_identities {
                 inner.identities.insert(row.name);
@@ -1051,19 +1073,35 @@ impl DeliveryHub {
     }
 
     /// Install a governor directly, no policy check. The governed paths are claim_governorship/
-    /// respond_claim; this is for bootstrapping, embedding, and tests. Persists like mint did.
-    pub fn install_governor(&self, expiry: Option<Duration>) -> GovernorToken {
-        let gov = self.lock().trust.install_governor(expiry);
+    /// respond_claim/transfer; this is for bootstrapping, embedding, and tests.
+    ///
+    /// Under FR2 there is no separate governor credential: this mints an ordinary participant
+    /// token bound to a fresh synthetic identity name and sets the governor privilege flag on
+    /// that identity. The returned `GovernorToken` simply wraps that same participant token as a
+    /// bearer for governor-gated calls — it is never a second, distinct credential.
+    /// `expiry` is accepted for API compatibility but unused: a governor's authority now lives on
+    /// their permanent participant token, which (FR1) never expires.
+    pub fn install_governor(&self, _expiry: Option<Duration>) -> GovernorToken {
+        let reg = self.register_participant();
+        let name = format!("governor-{reg}");
+        // Set the flag BEFORE binding the name: `open_listen`'s inline bind path enqueues the
+        // governor breadcrumb only if `is_governor(name)` is already true at bind time.
+        {
+            let mut inner = self.lock();
+            inner.trust.set_governor(&name);
+        }
+        let (listen_tok, _rx) = self
+            .open_listen(Some(&reg), None, Some(&name), None, false, false)
+            .expect("a token minted by register_participant() is always accepted by open_listen()");
         if let Some(store) = self.token_store.clone() {
-            let tok = gov.0.clone();
-            let expires_at = expiry.map(|d| SystemTime::now() + d.min(crate::types::MAX_EXPIRY));
+            let n = name.clone();
             self.db_write(async move {
-                if let Err(e) = store.upsert_token(&tok, &tok, "governor", expires_at).await {
+                if let Err(e) = store.set_governor(&n).await {
                     eprintln!("WARNING: token store write failed: {e}");
                 }
             });
         }
-        gov
+        GovernorToken(listen_tok)
     }
 
     // ── Governance claim / election / transfer ────────────────────────────────
@@ -1073,11 +1111,16 @@ impl DeliveryHub {
     /// - Auto-grant:  no governor AND no other live agents → immediate.
     /// - Election:    no governor BUT other SSE-alive agents exist → unanimous vote required.
     /// - Transfer:    a governor already exists → current governor(s) must approve.
+    ///
+    /// `_expiry` is accepted for wire compatibility (`POST /governors/claim` still takes an
+    /// optional `expiry_secs`) but unused under FR2: the governor flag rides on the claimant's own
+    /// permanent participant token, which never expires — there is no separate governor
+    /// credential left to carry an expiry.
     #[allow(clippy::type_complexity)] // deliberate: local tuple packs heterogeneous per-voter notification state
     pub fn claim_governorship(
         &self,
         claimant_token: &str,
-        expiry: Option<Duration>,
+        _expiry: Option<Duration>,
     ) -> Result<ClaimOutcome, Error> {
         // Collect data and determine outcome inside the lock; fire notifies outside.
         let (outcome, notify_pairs) = {
@@ -1096,8 +1139,14 @@ impl DeliveryHub {
 
             if inner.trust.has_active_governor() {
                 // ── Transfer path ─────────────────────────────────────────
-                let required: std::collections::HashSet<String> =
-                    inner.trust.active_governor_tokens().into_iter().collect();
+                // Singleton model (FR2/OQ1): at most one governor identity exists at a time, so
+                // `required` holds at most that one identity NAME (never a token id).
+                let required: std::collections::HashSet<String> = inner
+                    .trust
+                    .governor_identity()
+                    .map(|s| s.to_string())
+                    .into_iter()
+                    .collect();
 
                 inner.pending_claims.insert(
                     claim_id.clone(),
@@ -1145,28 +1194,22 @@ impl DeliveryHub {
                     .collect();
 
                 if required.is_empty() {
-                    // Auto-grant: no one else to approve.
-                    let gov = inner.trust.install_governor(expiry);
-                    let tok = gov.0.clone();
+                    // Auto-grant: no one else to approve. FR2: set the flag on the candidate's
+                    // OWN existing identity — no credential is minted.
+                    inner.trust.set_governor(&candidate_name);
+                    let identity = candidate_name.clone();
                     // Persist outside the lock via db_write (token_store may be None in tests).
                     let store_opt = self.token_store.clone();
-                    let expires_at =
-                        expiry.map(|d| SystemTime::now() + d.min(crate::types::MAX_EXPIRY));
                     drop(inner); // release lock before db_write
                     if let Some(store) = store_opt {
-                        let tok2 = tok.clone();
+                        let identity2 = identity.clone();
                         self.db_write(async move {
-                            if let Err(e) = store
-                                .upsert_token(&tok2, &tok2, "governor", expires_at)
-                                .await
-                            {
+                            if let Err(e) = store.set_governor(&identity2).await {
                                 eprintln!("WARNING: token store write failed: {e}");
                             }
                         });
                     }
-                    return Ok(ClaimOutcome::Granted {
-                        governor_token: tok,
-                    });
+                    return Ok(ClaimOutcome::Granted { identity });
                 }
 
                 // Election: insert claim and notify each voter via their message queue.
@@ -1269,16 +1312,17 @@ impl DeliveryHub {
             // Authorize and determine the approval key.
             let approval_key: String = match kind {
                 ClaimKind::Transfer => {
-                    // Approver must be a valid governor whose token is in required.
-                    let gov = GovernorToken(approver_token.to_string());
-                    inner
-                        .trust
-                        .validate_governor_token(&gov)
-                        .map_err(|_| Error::Forbidden)?;
-                    if !required.contains(approver_token) {
+                    // Approver must be the current governor (FR2: resolved from their own
+                    // participant token, never a separate credential) and in `required`.
+                    let name = inner
+                        .token_to_name
+                        .get(approver_token)
+                        .cloned()
+                        .ok_or(Error::Forbidden)?;
+                    if !inner.trust.is_governor(&name) || !required.contains(&name) {
                         return Err(Error::Forbidden);
                     }
-                    approver_token.to_string()
+                    name
                 }
                 ClaimKind::Election => {
                     // Approver must be an announced agent whose name is in required.
@@ -1355,13 +1399,13 @@ impl DeliveryHub {
                 });
             }
 
-            // All approved: install new governor.
-            let is_transfer = kind == ClaimKind::Transfer;
-            if is_transfer {
-                inner.trust.revoke_all_governors();
-            }
-            let gov = inner.trust.install_governor(None);
-            let gov_tok_str = gov.0.clone();
+            // All approved: set the governor flag on the candidate's OWN existing identity
+            // (FR2). For a transfer this single repoint both revokes the outgoing governor and
+            // installs the incoming one — the singleton pointer has nothing else to clear (OQ1).
+            // No credential is minted; `_is_transfer` documents the case for readers, kept for
+            // clarity even though the repoint logic no longer branches on it.
+            let _is_transfer = kind == ClaimKind::Transfer;
+            inner.trust.set_governor(&candidate_name);
 
             // Remove claim.
             inner.pending_claims.remove(claim_id);
@@ -1371,7 +1415,7 @@ impl DeliveryHub {
                 "type": "governance",
                 "event": "governorship_granted",
                 "claim_id": claim_id,
-                "governor_token": &gov_tok_str,
+                "identity": &candidate_name,
             })
             .to_string();
 
@@ -1398,18 +1442,17 @@ impl DeliveryHub {
             (
                 ClaimResolution::Established {
                     candidate_name: candidate_name.clone(),
-                    governor_token: gov_tok_str.clone(),
                 },
-                Some((gov_tok_str, notify, ntx)),
+                Some((candidate_name, notify, ntx)),
             )
         }; // lock released
 
-        if let Some((tok, notify, ntx)) = post_lock {
-            // Persist the new governor token.
+        if let Some((identity, notify, ntx)) = post_lock {
+            // Persist the new governor identity.
             if let Some(store) = self.token_store.clone() {
-                let t = tok.clone();
+                let id = identity.clone();
                 self.db_write(async move {
-                    if let Err(e) = store.upsert_token(&t, &t, "governor", None).await {
+                    if let Err(e) = store.set_governor(&id).await {
                         eprintln!("WARNING: token store write failed: {e}");
                     }
                 });
@@ -1447,8 +1490,16 @@ impl DeliveryHub {
     ) -> Result<String, Error> {
         // FP1 fix: if names weren't supplied by the caller, look them up from token_to_name.
         // For listen-flow agents identity == token, so token_to_name gives us the stable name.
-        let req = {
+        // Also resolve+validate the governor bearer here (FR2): governance rides on the
+        // presenting participant's own token, checked against the singleton governor pointer.
+        let (req, gov_identity) = {
             let inner = self.lock();
+            inner.validate_governor_token(gov)?;
+            let gov_identity = inner
+                .token_to_name
+                .get(&gov.0)
+                .cloned()
+                .unwrap_or_default();
             let mut r = req;
             if r.name_a.is_none() {
                 r.name_a = inner.token_to_name.get(id_a).cloned();
@@ -1456,12 +1507,12 @@ impl DeliveryHub {
             if r.name_b.is_none() {
                 r.name_b = inner.token_to_name.get(id_b).cloned();
             }
-            r
+            (r, gov_identity)
         };
-        let grant_id = self
-            .lock()
-            .trust
-            .approve_grant_req(gov, id_a, id_b, expiry, req.clone())?;
+        let grant_id =
+            self.lock()
+                .trust
+                .approve_grant_req(&gov_identity, id_a, id_b, expiry, req.clone())?;
         if let Some(store) = self.token_store.clone() {
             let gid = grant_id.clone();
             let a = id_a.to_string();
@@ -1481,7 +1532,7 @@ impl DeliveryHub {
             let max_msg = req.max_messages;
             let cond = req.conditions.clone();
             let orw = req.opens_reply_window.unwrap_or(true);
-            let gov_id = gov.0.clone();
+            let gov_id = gov_identity.clone();
             let expires_at = expiry.map(|d| SystemTime::now() + d.min(crate::types::MAX_EXPIRY));
             let na = req.name_a.clone();
             let nb = req.name_b.clone();
@@ -1600,7 +1651,11 @@ impl DeliveryHub {
             ) {
                 Ok(grant_ref) => match grant_ref.mediation {
                     GrantMediation::Inspect => {
-                        if !inner.trust.is_governor_id_online(&grant_ref.governor_id) {
+                        // FR2: "is the approving governor still around to inspect this?" now
+                        // means "does `governor_id` (an identity name, or the governorless
+                        // `recipient-consent` sentinel) still hold the governor flag?" — there is
+                        // no more separate online/offline session state to check (OQ6).
+                        if !inner.trust.is_governor(&grant_ref.governor_id) {
                             return Err(Error::MediationUnavailable);
                         }
                         inner.med_counter += 1;
@@ -2009,7 +2064,7 @@ impl DeliveryHub {
         let (to_name, notify, consumed_grant_id, ntx) = {
             let mut inner = self.lock();
             inner.prune_expired();
-            inner.trust.validate_governor_token(gov_token)?;
+            inner.validate_governor_token(gov_token)?;
 
             let now = Instant::now();
             let idx = inner
@@ -2023,7 +2078,16 @@ impl DeliveryHub {
             let (opens_reply_window, consumed_grant_id) = if let Some(ref gid) = hold_grant_id {
                 let expected_gov = inner.trust.grant_governor_id(gid).map(|s| s.to_string());
                 let expected_gov = expected_gov.ok_or(Error::MediationUnavailable)?;
-                if gov_token.0 != expected_gov {
+                // FR2: `expected_gov` is the approving IDENTITY NAME stored on the grant, never a
+                // raw bearer token — resolve the caller's own identity via `token_to_name` before
+                // comparing (a governor's bearer is an ordinary participant token, not the
+                // identity name itself).
+                let caller_identity = inner
+                    .token_to_name
+                    .get(&gov_token.0)
+                    .cloned()
+                    .unwrap_or_default();
+                if caller_identity != expected_gov {
                     return Err(Error::Forbidden);
                 }
                 let consumed = if matches!(
@@ -2125,7 +2189,7 @@ impl DeliveryHub {
     pub fn revoke_by_name(&self, name: &str, gov: &GovernorToken) -> Result<(), Error> {
         let (sse_sender, settle_opt, settle_window) = {
             let mut inner = self.lock();
-            inner.trust.validate_governor_token(gov)?;
+            inner.validate_governor_token(gov)?;
             // Begin settle BEFORE removing name from maps (presence push AC4 / TR4).
             let settle_opt = inner.begin_settle_offline(name);
             let settle_window = inner.settle_window;
@@ -2215,13 +2279,14 @@ impl DeliveryHub {
         participant_filter: Option<&str>,
     ) -> Result<Vec<crate::trust::AllGrantItem>, Error> {
         let inner = self.lock();
-        inner.trust.validate_governor_token(gov)?;
+        inner.validate_governor_token(gov)?;
         Ok(inner.trust.list_all_grants(participant_filter))
     }
 
-    /// Validates the governor token.
+    /// Validates the governor token (FR2: resolves the bearer to a participant identity and
+    /// checks it against the singleton governor pointer — see `HubInner::validate_governor_token`).
     pub fn validate_governor_token(&self, token: &GovernorToken) -> Result<(), Error> {
-        self.lock().trust.validate_governor_token(token)
+        self.lock().validate_governor_token(token)
     }
 
     /// List all registered agents with their identity and effective status.
@@ -2229,7 +2294,7 @@ impl DeliveryHub {
     /// Hidden agents always appear offline even to governors.
     pub fn list_participants(&self, gov: &GovernorToken) -> Result<Vec<ParticipantInfo>, Error> {
         let inner = self.lock();
-        inner.trust.validate_governor_token(gov)?;
+        inner.validate_governor_token(gov)?;
         let mut result: Vec<ParticipantInfo> = inner
             .agents
             .iter()
@@ -2270,106 +2335,78 @@ impl DeliveryHub {
         from: &GovernorToken,
         to_identity: Option<&str>,
     ) -> Result<String, Error> {
-        self.lock().trust.transfer_governor(from, to_identity)
+        let mut inner = self.lock();
+        inner.validate_governor_token(from)?;
+        let from_identity = inner
+            .token_to_name
+            .get(&from.0)
+            .cloned()
+            .ok_or(Error::AuthFailed)?;
+        inner.trust.transfer_governor(&from_identity, to_identity)
     }
 
     /// Accept a pending governor transfer (FG-5 / security-MAJOR-3). The claiming identity is
     /// derived from the **verified participant bearer** — never from the request body. `bearer`
-    /// must be a current named participant token. Revokes the initiating governor; returns the
-    /// new governor token.
+    /// must be a current named participant token. FR2: the governor flag simply moves to the
+    /// accepting identity's own existing token — no new credential is minted or returned.
     ///
     /// Errors: `AuthFailed` (bearer is not a named participant), `RecipientUnknown` (transfer
     /// token not found or already consumed → 404), `Forbidden` (transfer's to_identity is set
     /// and does not match the bearer's name → 403).
-    pub fn accept_governor_transfer(
-        &self,
-        bearer: &str,
-        transfer_token: &str,
-    ) -> Result<GovernorToken, Error> {
-        let (new_token, expiry_instant) = {
-            let mut inner = self.lock();
-            // Resolve the claiming identity from the verified participant bearer.
-            let is_live_participant = inner
-                .listen_tokens
-                .get(bearer)
-                .map(|s| !s.revoked)
-                .unwrap_or(false);
-            if !is_live_participant {
-                return Err(Error::AuthFailed);
-            }
-            let name = inner
-                .token_to_name
-                .get(bearer)
-                .cloned()
-                .ok_or(Error::AuthFailed)?;
-            let new_token = match inner.trust.accept_governor_transfer(transfer_token, &name) {
-                Ok(t) => t,
-                // trust returns AuthFailed when the transfer token is unknown/consumed → 404.
-                Err(Error::AuthFailed) => return Err(Error::RecipientUnknown),
-                Err(e) => return Err(e),
-            };
-            let expiry_instant = inner.trust.governor_expiry(&new_token);
-            (new_token, expiry_instant)
-        };
+    pub fn accept_governor_transfer(&self, bearer: &str, transfer_token: &str) -> Result<(), Error> {
+        let mut inner = self.lock();
+        // Resolve the claiming identity from the verified participant bearer.
+        let is_live_participant = inner
+            .listen_tokens
+            .get(bearer)
+            .map(|s| !s.revoked)
+            .unwrap_or(false);
+        if !is_live_participant {
+            return Err(Error::AuthFailed);
+        }
+        let name = inner
+            .token_to_name
+            .get(bearer)
+            .cloned()
+            .ok_or(Error::AuthFailed)?;
+        match inner.trust.accept_governor_transfer(transfer_token, &name) {
+            Ok(()) => {}
+            // trust returns AuthFailed when the transfer token is unknown/consumed → 404.
+            Err(Error::AuthFailed) => return Err(Error::RecipientUnknown),
+            Err(e) => return Err(e),
+        }
+        drop(inner);
         if let Some(store) = self.token_store.clone() {
-            let new = new_token.0.clone();
-            let expires_at = expiry_instant.map(instant_to_system_time);
+            let id = name.clone();
             self.db_write(async move {
-                if let Err(e) = store.upsert_token(&new, &new, "governor", expires_at).await {
+                if let Err(e) = store.set_governor(&id).await {
                     eprintln!("WARNING: token store write failed: {e}");
                 }
             });
         }
-        Ok(new_token)
+        Ok(())
     }
 
-    /// Operator-anchored governor reset (POST /admin/governor/reset). In one locked section:
-    /// revoke every current governor, clear all pending transfers (so an in-flight transfer
-    /// cannot bypass the revoke), and install a fresh governor. The state change is committed to
-    /// SQLite in a single transaction (DELETE old governors + INSERT new) — no crash window
-    /// between revoke and install. Returns the new governor token. (security-MAJOR-1/2, M2)
-    pub fn admin_reset_governor(&self) -> GovernorToken {
-        let (new_token, revoked) = {
+    /// Operator-anchored governor reset (POST /admin/governor/reset). Clears the governor
+    /// pointer and all pending transfers in one locked section. FR1 forbids minting a fresh,
+    /// nameless credential here (there would be no participant identity behind it) — this is now
+    /// purely a "clear governor, re-open bootstrap" escape hatch; a legitimate participant claims
+    /// governorship fresh afterward via the normal `POST /governors/claim` flow (which, with the
+    /// pointer cleared, sees `has_active_governor() == false` and auto-grants or elects as usual).
+    /// (security-MAJOR-1/2, M2 — adapted for 15-0040 FR1/FR2)
+    pub fn admin_reset_governor(&self) {
+        {
             let mut inner = self.lock();
-            let revoked = inner.trust.revoke_all_governors();
+            inner.trust.clear_governor();
             inner.trust.clear_pending_transfers();
-            let new_token = inner.trust.install_governor(None);
-            (new_token, revoked)
-        };
+        }
         if let Some(store) = self.token_store.clone() {
-            let new = new_token.0.clone();
             self.db_write(async move {
-                if let Err(e) = store.reset_governors(&revoked, &new).await {
+                if let Err(e) = store.clear_governor().await {
                     eprintln!("WARNING: admin governor reset DB write failed: {e}");
                 }
             });
         }
-        new_token
-    }
-
-    /// Rotate the caller's governor token atomically. Old token is immediately invalidated.
-    pub fn refresh_governor_token(
-        &self,
-        old_token: &GovernorToken,
-    ) -> Result<GovernorToken, Error> {
-        let (new_token, expiry_instant) = {
-            let mut inner = self.lock();
-            let new_token = inner.trust.rotate_governor_token(old_token)?;
-            let expiry_instant = inner.trust.governor_expiry(&new_token);
-            (new_token, expiry_instant)
-        };
-        if let Some(store) = self.token_store.clone() {
-            let old = old_token.0.clone();
-            let new = new_token.0.clone();
-            let expires_at = expiry_instant.map(instant_to_system_time);
-            self.db_write(async move {
-                let _ = store.delete_token(&old).await;
-                if let Err(e) = store.upsert_token(&new, &new, "governor", expires_at).await {
-                    eprintln!("WARNING: token store write failed: {e}");
-                }
-            });
-        }
-        Ok(new_token)
     }
 
     // ── Grant request flow ────────────────────────────────────────────────────
@@ -2582,7 +2619,6 @@ impl DeliveryHub {
                 .ok_or(Error::BadRequest)?;
 
             let is_governor = inner
-                .trust
                 .validate_governor_token(&GovernorToken(token_str.to_string()))
                 .is_ok();
             let to_identity = req.to_identity.clone();
@@ -2605,6 +2641,14 @@ impl DeliveryHub {
                 }
             }
 
+            // Resolve the approving governor's stable identity name now (FR2) — grants are
+            // keyed by identity, never by a raw bearer token.
+            let approving_governor_identity = inner
+                .token_to_name
+                .get(token_str)
+                .cloned()
+                .unwrap_or_else(|| token_str.to_string());
+
             let req_mut = inner
                 .connection_requests
                 .get_mut(request_id)
@@ -2612,7 +2656,7 @@ impl DeliveryHub {
             match req_mut.stage {
                 ConnectionStage::PendingGovernor => {
                     req_mut.governor_expiry = expiry;
-                    req_mut.approving_governor = Some(token_str.to_string());
+                    req_mut.approving_governor = Some(approving_governor_identity);
                     req_mut.stage = ConnectionStage::PendingRecipient;
                     // Reset the timeout so the recipient gets a fresh 30 min.
                     req_mut.expires_at = Instant::now() + GRANT_REQUEST_TIMEOUT;
@@ -2663,7 +2707,7 @@ impl DeliveryHub {
                     let to_identity = req_mut.to_identity.clone();
                     let gov_expiry = req_mut.governor_expiry;
                     let rec_expiry = req_mut.recipient_expiry;
-                    let gov_tok_str = req_mut
+                    let gov_identity_str = req_mut
                         .approving_governor
                         .clone()
                         .ok_or(Error::BadRequest)?;
@@ -2675,14 +2719,13 @@ impl DeliveryHub {
                         (Some(g), Some(r)) => Some(g.min(r)),
                     };
 
-                    let gov_tok = GovernorToken(gov_tok_str.clone());
                     // FP1 fix: pass stable names so the grant survives identity rotation on reconnect.
                     let grant_req = ApproveGrantRequest {
                         name_a: Some(from_name.clone()),
                         name_b: Some(to_name.clone()),
                         ..ApproveGrantRequest::default()
                     };
-                    let grant_result = if gov_tok_str == "recipient-consent" {
+                    let grant_result = if gov_identity_str == "recipient-consent" {
                         // Governorless: the recipient's approval alone establishes the grant.
                         inner.trust.create_consent_grant(
                             &from_identity,
@@ -2692,7 +2735,7 @@ impl DeliveryHub {
                         )
                     } else {
                         inner.trust.approve_grant_req(
-                            &gov_tok,
+                            &gov_identity_str,
                             &from_identity,
                             &to_identity,
                             grant_expiry,
@@ -2765,7 +2808,7 @@ impl DeliveryHub {
                             grant_id,
                             from_identity,
                             to_identity,
-                            gov_tok_str,
+                            gov_identity_str,
                             from_name,
                             to_name,
                         )),
@@ -2841,7 +2884,6 @@ impl DeliveryHub {
                 .ok_or(Error::BadRequest)?;
 
             let is_governor = inner
-                .trust
                 .validate_governor_token(&GovernorToken(token_str.to_string()))
                 .is_ok();
             let to_identity = req.to_identity.clone();
@@ -2922,7 +2964,6 @@ impl DeliveryHub {
     ) -> Result<(), Error> {
         let mut inner = self.lock();
         let is_governor = inner
-            .trust
             .validate_governor_token(&GovernorToken(token_str.to_string()))
             .is_ok();
         if !is_governor {
@@ -2956,7 +2997,7 @@ impl DeliveryHub {
     ) -> Result<(), Error> {
         {
             let mut inner = self.lock();
-            inner.trust.validate_governor_token(gov)?;
+            inner.validate_governor_token(gov)?;
             inner.denial_blocks.insert(
                 (from_identity.to_string(), to_name.to_string()),
                 DenialBlock {
@@ -2984,7 +3025,7 @@ impl DeliveryHub {
     pub fn revoke_grant(&self, grant_id: &str, gov: &GovernorToken) -> Result<(), Error> {
         let senders = {
             let mut inner = self.lock();
-            inner.trust.validate_governor_token(gov)?;
+            inner.validate_governor_token(gov)?;
 
             // Look up both parties of the grant.
             let parties = inner.trust.grant_parties(grant_id).ok_or(Error::NoGrant)?;
@@ -3061,7 +3102,6 @@ impl DeliveryHub {
                 .ok_or(Error::BadRequest)?;
 
             let is_governor = inner
-                .trust
                 .validate_governor_token(&GovernorToken(token_str.to_string()))
                 .is_ok();
             let to_identity = req.to_identity.clone();
@@ -3170,8 +3210,12 @@ impl DeliveryHub {
         }
     }
 
-    /// True if `token` is a current (non-revoked) participant (listen) token. Used by the
-    /// /register handler to return 403 (not 401) when a participant presents its own token.
+    /// True if `token` is a current (non-revoked) participant (listen) token.
+    ///
+    /// 15-0040 note: no longer usable to distinguish "participant" from "governor" — under FR2 a
+    /// governor's bearer IS an ordinary participant token, so this returns true for governors too.
+    /// Retained as a general validity predicate; callers needing "is this bearer the governor?"
+    /// must use `validate_governor_token` instead (see `handle_register`'s 15-0040 note).
     pub fn is_participant_token(&self, token: &str) -> bool {
         self.lock()
             .listen_tokens
@@ -3198,7 +3242,7 @@ impl DeliveryHub {
     ) -> Result<(String, Option<String>), Error> {
         let (new_token, bound, old_token) = {
             let mut inner = self.lock();
-            inner.trust.validate_governor_token(gov)?;
+            inner.validate_governor_token(gov)?;
 
             let mut rng = rand::thread_rng();
             let mint = |inner: &mut HubInner, rng: &mut rand::rngs::ThreadRng| -> String {
@@ -3331,32 +3375,15 @@ impl DeliveryHub {
 
                 provided_token.to_string()
             } else {
-                // Unknown token — check if it's a governor token (governor session-link flow).
-                // Governors may present their governor token to /listen to establish an identity
-                // link so that announce() can later enqueue the governor_role breadcrumb.
-                let gov_candidate = GovernorToken(provided_token.to_string());
-                if inner.trust.validate_governor_token(&gov_candidate).is_ok() {
-                    // Mint a new listen token and link the governor identity to it.
-                    let mut rng = rand::thread_rng();
-                    let new_tok = loop {
-                        let digits: u64 = rng.gen_range(10_000_000..=999_999_999_999);
-                        let t = digits.to_string();
-                        if !inner.listen_tokens.contains_key(&t) {
-                            break t;
-                        }
-                    };
-                    inner
-                        .listen_tokens
-                        .insert(new_tok.clone(), ListenTokenState::new());
-                    new_tok
-                } else {
-                    // Not a listen token or governor token — auth failed.
-                    drop(inner);
-                    for (name, senders, cancel_rx) in gc_offline_events {
-                        spawn_settle_task(name, senders, settle_window, cancel_rx);
-                    }
-                    return Err(Error::AuthFailed);
+                // Unknown token — not authenticated. 15-0040 (FR2) retires the old "governor
+                // session link" special case: a governor's bearer is always an ordinary
+                // participant token, so it would already have matched the `contains_key` branch
+                // above. A token found nowhere in `listen_tokens` is simply invalid.
+                drop(inner);
+                for (name, senders, cancel_rx) in gc_offline_events {
+                    spawn_settle_task(name, senders, settle_window, cancel_rx);
                 }
+                return Err(Error::AuthFailed);
             };
 
             let (tx, rx) = mpsc::unbounded_channel::<String>();
@@ -3442,20 +3469,10 @@ impl DeliveryHub {
             }
             *inner.sse_connections.entry(token.clone()).or_insert(0) += 1;
 
-            // Governor session link: if the bearer was a governor token (not a listen token),
-            // record the link on the new listen session so announce() can enqueue the breadcrumb.
-            if let Some(prov_tok) = token_opt
-                && prov_tok != token.as_str()
-            {
-                // The provided bearer generated a new listen token — check if it's a governor.
-                let gov_tok = GovernorToken(prov_tok.to_string());
-                if inner.trust.validate_governor_token(&gov_tok).is_ok() {
-                    inner.trust.link_governor_session(prov_tok, &token);
-                    if let Some(st) = inner.listen_tokens.get_mut(&token) {
-                        st.governor_id = Some(prov_tok.to_string());
-                    }
-                }
-            }
+            // 15-0040 (FR2): the old "governor session link" special case is retired — a
+            // governor's bearer is always an ordinary participant token already present in
+            // `listen_tokens` (never a distinct credential), so `token == provided_token`
+            // unconditionally here. There is nothing left to link.
 
             // Fix 2: attempt inline name binding if requested.
             let (_name_in_use, _holder_identity, bound_name_for_persist) =
@@ -3481,39 +3498,33 @@ impl DeliveryHub {
                         inner.bind_name(&token, name);
                         // Cancel any pending settle task (name is being freshly bound).
                         inner.cancel_settle_online(name);
+                        // Governor breadcrumb: `install_governor` (and any other caller that
+                        // binds a name inline via /listen) no longer goes through `announce()`
+                        // separately, so the same one-time role reminder must be enqueued here
+                        // too. The catch-up notify check just below already reads
+                        // `message_queues[name]`, so no extra notify wiring is needed — it picks
+                        // this up automatically.
+                        if inner.trust.is_governor(name) {
+                            maybe_enqueue_governor_breadcrumb(&mut inner, name);
+                        }
                         (false, None, Some(name.to_string()))
                     }
                 } else {
                     (false, None, None)
                 };
 
-            // Emit service/welcome — the agent's entry point.
-            // Normal participants already know their token (from POST /register) so we
-            // do not echo it back. Exception: governor session-link path presents a governor
-            // token and receives a newly minted listen token — the agent does NOT have it yet,
-            // so we include it in the welcome so they can use it for announce/dequeue.
-            // AC8: Both paths now include subscription_id for unambiguous subscription identity.
+            // Emit service/welcome — the agent's entry point. Participants already know their
+            // token (from POST /register) so we do not echo it back.
+            // AC8: subscription_id is included for unambiguous subscription identity.
             {
                 let name_opt = inner.listen_tokens.get(&token).and_then(|s| s.name.clone());
-                let governor_minted = token.as_str() != provided_token;
-                let welcome = if governor_minted {
-                    serde_json::json!({
-                        "type": "service",
-                        "event": "welcome",
-                        "subscription_id": &token,
-                        "token": &token,
-                        "name": name_opt,
-                        "instructions": "Call POST /announce to register your name. You will receive notify events when messages arrive — call POST /messages/dequeue to retrieve them.",
-                    })
-                } else {
-                    serde_json::json!({
-                        "type": "service",
-                        "event": "welcome",
-                        "subscription_id": &token,
-                        "name": name_opt,
-                        "instructions": "Call POST /announce to register your name. You will receive notify events when messages arrive — call POST /messages/dequeue to retrieve them.",
-                    })
-                }
+                let welcome = serde_json::json!({
+                    "type": "service",
+                    "event": "welcome",
+                    "subscription_id": &token,
+                    "name": name_opt,
+                    "instructions": "Call POST /announce to register your name. You will receive notify events when messages arrive — call POST /messages/dequeue to retrieve them.",
+                })
                 .to_string();
                 let _ = tx.send(welcome);
             }
@@ -3862,20 +3873,15 @@ impl DeliveryHub {
             PresenceScope::GrantScoped,
         );
 
-        // Governor breadcrumb: if this session was opened with a governor token as bearer,
-        // enqueue the role breadcrumb once so the governor knows its responsibilities.
-        let gov_notify_val = {
-            let gov_id_opt = inner
-                .listen_tokens
-                .get(token)
-                .and_then(|s| s.governor_id.clone());
-            if let Some(ref gov_id) = gov_id_opt {
-                inner.trust.link_governor_session(gov_id, token);
-                maybe_enqueue_governor_breadcrumb(&mut inner, name);
-                inner.take_notify(name)
-            } else {
-                None
-            }
+        // Governor breadcrumb: if the identity just (re)bound to this token currently holds the
+        // governor flag, enqueue the role breadcrumb once so the governor knows its
+        // responsibilities. FR2: this is now a direct identity check — no separate "was this
+        // session opened with a governor credential" session-link state to consult.
+        let gov_notify_val = if inner.trust.is_governor(name) {
+            maybe_enqueue_governor_breadcrumb(&mut inner, name);
+            inner.take_notify(name)
+        } else {
+            None
         };
 
         // Presence push (AC1 / TR1): cancel any pending settle task and collect opted-in
@@ -4109,7 +4115,7 @@ impl DeliveryHub {
     pub fn revoke_token(&self, token: &str, gov: &GovernorToken) -> Result<(), Error> {
         let (sender, settle_opt, settle_window, revoked_name) = {
             let mut inner = self.lock();
-            inner.trust.validate_governor_token(gov)?;
+            inner.validate_governor_token(gov)?;
             // Collect the bound name and begin settle BEFORE marking revoked.
             let revoked_name = inner.token_to_name.get(token).cloned();
             let settle_opt = if let Some(ref name) = revoked_name {
@@ -5236,18 +5242,17 @@ mod tests {
         );
     }
 
-    /// No grant + governor offline → send returns NoGrant; request_grant creates ConnectionRequest without governor online.
+    /// No grant → send returns NoGrant; request_grant still creates a ConnectionRequest.
+    /// (15-0040 OQ6: the old governor online/offline session-gate is retired — a governor's
+    /// authority is now just the flag on their permanent identity, with no separate liveness
+    /// state to toggle — so this no longer exercises an "offline governor" case specifically,
+    /// only that request_grant works independent of the governor's own activity.)
     #[test]
-    fn no_grant_no_governor_still_creates_request() {
+    fn no_grant_still_creates_request() {
         let hub = make_hub(Duration::from_secs(30));
-        let gov = hub.install_governor(None);
+        let _gov = hub.install_governor(None);
         let tok_a = test_mint(&hub).unwrap();
         let tok_b = test_mint(&hub).unwrap();
-        hub.inner
-            .lock()
-            .unwrap()
-            .trust
-            .set_governor_online(&gov, false);
         test_bind(&hub, "alice", &tok_a, PresenceScope::GrantScoped).unwrap();
         test_bind(&hub, "bob", &tok_b, PresenceScope::GrantScoped).unwrap();
 
@@ -5266,7 +5271,7 @@ mod tests {
         );
         let request_id = hub
             .request_grant(&tok_a.0, "bob", Some("reason".into()), None)
-            .expect("request_grant must succeed regardless of governor online status");
+            .expect("request_grant must succeed");
         assert!(!request_id.is_empty(), "connection request must be created");
     }
 
@@ -5486,18 +5491,18 @@ mod tests {
         ));
     }
 
-    /// Inspect: governor offline at send time → MediationUnavailable (no hold created).
+    /// Inspect: the approving governor no longer holds the governor flag → MediationUnavailable
+    /// (no hold created). 15-0040 (OQ6): replaces the old governor online/offline session-gate,
+    /// which is retired — there is no more separate liveness state, only "is/isn't currently
+    /// governor" (`TrustChain::is_governor`), so this exercises governance having moved on
+    /// (e.g. cleared/transferred) instead of an offline toggle.
     #[test]
-    fn inspect_governor_offline_returns_mediation_unavailable() {
-        let (hub, gov, tok_a, tok_b) = setup_hub_inspect();
+    fn inspect_governor_no_longer_governor_returns_mediation_unavailable() {
+        let (hub, _gov, tok_a, tok_b) = setup_hub_inspect();
         test_bind(&hub, "alice", &tok_a, PresenceScope::Public).unwrap();
         test_bind(&hub, "bob", &tok_b, PresenceScope::Public).unwrap();
 
-        hub.inner
-            .lock()
-            .unwrap()
-            .trust
-            .set_governor_online(&gov, false);
+        hub.inner.lock().unwrap().trust.clear_governor();
 
         assert!(matches!(
             hub.send(&tok_a, "bob", Payload(b"hi".to_vec()), None, None),
@@ -5888,7 +5893,10 @@ mod tests {
 
     // ── Agent list tests (AC1–AC5 / Feature 1) ───────────────────────────────
 
-    /// AC1 + AC5: governor_list_participants — register 2 agents, list shows both with correct fields.
+    /// AC1 + AC5: governor_list_participants — register 2 agents, list shows both with correct
+    /// fields. 15-0040 (FR2): the roster now also includes the governor's OWN synthetic identity
+    /// (`install_governor` mints and binds a real participant identity — governance is a flag on
+    /// a participant, not a separate out-of-roster credential), so the expected count is 3, not 2.
     #[test]
     fn governor_list_participants() {
         let hub = make_hub(Duration::from_secs(30));
@@ -5899,7 +5907,7 @@ mod tests {
         test_bind(&hub, "bob", &tok_b, PresenceScope::GrantScoped).unwrap();
 
         let agents = hub.list_participants(&gov).unwrap();
-        assert_eq!(agents.len(), 2);
+        assert_eq!(agents.len(), 3, "alice, bob, and the governor's own identity");
 
         // Listen-flow identity == token (unlike the deleted minted-agent path).
         let alice = agents.iter().find(|a| a.name == "alice").unwrap();
@@ -5909,12 +5917,20 @@ mod tests {
         let bob = agents.iter().find(|a| a.name == "bob").unwrap();
         assert_eq!(bob.identity, tok_b.0);
         assert_eq!(bob.status, "online");
+
+        // The governor's own identity is a real roster entry, reachable via its own token.
+        assert_eq!(
+            agents.iter().filter(|a| a.identity == gov.0).count(),
+            1,
+            "governor's own participant identity must appear exactly once"
+        );
     }
 
-    /// AC2 (updated for 15-0030): participant token → AuthFailed (was Forbidden / 403
-    /// FORBIDDEN at the HTTP layer). See ac_gov_grants_6_7_8_auth_errors's AC8 comment — the
-    /// Forbidden-for-agent-token distinction was specific to the now-deleted
-    /// TrustChain.agents-backed minted agent token; a listen token here yields AuthFailed.
+    /// AC2 (updated again for 15-0040 AC-2): a valid participant token without the governor flag
+    /// is rejected with Forbidden (403), not AuthFailed. This flips the 15-0030 update once more —
+    /// under FR1/FR2 a listen token IS a real, live credential (just not the governor's), which is
+    /// exactly the Forbidden case AC-2 specifies; only a wholly unknown/revoked bearer is
+    /// AuthFailed now (see `HubInner::validate_governor_token`).
     #[test]
     fn list_participants_rejects_participant_token() {
         let hub = make_hub(Duration::from_secs(30));
@@ -5923,8 +5939,8 @@ mod tests {
 
         let fake_gov = GovernorToken(tok_a.0.clone());
         assert!(
-            matches!(hub.list_participants(&fake_gov), Err(Error::AuthFailed)),
-            "participant token must be rejected with AuthFailed for list_participants"
+            matches!(hub.list_participants(&fake_gov), Err(Error::Forbidden)),
+            "participant token must be rejected with Forbidden for list_participants"
         );
     }
 
@@ -5961,26 +5977,12 @@ mod tests {
     // So AC6-AC8, AC10, and the token-rotation-specific `agent_refresh_preserves_registration`
     // are removed rather than converted: there is nothing left to convert them to that isn't
     // already tested.
-
-    /// AC9: governor refresh returns new token; old governor token invalidated.
-    #[test]
-    fn ac9_governor_token_refresh() {
-        let hub = make_hub(Duration::from_secs(30));
-        let gov = hub.install_governor(None);
-
-        let new_gov = hub.refresh_governor_token(&gov).unwrap();
-
-        assert_ne!(new_gov.0, gov.0);
-
-        assert!(
-            matches!(hub.validate_governor_token(&gov), Err(Error::AuthFailed)),
-            "old governor token must be invalidated after refresh"
-        );
-        assert!(
-            hub.validate_governor_token(&new_gov).is_ok(),
-            "new governor token must be valid after refresh"
-        );
-    }
+    //
+    // 15-0040 (FR1/FR2): AC9 (`refresh_governor_token` / `POST /governors/refresh`) is now ALSO
+    // removed, for the same "nothing left to convert it to" reason as its siblings above: a
+    // governor's bearer is its own permanent participant token (FR1), never a separate credential,
+    // so there is no more distinct "governor token" left to rotate independent of the participant
+    // token itself. `ac9_governor_token_refresh` is deleted rather than adapted.
 
     // ── Bilateral consent tests (AC1–AC8 for task 20-9008) ───────────────────
 
@@ -6230,6 +6232,7 @@ mod tests {
             .await
             .expect("load denial blocks");
         let identities = store.load_identities().await.expect("load identities");
+        let governor = store.load_governor().await.expect("load governor");
         DeliveryHub::new_with_persisted_state(
             lapse,
             store,
@@ -6237,6 +6240,7 @@ mod tests {
             grants,
             denial_blocks,
             identities,
+            governor,
         )
     }
 
@@ -6249,7 +6253,10 @@ mod tests {
         let grants = store.load_grants().await.expect("load grants");
         let denial = store.load_denial_blocks().await.expect("load denial");
         let identities = store.load_identities().await.expect("load identities");
-        DeliveryHub::new_with_persisted_state(lapse, store, tokens, grants, denial, identities)
+        let governor = store.load_governor().await.expect("load governor");
+        DeliveryHub::new_with_persisted_state(
+            lapse, store, tokens, grants, denial, identities, governor,
+        )
     }
 
     /// S1-AC-1: the `identities` table exists on a fresh DB.
@@ -6922,36 +6929,42 @@ mod tests {
 
     // ── 15-0029 S5: admin reset durability ─────────────────────────────────────
 
-    /// S5-AC-6: admin reset commits revoke + install in one transaction; after a restart the new
-    /// governor is durable and the old one is gone (no permanently-open bootstrap window).
+    /// S5-AC-6 (adapted for 15-0040 FR1): admin reset commits the governor-pointer clear in one
+    /// transaction; after a restart the cleared state is durable — no governor exists, and
+    /// bootstrap mode is open again. FR1 forbids minting a fresh, nameless credential here (there
+    /// is no participant identity to attach it to), so — unlike the old behavior — reset does NOT
+    /// automatically install a replacement governor; a participant must claim fresh afterward.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_s5_admin_reset_single_transaction() {
         let db = unique_test_db();
-        let (old_gov, new_gov) = {
+        let old_gov = {
             let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
             let g1 = hub.install_governor(None);
-            let g2 = hub.admin_reset_governor();
-            assert_ne!(g1.0, g2.0);
-            // In-memory: old revoked, new valid.
-            assert!(hub.validate_governor_token(&g1).is_err());
-            assert!(hub.validate_governor_token(&g2).is_ok());
-            (g1, g2)
+            assert!(hub.has_active_governor());
+            hub.admin_reset_governor();
+            // In-memory: g1's participant token is untouched (FR1: permanent), but it no longer
+            // carries the governor flag — Forbidden (valid-but-not-governor), not AuthFailed.
+            assert!(matches!(
+                hub.validate_governor_token(&g1),
+                Err(Error::Forbidden)
+            ));
+            assert!(
+                !hub.has_active_governor(),
+                "reset clears the governor pointer; no replacement is auto-installed (FR1)"
+            );
+            g1
         };
 
-        // Restart from the same DB: the new governor is durable; the old is gone.
+        // Restart from the same DB: the cleared state is durable.
         let hub2 = make_persisted_hub(&db, Duration::from_secs(30)).await;
         assert!(
-            hub2.validate_governor_token(&new_gov).is_ok(),
-            "new governor must be durable after restart"
+            !hub2.has_active_governor(),
+            "no governor must exist after restart (bootstrap reopens)"
         );
-        assert!(
-            hub2.validate_governor_token(&old_gov).is_err(),
-            "old governor must be gone after restart"
-        );
-        assert!(
-            hub2.has_active_governor(),
-            "a governor must exist after restart (no permanently-open bootstrap)"
-        );
+        assert!(matches!(
+            hub2.validate_governor_token(&old_gov),
+            Err(Error::Forbidden)
+        ));
         let _ = std::fs::remove_file(&db);
     }
 
@@ -7319,7 +7332,10 @@ mod tests {
     // ac_t5_gc_no_grant_ttl_removes_listened_never_granted_token, test_abandoned_token_gcd).
     // Removed rather than converted: there is no fixed-expiry mechanism left to test.
 
-    /// AC5: revoking a token removes it from store immediately; does not return after restart.
+    /// AC5 (adapted for 15-0040 FR2): clearing the governor pointer removes it from the store
+    /// immediately; it does not return after restart. The old test revoked a distinct `gov-N`
+    /// token row directly — under the singleton-pointer model, clearing the pointer is the
+    /// equivalent operation with the same durability property.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ac5_revoked_token_absent_after_restart() {
         let db = unique_test_db();
@@ -7327,12 +7343,10 @@ mod tests {
         let gov_tok = {
             let hub = make_persisted_hub(&db, Duration::from_secs(30)).await;
             let gov = hub.install_governor(None);
-            // Revoke in-memory and delete from the persistent store so it isn't reloaded.
-            let revoked_toks = hub.lock().trust.revoke_all_governors();
+            // Clear in-memory and persist the clear so it isn't reloaded.
+            hub.lock().trust.clear_governor();
             if let Some(store) = hub.token_store.clone() {
-                for tok in revoked_toks {
-                    let _ = store.delete_token(&tok).await;
-                }
+                let _ = store.clear_governor().await;
             }
             gov
         };
@@ -7340,7 +7354,7 @@ mod tests {
         let hub2 = make_persisted_hub(&db, Duration::from_secs(30)).await;
         assert!(
             hub2.validate_governor_token(&gov_tok).is_err(),
-            "AC5: revoked governor token must not be present after restart"
+            "AC5: cleared governor pointer must not be present after restart"
         );
 
         let _ = std::fs::remove_file(&db);
@@ -7732,27 +7746,28 @@ mod tests {
         );
     }
 
-    /// GC-AC-2: a governor listen token is never age-GC'd.
+    /// GC-AC-2 (adapted for 15-0040 OQ6): a governor's participant token is never age-GC'd — not
+    /// via any governor-specific carve-out (the old `ListenTokenState.governor_id` / "governor
+    /// session link" mechanism is retired, since a governor's bearer is now an ordinary
+    /// identity-bound participant token, FR2), but via the SAME generic identity-bound exemption
+    /// GC-AC-1 exercises for any announced participant.
     #[test]
     fn test_governor_listen_token_survives_indefinitely() {
         let hub = make_hub(Duration::from_secs(30));
         let gov = hub.install_governor(None);
-        let (tok, _rx) = hub
-            .open_listen(Some(&gov.0), None, None, None, false, false)
-            .unwrap();
         {
             let mut inner = hub.inner.lock().unwrap();
-            let st = inner.listen_tokens.get_mut(&tok).unwrap();
+            let st = inner.listen_tokens.get_mut(&gov.0).unwrap();
             assert!(
-                st.governor_id.is_some(),
-                "governor listen token must record governor_id"
+                st.name.is_some(),
+                "a governor's token must be identity-bound — no separate session-link state"
             );
             st.last_active = Instant::now() - Duration::from_secs(100_000);
         }
         let _ = hub.trigger_gc_for_test();
         assert!(
-            hub.validate_token(&tok).is_ok(),
-            "governor listen token must survive age-GC"
+            hub.validate_token(&gov.0).is_ok(),
+            "governor token must survive age-GC via the generic identity-bound exemption"
         );
     }
 
@@ -8121,21 +8136,18 @@ mod tests {
             "AC7: invalid token must yield AuthFailed"
         );
 
-        // AC8 (updated for 15-0030): a valid participant (listen) token presented in the
-        // governor slot → AuthFailed. The original AC8 expected Forbidden specifically for a
-        // TrustChain.agents-backed minted agent token — `verify_governor`'s
-        // `self.agents.contains_key(...)` branch distinguished "valid-but-wrong-type" (403)
-        // from "unknown" (401) for that now-deleted token category. Listen tokens were never
-        // in `TrustChain.agents`, so a listen token here already fell through to AuthFailed
-        // pre-15-0030 too — this assertion now matches that reality instead of an
-        // unreachable minted-agent path.
+        // AC8 (updated again for 15-0040 FR2/AC-2): a valid participant (listen) token presented
+        // in the governor slot → Forbidden, not AuthFailed. This flips the 15-0030 update once
+        // more: under the flag model a listen token IS a real, live credential (never a distinct
+        // "wrong type"), just not the governor's — exactly the Forbidden case AC-2 specifies.
+        // Only a wholly unknown/revoked bearer (AC6/AC7 above) is AuthFailed now.
         let participant_as_gov = GovernorToken(participant_tok.0.clone());
         assert!(
             matches!(
                 hub.list_all_grants_gov(&participant_as_gov, None),
-                Err(Error::AuthFailed)
+                Err(Error::Forbidden)
             ),
-            "AC8: participant token in governor slot must yield AuthFailed"
+            "AC8: participant token in governor slot must yield Forbidden"
         );
     }
 

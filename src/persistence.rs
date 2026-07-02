@@ -183,6 +183,19 @@ impl TokenStore {
         .execute(&self.pool)
         .await?;
 
+        // 15-0040 FR2/OQ1: the governor is a privilege flag on a participant identity, not a
+        // separate credential — persisted as a single-row singleton pointer (identity name),
+        // never a per-identity table (that would smuggle back the two-credential shape this task
+        // removes). At most one row (id=0) ever exists.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS governor (
+                id        INTEGER PRIMARY KEY CHECK (id = 0),
+                identity  TEXT NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
         // ── 15-0029 zero-debt migration Steps 2–7 ──────────────────────────────
         // All idempotent, all mandatory. Run AFTER the identities table exists and AFTER
         // the v2→listen rename above. Provably-safe: a row is preserved by the Step-6 purge
@@ -291,6 +304,69 @@ impl TokenStore {
             name_col_dropped,
         );
 
+        // ── 15-0040 — operator-authorized full reset (one-time, ever) ──────────────────
+        // Collapses the old two-credential (participant + gov-N) model into the single-token +
+        // governor-flag model (FR1/FR2). The operator explicitly authorized wiping ALL pre-reset
+        // naming/trust state fleet-wide rather than a careful preserve-and-convert migration (see
+        // 15-0040 "Backward-compatibility / migration — OPERATOR-AUTHORIZED FULL RESET"): the
+        // hub's naming/governor layer was already fully locked out, so a reset cannot make it
+        // worse. Every participant re-registers and every grant is re-requested after this runs.
+        //
+        // Gated by a one-row marker table so this destructive step runs exactly once, ever, no
+        // matter how many times the server restarts afterward (AC-13 idempotency).
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS reset_15_0040 (
+                id       INTEGER PRIMARY KEY CHECK (id = 0),
+                done_at  TEXT NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        let already_reset = sqlx::query("SELECT 1 FROM reset_15_0040 WHERE id = 0")
+            .fetch_optional(&self.pool)
+            .await?
+            .is_some();
+
+        if !already_reset {
+            let now = system_time_to_secs_str(SystemTime::now());
+            let mut tx = self.pool.begin().await?;
+            let tokens_cleared = sqlx::query("DELETE FROM tokens")
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            let identities_cleared = sqlx::query("DELETE FROM identities")
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            let grants_cleared = sqlx::query("DELETE FROM grants")
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            let denial_blocks_cleared = sqlx::query("DELETE FROM denial_blocks")
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            let governor_cleared = sqlx::query("DELETE FROM governor")
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            sqlx::query("INSERT INTO reset_15_0040 (id, done_at) VALUES (0, ?)")
+                .bind(&now)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            eprintln!(
+                "sim_migrate: 15-0040 full reset — tokens_cleared={} identities_cleared={} \
+                 grants_cleared={} denial_blocks_cleared={} governor_cleared={}",
+                tokens_cleared,
+                identities_cleared,
+                grants_cleared,
+                denial_blocks_cleared,
+                governor_cleared,
+            );
+        }
+
         Ok(())
     }
 
@@ -348,6 +424,36 @@ impl TokenStore {
                 }
             })
             .collect())
+    }
+
+    /// Load the singleton governor identity (15-0040 FR2/OQ1), if one is currently set.
+    pub async fn load_governor(&self) -> Result<Option<String>, sqlx::Error> {
+        use sqlx::Row;
+        let row = sqlx::query("SELECT identity FROM governor WHERE id = 0")
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get("identity")))
+    }
+
+    /// Set (or move) the singleton governor pointer to `identity`. No credential is minted —
+    /// this only records which existing participant identity currently holds the flag.
+    pub async fn set_governor(&self, identity: &str) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO governor (id, identity) VALUES (0, ?) \
+             ON CONFLICT(id) DO UPDATE SET identity = excluded.identity",
+        )
+        .bind(identity)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Clear the singleton governor pointer (nobody is governor afterward).
+    pub async fn clear_governor(&self) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM governor")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     /// Load all permanent identity records (15-0029 / FG-7).
@@ -413,35 +519,6 @@ impl TokenStore {
             .bind(token)
             .execute(&self.pool)
             .await?;
-        Ok(())
-    }
-
-    /// Operator-anchored governor reset (15-0029 / security-MAJOR-1/2): delete the revoked
-    /// governor rows and insert the new governor in a SINGLE transaction, so a crash cannot
-    /// leave the hub with no durable governor.
-    pub async fn reset_governors(
-        &self,
-        delete_ids: &[String],
-        new_token: &str,
-    ) -> Result<(), sqlx::Error> {
-        let now = system_time_to_secs_str(SystemTime::now());
-        let mut tx = self.pool.begin().await?;
-        for id in delete_ids {
-            sqlx::query("DELETE FROM tokens WHERE token = ?")
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
-        }
-        sqlx::query(
-            "INSERT OR REPLACE INTO tokens (token, identity, token_type, expires_at, created_at) \
-             VALUES (?, ?, 'governor', NULL, ?)",
-        )
-        .bind(new_token)
-        .bind(new_token)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
         Ok(())
     }
 
