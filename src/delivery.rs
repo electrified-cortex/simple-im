@@ -4299,12 +4299,23 @@ impl DeliveryHub {
 
     /// Presence for a listen token: online if active SSE and not hidden.
     ///
-    /// Visibility rule (15-0028 / operator-final-rule):
-    ///   A querier sees a target's presence if and only if:
-    ///   (A) the querier holds a PERMISSIVE grant with the target, OR
+    /// Visibility rule (15-0028 / operator-final-rule, corrected by 15-0032):
+    ///   A querier sees a target's REAL presence if and only if:
+    ///   (A) the querier holds a non-denied PERMISSIVE grant with the target, OR
     ///   (B) the querier currently shares a room with the target.
-    ///   DENY-GRANT OVERRIDE: if a denial block exists for (querier_identity → target_name),
-    ///   returns false regardless of grant or room membership.
+    ///   Otherwise (no grant, an expired-only grant, an active DENY-GRANT override, or the
+    ///   target never having registered at all) the response is unified into the same
+    ///   `Err(Error::RecipientUnknown)` "unknown participant" shape — nothing is revealed,
+    ///   not even that the target exists. This closes the 15-0032 privacy leak: previously
+    ///   the deny-grant and no-grant/no-room cases returned `Ok(false)` (HTTP 200
+    ///   "offline"), which let any authenticated querier distinguish "real, disconnected
+    ///   participant" from "no visibility" — i.e. confirm a target's existence without any
+    ///   grant. Operator decision (2026-07-01): "if you don't have a grant, they don't show
+    ///   up" — the spec's "(non-denied grant)" phrasing plus "otherwise" explicitly carves
+    ///   deny-grant OUT of the granted set, so it falls into the same unknown-style bucket
+    ///   as plain no-grant, not the old `Ok(false)`. An expired grant needs no special
+    ///   handling: `check_grant_directed_with_names` already surfaces it as `Err(..)`, so it
+    ///   naturally lands in the no-grant/no-room branch below.
     pub fn presence_for_token(&self, token: &str, target_name: &str) -> Result<bool, Error> {
         let inner = self.lock();
         // Validate querier token.
@@ -4324,8 +4335,12 @@ impl DeliveryHub {
 
         // Deny-grant override: hard block regardless of grant or room.
         // Key: (querier_identity → target_name); for listen-flow, identity == token.
+        // 15-0032: unified into RecipientUnknown (was Ok(false)) — a denial is definitionally
+        // NOT a "non-denied grant", so it falls into the spec's "otherwise" bucket alongside
+        // plain no-grant, per the operator's 2026-07-01 decision. Revealing "offline" here
+        // would leak the target's existence to a querier the operator explicitly blocked.
         if inner.is_denial_active(token, target_name) {
-            return Ok(false);
+            return Err(Error::RecipientUnknown);
         }
 
         // Resolve target identity (listen token string if they're a listen-flow agent).
@@ -4392,7 +4407,16 @@ impl DeliveryHub {
 
         if !has_grant && !shares_room {
             // Neither grant nor shared room → target not visible.
-            return Ok(false);
+            // 15-0032: unified into RecipientUnknown (was Ok(false)). Operator decision
+            // 2026-07-01: no-grant-real-target must read identically to a never-registered
+            // name ("if you don't have a grant, they don't show up... they don't exist") —
+            // the old Ok(false)/"offline" response let any authenticated querier confirm a
+            // real target's existence with zero grant, which is exactly the privacy leak
+            // this task closes. An expired-only grant lands here too: `has_grant` is false
+            // because `check_grant_directed_with_names` returned `Err(GrantExpired)` above,
+            // which is indistinguishable from "no grant at all" at this point — intentional,
+            // per the "(non-denied grant)" = currently-valid-grant reading of the spec.
+            return Err(Error::RecipientUnknown);
         }
 
         // Check if target is a listen-flow agent.
@@ -5727,8 +5751,11 @@ mod tests {
     // ── Presence scoping tests ────────────────────────────────────────────────
 
     /// Grant-scoped agent is invisible to a querier without any grant.
+    /// 15-0032: renamed from `grant_scoped_querier_without_grant_sees_offline` — a no-grant
+    /// querier no longer sees a structured "offline" for a real target; they get the same
+    /// RecipientUnknown response as an unknown participant (operator decision 2026-07-01).
     #[test]
-    fn grant_scoped_querier_without_grant_sees_offline() {
+    fn grant_scoped_querier_without_grant_sees_recipient_unknown() {
         let hub = make_hub(Duration::from_secs(30));
         let _gov = hub.install_governor(None);
         let tok_a = test_mint(&hub).unwrap();
@@ -5739,8 +5766,9 @@ mod tests {
 
         let result = hub.presence_for_token(&tok_b.0, "alice");
         assert!(
-            matches!(result, Ok(false)),
-            "bob without grant should see alice as offline"
+            matches!(result, Err(Error::RecipientUnknown)),
+            "bob without grant should see alice as unknown (not offline) — got {:?}",
+            result
         );
     }
 
@@ -8099,9 +8127,14 @@ mod tests {
 
     // ── Grant-gated presence tests ────────────────────────────────────────────
 
-    /// AC1: Agent A with no grant to Agent B → presence_for_token returns false (not visible).
+    /// AC1: Agent A with no grant to Agent B → presence_for_token returns RecipientUnknown
+    /// (not visible — indistinguishable from an unknown participant).
+    /// 15-0032: renamed from `test_presence_no_grant_returns_offline` — operator decision
+    /// 2026-07-01 unified the no-grant-real-target response with the never-registered-name
+    /// response; the old `Ok(false)`/"offline" shape let a querier confirm a real target's
+    /// existence with zero grant, which was the privacy leak this task closes.
     #[test]
-    fn test_presence_no_grant_returns_offline() {
+    fn test_presence_no_grant_returns_recipient_unknown() {
         let hub = make_hub(Duration::from_secs(30));
         let _gov = hub.install_governor(None);
 
@@ -8121,11 +8154,12 @@ mod tests {
         hub.announce(&listen_a, "alice").unwrap();
         hub.announce(&listen_b, "bob").unwrap();
 
-        // A has no grant with B → presence_for_token should return false.
+        // A has no grant with B → presence_for_token should return RecipientUnknown.
         let result = hub.presence_for_token(&listen_a, "bob");
         assert!(
-            matches!(result, Ok(false)),
-            "Agent without grant should see target as not visible (false)"
+            matches!(result, Err(Error::RecipientUnknown)),
+            "Agent without grant should see target as unknown (not offline) — got {:?}",
+            result
         );
     }
 
@@ -8162,9 +8196,12 @@ mod tests {
         );
     }
 
-    /// AC3: Grant exists but expired → presence_for_token returns false.
+    /// AC3: Grant exists but expired → presence_for_token returns RecipientUnknown.
+    /// 15-0032: renamed from `test_presence_grant_expired_returns_offline` — an expired grant
+    /// is not a "non-denied grant" (it's not currently valid), so `has_grant` is false and this
+    /// falls into the same unified no-grant/no-room → RecipientUnknown branch as plain no-grant.
     #[test]
-    fn test_presence_grant_expired_returns_offline() {
+    fn test_presence_grant_expired_returns_recipient_unknown() {
         let hub = make_hub(Duration::from_secs(30));
         let gov = hub.install_governor(None);
 
@@ -8191,11 +8228,12 @@ mod tests {
         // Wait for expiry.
         std::thread::sleep(Duration::from_millis(10));
 
-        // Grant expired → should return false.
+        // Grant expired → should return RecipientUnknown (same bucket as no-grant).
         let result = hub.presence_for_token(&listen_a, "bob");
         assert!(
-            matches!(result, Ok(false)),
-            "Agent with expired grant should see target as not visible"
+            matches!(result, Err(Error::RecipientUnknown)),
+            "Agent with expired grant should see target as unknown (not offline) — got {:?}",
+            result
         );
     }
 
@@ -8203,7 +8241,7 @@ mod tests {
     // `test_presence_any_token_with_grant_returns_online` tested `presence_any_token`'s
     // now-deleted minted-agent branch specifically. `presence_any_token` itself was dead
     // (no HTTP route; superseded by `presence_for_token`, which is exercised by
-    // `test_presence_no_grant_returns_offline` / `test_presence_with_grant_returns_online`
+    // `test_presence_no_grant_returns_recipient_unknown` / `test_presence_with_grant_returns_online`
     // above) — removed along with it rather than converted, since the listen-flow behavior
     // they'd otherwise duplicate is already covered.
 

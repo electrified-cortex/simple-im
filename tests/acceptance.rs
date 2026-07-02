@@ -1,6 +1,7 @@
 use futures::StreamExt;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
+use simple_im::error::Error;
 use simple_im::http::AppState;
 use std::sync::Arc;
 use std::time::Duration;
@@ -408,7 +409,10 @@ async fn ac_d3_dequeue_all_returns_all_messages() {
 
 #[tokio::test]
 async fn ac_p1_presence_reflects_active_sse() {
-    let server = TestServer::spawn().await;
+    // 15-0032: needs a governor + grant now — without one, B has zero visibility into A
+    // and the query 404s RecipientUnknown regardless of A's SSE state, which would make
+    // this test unable to observe what it's named for (SSE reflected in presence).
+    let (server, gov) = TestServer::spawn_with_governor().await;
     let client = server.client();
 
     let (tok_a, _) = listen_and_get_welcome(&server, &client, None).await;
@@ -418,6 +422,15 @@ async fn ac_p1_presence_reflects_active_sse() {
         .post(server.url("/announce"))
         .header("Authorization", format!("Bearer {}", tok_a))
         .json(&json!({"name": "AgentOnline"}))
+        .send()
+        .await
+        .unwrap();
+
+    // Grant required for B to see A's presence at all (15-0032 grant-gated visibility).
+    client
+        .post(server.url("/grants/approve"))
+        .header("Authorization", format!("Bearer {}", gov))
+        .json(&json!({"identity_a": tok_a, "identity_b": tok_b}))
         .send()
         .await
         .unwrap();
@@ -1439,10 +1452,18 @@ async fn ac_n5_service_events_bypass_notify_interlock() {
     );
 }
 
-// ── AC-P3: Presence query works with any valid token (no grant needed) ─────────
+// ── AC-P3: Presence query for a no-grant real target → RecipientUnknown ────────
+//
+// 15-0032: renamed from `ac_p3_presence_any_valid_token_no_grant`. That name and its old
+// assertion (HTTP 200, online-or-offline) encoded the PRE-15-0032 contract — "any valid
+// token may query presence without a grant" — which the operator explicitly overturned on
+// 2026-07-01: "if you don't have a grant, they don't show up." A no-grant querier must now
+// get the exact same 404 RECIPIENT_UNKNOWN response as querying a never-registered name, not
+// a structured "offline". This test is kept (not deleted) to preserve coverage of the
+// no-grant-real-target branch — only the expected response has changed.
 
 #[tokio::test]
-async fn ac_p3_presence_any_valid_token_no_grant() {
+async fn ac_p3_presence_no_grant_real_target_returns_recipient_unknown() {
     let server = TestServer::spawn().await;
     let client = server.client();
 
@@ -1468,18 +1489,17 @@ async fn ac_p3_presence_any_valid_token_no_grant() {
         .await
         .unwrap();
 
-    // Must succeed (not 401/403) — any valid token may query presence without a grant.
+    // 15-0032: no-grant querier gets RecipientUnknown (404), same as an unknown name —
+    // reveals neither the target's existence nor its online/offline status.
     assert_eq!(
         r.status(),
-        StatusCode::OK,
-        "presence query must succeed for any valid token"
+        StatusCode::NOT_FOUND,
+        "presence query without a grant must 404 RECIPIENT_UNKNOWN, not reveal real status"
     );
     let body: Value = r.json().await.unwrap();
-    // status is online or offline — either is acceptable, just not an error.
-    let status = body["status"].as_str().unwrap_or("");
-    assert!(
-        status == "online" || status == "offline",
-        "status must be online or offline, got: {:?}",
+    assert_eq!(
+        body["error"], "RECIPIENT_UNKNOWN",
+        "expected RECIPIENT_UNKNOWN error code, got: {:?}",
         body
     );
 
@@ -1695,10 +1715,17 @@ async fn ac_n5_service_events_bypass_notify_suppressed() {
     );
 }
 
-// ── AC-P3: Presence query succeeds with any valid token (no grant required) ───
+// ── AC-P3: Presence query for a no-grant real target → RecipientUnknown (dup) ──
+//
+// 15-0032: renamed from `ac_p3_presence_any_valid_token_no_grant_needed` — near-duplicate of
+// `ac_p3_presence_no_grant_real_target_returns_recipient_unknown` above (same no-grant/
+// real-target scenario, different agent names), same operator-decision fate: the old "any
+// valid token, no grant needed, 200" contract is overturned; a no-grant querier now gets
+// RecipientUnknown (404), same as an unknown name. Kept as a second, independent instance of
+// this coverage rather than deleted.
 
 #[tokio::test]
-async fn ac_p3_presence_any_valid_token_no_grant_needed() {
+async fn ac_p3_presence_no_grant_real_target_returns_recipient_unknown_dup() {
     let server = TestServer::spawn().await;
     let client = server.client();
 
@@ -1716,7 +1743,7 @@ async fn ac_p3_presence_any_valid_token_no_grant_needed() {
         .await
         .unwrap();
 
-    // No grant between querier and target — query must still succeed (not 401/403).
+    // No grant between querier and target — query must 404 RecipientUnknown.
     let r = client
         .get(server.url("/participants/P3Target/presence"))
         .header("Authorization", format!("Bearer {}", tok_querier))
@@ -1725,14 +1752,14 @@ async fn ac_p3_presence_any_valid_token_no_grant_needed() {
         .unwrap();
     assert_eq!(
         r.status(),
-        StatusCode::OK,
-        "presence must return 200 without a grant"
+        StatusCode::NOT_FOUND,
+        "presence query without a grant must 404 RECIPIENT_UNKNOWN"
     );
     let body: Value = r.json().await.unwrap();
-    assert!(
-        body["status"] == "online" || body["status"] == "offline",
-        "status must be online or offline, got: {:?}",
-        body["status"]
+    assert_eq!(
+        body["error"], "RECIPIENT_UNKNOWN",
+        "expected RECIPIENT_UNKNOWN error code, got: {:?}",
+        body
     );
 
     stream_target.abort();
@@ -2265,20 +2292,10 @@ async fn ac_claim_transfer_existing_governor() {
 // AC2: Presence recovers automatically after an SSE drop → re-announce cycle.
 // AC3: An agent that has not announced recently still shows "offline".
 
-/// Helper: spawn a TestServer with a custom liveness window (for AC3's short-TTL variant).
-async fn spawn_server_with_ttl(liveness_secs: u64) -> TestServer {
-    let state = Arc::new(AppState::new(Duration::from_secs(liveness_secs)));
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let app = simple_im::http::router(Arc::clone(&state));
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    TestServer {
-        base_url: format!("http://127.0.0.1:{}", addr.port()),
-        gov: None,
-    }
-}
+// 15-0032: the plain (no-governor) `spawn_server_with_ttl` helper was removed — its one
+// caller (`ac_pr3_absent_participant_shows_offline_after_ttl_expires`) now needs a governor +
+// grant (see that test), so it was switched to `spawn_server_with_governor_ttl` below. Keeping
+// the ungoverned helper around unused would trip clippy's dead-code lint under `-D warnings`.
 
 /// Helper: spawn a TestServer with a custom liveness window AND a governor.
 async fn spawn_server_with_governor_ttl(liveness_secs: u64) -> (TestServer, String) {
@@ -2462,7 +2479,10 @@ async fn ac_pr2_presence_recovers_after_sse_drop_and_reannounce() {
 #[tokio::test]
 async fn ac_pr3_absent_participant_shows_offline_after_ttl_expires() {
     // Use a 1-second liveness window so the test doesn't take 30 s.
-    let server = spawn_server_with_ttl(1).await;
+    // 15-0032: switched to the governor+TTL helper — without a grant, the querier gets
+    // RecipientUnknown regardless of TTL/SSE state, which would make this test unable to
+    // observe what it's named for (TTL-expiry reflected as "offline" for a GRANTED querier).
+    let (server, gov) = spawn_server_with_governor_ttl(1).await;
     let client = server.client();
 
     // Agent A: open SSE, announce.
@@ -2483,6 +2503,15 @@ async fn ac_pr3_absent_participant_shows_offline_after_ttl_expires() {
 
     // Querier.
     let (tok_q, _stream_q) = listen_get_token(&server, &client, None).await;
+
+    // Grant required for the querier to see A's presence at all (15-0032 grant-gating).
+    client
+        .post(server.url("/grants/approve"))
+        .header("Authorization", format!("Bearer {}", gov))
+        .json(&json!({"identity_a": tok_a, "identity_b": tok_q}))
+        .send()
+        .await
+        .unwrap();
 
     // Drop SSE so the agent is no longer connected.
     stream_a.abort();
@@ -3836,8 +3865,12 @@ async fn ac_ppv1_permissive_grant_sees_presence() {
 }
 
 // AC-VIS2: no grant AND no shared room → ZERO presence visibility (push + pull).
+// 15-0032: the pull assertion changed from `Ok(false)` to `Err(RecipientUnknown)` — a
+// no-grant/no-room querier must not be able to distinguish "real, disconnected participant"
+// from "no visibility" (operator decision 2026-07-01). Push-side behavior (no event fanout)
+// is unaffected and unchanged.
 #[tokio::test]
-async fn ac_ppv2_no_grant_no_room_zero_visibility() {
+async fn ac_ppv2_no_grant_no_room_returns_recipient_unknown() {
     let (hub, _gov) = make_presence_hub();
 
     let tok_a = hub.register_participant();
@@ -3862,10 +3895,12 @@ async fn ac_ppv2_no_grant_no_room_zero_visibility() {
         "A must NOT receive push events for B without grant or shared room"
     );
 
-    // Pull: A must NOT see B's presence.
+    // Pull: A must see B as RecipientUnknown (not a structured "offline").
+    let result = hub.presence_for_token(&tok_a, "PpB7b");
     assert!(
-        !hub.presence_for_token(&tok_a, "PpB7b").unwrap(),
-        "A must NOT see B's presence via pull without grant or shared room"
+        matches!(result, Err(Error::RecipientUnknown)),
+        "A must see B as unknown (not offline) via pull without grant or shared room — got {:?}",
+        result
     );
 }
 
@@ -3915,8 +3950,14 @@ async fn ac_ppv3_shared_room_no_grant_sees_presence() {
 }
 
 // AC-VIS4: deny/negative grant → ZERO presence even when sharing a room (push + pull).
+// 15-0032: the pull assertion changed from `Ok(false)` to `Err(RecipientUnknown)`. Judgment
+// call (documented in `presence_for_token`'s deny-grant-override branch): the spec's
+// "(non-denied grant)" phrasing carves an active deny-grant OUT of the granted set, so it
+// falls into the same "otherwise" → unknown-style bucket as plain no-grant, per the operator's
+// 2026-07-01 decision ("if you don't have a grant, they don't show up"). Push-side behavior
+// (deny blocks event fanout even in a shared room) is unaffected and unchanged.
 #[tokio::test]
-async fn ac_ppv4_deny_grant_zero_visibility_even_in_room() {
+async fn ac_ppv4_deny_grant_returns_recipient_unknown_even_in_room() {
     let (hub, gov) = make_presence_hub();
 
     let tok_a = hub.register_participant();
@@ -3951,10 +3992,13 @@ async fn ac_ppv4_deny_grant_zero_visibility_even_in_room() {
         "A must NOT receive push events for B when a deny grant is active"
     );
 
-    // Pull: A must NOT see B's presence (deny overrides room).
+    // Pull: A must see B as RecipientUnknown (deny overrides room; unified unknown-style
+    // response — not a structured "offline" that would reveal B's existence).
+    let result = hub.presence_for_token(&tok_a, "PpB7d");
     assert!(
-        !hub.presence_for_token(&tok_a, "PpB7d").unwrap(),
-        "A must NOT see B's presence via pull when a deny grant is active"
+        matches!(result, Err(Error::RecipientUnknown)),
+        "A must see B as unknown (not offline) via pull when a deny grant is active — got {:?}",
+        result
     );
 }
 
