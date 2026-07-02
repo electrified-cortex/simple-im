@@ -316,7 +316,12 @@ paths:
     get:
       tags: [participant]
       summary: Check presence
-      description: Check if a participant is online
+      description: >
+        Check if a participant is online. Grant-gated (15-0032): the querier must hold a
+        non-denied grant with, or share a room with, the target to see real presence.
+        Otherwise — no grant, an expired-only grant, an active deny-grant, or the name was
+        never registered at all — the response is 404 RECIPIENT_UNKNOWN, identical to an
+        unknown name, revealing neither the target's existence nor its online/offline status.
       operationId: getPresence
       security:
         - bearerAuth: []
@@ -328,7 +333,7 @@ paths:
             type: string
       responses:
         "200":
-          description: Presence status
+          description: Presence status (querier holds a non-denied grant with, or shares a room with, the target)
           content:
             application/json:
               schema:
@@ -340,6 +345,10 @@ paths:
                     enum: [online, offline]
         "401":
           $ref: "#/components/responses/AuthFailed"
+        "404":
+          description: >
+            RECIPIENT_UNKNOWN — no visibility into this name: either it was never registered,
+            or the querier has no non-denied grant with and shares no room with the target.
 
   /participants/{name}/presence-scope:
     post:
